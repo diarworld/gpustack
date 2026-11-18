@@ -144,7 +144,10 @@ class TestReconcileSpecDiff:
     def test_ignores_the_live_spec_and_renders_from_inputs(self):
         """The reconciler owns the whole CR: base fields render from cfg and
         combinations from the database, so a stale CR is overwritten rather
-        than merged."""
+        than merged. The deployment default plan leads the list -- it is a
+        fallback and the key combos must be able to suppress it."""
+        from gpustack.gateway.rate_limit import default_plan_combination
+
         cfg = make_cfg(default_rpm=60, default_tpm=100_000)
         combos = [{"name": "key-1", "match": []}]
 
@@ -152,10 +155,25 @@ class TestReconcileSpecDiff:
         spec = reconcile_spec_diff(stale, cfg, combos)
 
         assert spec.defaultConfig["rule_name"] == "gpustack-rate-limit"
-        assert spec.defaultConfig["limit_combinations"] == combos
+        assert spec.defaultConfig["limit_combinations"] == (
+            [default_plan_combination(cfg)] + combos
+        )
         assert spec.priority == 600
 
+    def test_defaults_survive_a_pass_without_database_combinations(self):
+        """The static pass bootstraps the CR with the default plan, but the
+        reconciler owns it from its first pass on -- a full write that dropped
+        the defaults would silence the deployment-wide limits until the next
+        server restart."""
+        cfg = make_cfg(default_rpm=60)
+        spec = reconcile_spec_diff(None, cfg, [])
+        (combo,) = spec.defaultConfig["limit_combinations"]
+        assert combo["name"] == "default-plan"
+        assert combo["is_fallback"] is True
+
     def test_no_combinations_leaves_the_base_without_the_key(self):
+        """No defaults configured and an empty database: the plugin stays a
+        passthrough instead of enforcing an empty plan."""
         spec = reconcile_spec_diff(None, make_cfg(), [])
         assert "limit_combinations" not in spec.defaultConfig
 
@@ -202,6 +220,5 @@ class TestReconcilePass:
         assert call["name"] == "gpustack-rate-limit"
         assert call["namespace"] == "higress-system"
         spec = call["spec_diff"](None)
-        assert spec.defaultConfig["limit_combinations"] == [
-            {"name": "key-7", "match": []}
-        ]
+        combos = spec.defaultConfig["limit_combinations"]
+        assert [combo["name"] for combo in combos] == ["default-plan", "key-7"]

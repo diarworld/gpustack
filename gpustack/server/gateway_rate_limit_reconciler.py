@@ -49,6 +49,7 @@ from gpustack.gateway.client.extensions_higress_io_v1_api import (
 from gpustack.gateway.rate_limit import (
     WEEK_IN_SECONDS,
     consumer_user_capture,
+    default_plan_combination,
     rate_limit_plugin_name,
     rate_limit_spec,
 )
@@ -146,9 +147,10 @@ def fit_combinations(
 ) -> List[Dict[str, Any]]:
     """The combinations that fit the CR byte budget.
 
-    The default plan is not part of the input -- it is published by the
-    static pass regardless -- so everything here is database-driven. Key
-    combos are served before user budgets: they carry admin-set overrides,
+    The default plan is not part of the input and never competes for the
+    budget: ``reconcile_spec_diff`` prepends it after this fitting, so byte
+    pressure can only drop database-driven combinations. Key combos are
+    served before user budgets: they carry admin-set overrides,
     and a user budget dropped for want of room degrades to the deployment
     default, while a dropped key combo could land on either side of it.
     """
@@ -180,12 +182,20 @@ def reconcile_spec_diff(
 
     There is nothing to preserve -- the base renders from ``cfg`` every pass
     and the combinations from the database, so a stale CR is overwritten, not
-    merged. A missing CR is rebuilt for the same reason the ext-auth
-    reconciler rebuilds its own: ``ensure_wasm_plugin`` creates from this
-    result, and an absent rate-limit CR means the deployment defaults are the
-    only thing standing between the users and the limits they were given.
+    merged. The deployment default plan leads the list: the static pass is
+    create-only bootstrap, so this reconciler's full write is the only copy
+    of the defaults the CR carries once it has run -- leaving them out would
+    silence the deployment-wide limits until the next server restart. A
+    missing CR is rebuilt for the same reason the ext-auth reconciler
+    rebuilds its own: ``ensure_wasm_plugin`` creates from this result, and an
+    absent rate-limit CR means the deployment defaults are the only thing
+    standing between the users and the limits they were given.
     """
-    return rate_limit_spec(cfg, combinations)
+    combos = list(combinations)
+    default_combo = default_plan_combination(cfg)
+    if default_combo is not None:
+        combos.insert(0, default_combo)
+    return rate_limit_spec(cfg, combos)
 
 
 class GatewayRateLimitReconciler:
