@@ -103,7 +103,10 @@ class TestRateLimitPlugin:
             ),
         )
         redis = spec.defaultConfig["redis"]
-        assert redis["service_name"] == "redis.gpustack-system.svc.cluster.local"
+        # The plugin names the McpBridge registry, not the raw Service
+        # FQDN: this gateway routes through McpBridge registries, and a
+        # raw FQDN has no Envoy cluster behind it.
+        assert redis["service_name"] == "gpustack-rate-limit-redis.dns"
         assert redis["service_port"] == 6379
         assert redis["password"] == "secret"
         assert redis["database"] == 2
@@ -111,6 +114,59 @@ class TestRateLimitPlugin:
     def test_no_redis_section_means_local_mode(self):
         _, spec = build(enabled=True, default_rpm=60)
         assert "redis" not in spec.defaultConfig
+
+
+class TestRateLimitRedisRegistry:
+    def test_registry_carries_the_service_as_a_dns_domain(self):
+        from gpustack.gateway.rate_limit import rate_limit_redis_registry
+
+        cfg = make_cfg(
+            GatewayRateLimitConfig(
+                enabled=True,
+                redis=GatewayRateLimitRedis(
+                    service_name="rate-limit-redis.gpustack.svc.cluster.local"
+                ),
+            )
+        )
+        registry = rate_limit_redis_registry(cfg, "gpustack")
+        assert registry is not None
+        assert registry.name == "gpustack-rate-limit-redis"
+        assert registry.type == "dns"
+        assert registry.domain == "rate-limit-redis.gpustack.svc.cluster.local"
+        assert registry.port == 6379
+        assert registry.protocol == "tcp"
+
+    def test_bare_service_name_is_namespaced_for_strict_dns(self):
+        """A single-label Service name does not resolve in Envoy's
+        STRICT_DNS; the registry domain must carry the namespace and stop
+        at ``.svc`` so the pod's search list completes the cluster domain."""
+        from gpustack.gateway.rate_limit import rate_limit_redis_registry
+
+        cfg = make_cfg(
+            GatewayRateLimitConfig(
+                enabled=True,
+                redis=GatewayRateLimitRedis(service_name="redis"),
+            )
+        )
+        registry = rate_limit_redis_registry(cfg, "gpustack")
+        assert registry.domain == "redis.gpustack.svc"
+
+    def test_none_without_redis_or_when_disabled(self):
+        from gpustack.gateway.rate_limit import rate_limit_redis_registry
+
+        assert (
+            rate_limit_redis_registry(
+                make_cfg(GatewayRateLimitConfig(enabled=True)), "gpustack"
+            )
+            is None
+        )
+        cfg = make_cfg(
+            GatewayRateLimitConfig(
+                enabled=False,
+                redis=GatewayRateLimitRedis(service_name="redis"),
+            )
+        )
+        assert rate_limit_redis_registry(cfg, "gpustack") is None
 
     def test_timezone_anchors_calendar_budgets(self):
         _, spec = build(enabled=True, default_daily_tokens=1, timezone="Asia/Shanghai")

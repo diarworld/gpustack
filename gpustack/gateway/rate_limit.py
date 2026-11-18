@@ -17,10 +17,19 @@ Combination semantics worth restating, because the reconciler leans on both:
 from typing import Any, Dict, List, Optional
 
 from gpustack.config.config import Config
-from gpustack.gateway.client import WasmPluginSpec
+from gpustack.gateway.client import McpBridgeRegistry, WasmPluginSpec
 from gpustack.gateway.plugins import plugin_spec_overrides
 
 rate_limit_plugin_name = "gpustack-rate-limit"
+
+# The McpBridge registry that carries the rate-limit redis service. This
+# gateway publishes no Kubernetes services on its own -- every cluster it
+# routes to comes from the default McpBridge's registries -- so a redis
+# block naming the raw Service FQDN would address an Envoy cluster that
+# never exists (the reason the LB plugin registers its redis the same
+# way). ``ensure_mcp_resources`` creates the entry; the plugin config
+# names it as ``<name>.dns``, which is what maps to a live cluster.
+RATE_LIMIT_REDIS_REGISTRY_NAME = "gpustack-rate-limit-redis"
 
 # Matches both consumer shapes ext-auth can produce -- the API-key form
 # ``<access_key>.gpustack-<user-id>`` and the UI form ``gpustack-<user-id>``
@@ -73,8 +82,43 @@ def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
     return combo
 
 
+def _redis_dns_domain(service_name: str, gateway_namespace: Optional[str]) -> str:
+    """The registry domain for the redis service: a bare Service name is
+    expanded to ``<name>.<namespace>.svc`` -- a single-label host does not
+    resolve in Envoy's STRICT_DNS even though an in-pod client connects
+    fine, and the pod's resolv.conf search list completes the cluster
+    domain. Dotted names (FQDNs, the ``.dns`` registry form) and IPs pass
+    through untouched."""
+    if "." in service_name or not gateway_namespace:
+        return service_name
+    return f"{service_name}.{gateway_namespace}.svc"
+
+
+def rate_limit_redis_registry(
+    cfg: Config, gateway_namespace: Optional[str]
+) -> Optional[McpBridgeRegistry]:
+    """The McpBridge registry entry that carries the rate-limit redis
+    service, or None when the feature runs without redis (disabled or
+    local mode): then no cluster is needed and nothing is registered."""
+    rlc = cfg.gateway_rate_limit
+    if not rlc.enabled or rlc.redis is None:
+        return None
+    return McpBridgeRegistry(
+        name=RATE_LIMIT_REDIS_REGISTRY_NAME,
+        type="dns",
+        domain=_redis_dns_domain(rlc.redis.service_name, gateway_namespace),
+        port=rlc.redis.service_port,
+        protocol="tcp",
+    )
+
+
 def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
-    """The ``defaultConfig`` fields that do not depend on the database."""
+    """The ``defaultConfig`` fields that do not depend on the database.
+
+    The redis block names the McpBridge registry, not the raw Service
+    FQDN -- the registry is what turns the service into an Envoy cluster
+    the plugin's redis client can address.
+    """
     rlc = cfg.gateway_rate_limit
     config: Dict[str, Any] = {
         "rule_name": rate_limit_plugin_name,
@@ -88,9 +132,10 @@ def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
         **rlc.plugin_config,
     }
     if rlc.redis is not None:
+        registry = rate_limit_redis_registry(cfg, cfg.gateway_namespace)
         config["redis"] = {
-            "service_name": rlc.redis.service_name,
-            "service_port": rlc.redis.service_port,
+            "service_name": registry.get_service_name(),
+            "service_port": registry.port,
             "username": rlc.redis.username,
             "password": rlc.redis.password,
             "timeout": rlc.redis.timeout,

@@ -55,8 +55,10 @@ from gpustack.gateway.ext_auth import (
 )
 from gpustack.gateway.plugins import plugin_entry, plugin_spec_overrides
 from gpustack.gateway.rate_limit import (
+    RATE_LIMIT_REDIS_REGISTRY_NAME,
     default_plan_combination,
     rate_limit_plugin_name,
+    rate_limit_redis_registry,
     rate_limit_spec,
 )
 from gpustack.routes.plugins import route_plugins
@@ -186,6 +188,45 @@ def _redis_registry_from_config(
     return redis_registry_from_url(redis_url, namespace=gateway_namespace)
 
 
+def _merge_bridge_registries(
+    bridge: McpBridge,
+    upserts: List[McpBridgeRegistry],
+    prune_names: List[str],
+) -> bool:
+    """Upsert the registry entries into the bridge in place and drop the
+    named ones, returning whether anything changed. Pruning is how a
+    feature that stopped needing its redis -- an unset or refused url,
+    rate limiting disabled or moved to local mode -- keeps its entry
+    from outliving it: nothing references it any more, and the stale
+    gateway config would outlive the feature."""
+    if bridge.spec is None:
+        bridge.spec = McpBridgeSpec()
+    registries = list(bridge.spec.registries or [])
+    changed = False
+    for upsert in upserts:
+        existing = next((r for r in registries if r.name == upsert.name), None)
+        if existing is None:
+            registries.append(upsert)
+            changed = True
+        elif (
+            existing.type != upsert.type
+            or existing.domain != upsert.domain
+            or existing.port != upsert.port
+            or existing.protocol != upsert.protocol
+        ):
+            existing.type = upsert.type
+            existing.domain = upsert.domain
+            existing.port = upsert.port
+            existing.protocol = upsert.protocol
+            changed = True
+    remaining = [r for r in registries if r.name not in prune_names]
+    if len(remaining) != len(registries):
+        registries = remaining
+        changed = True
+    bridge.spec.registries = registries
+    return changed
+
+
 async def ensure_mcp_resources(cfg: Config, api_client: k8s_client.ApiClient):
     api = gw_client.NetworkingHigressIoV1Api(api_client)
     # use default name for embedded mode
@@ -206,7 +247,22 @@ async def ensure_mcp_resources(cfg: Config, api_client: k8s_client.ApiClient):
     # WasmPlugin config (a service name, not a raw host) always has a
     # cluster behind it.
     redis_registry = _redis_registry_from_config(cfg, gateway_namespace)
-    registries_to_upsert = [r for r in (target_registry, redis_registry) if r]
+    # The redis service the rate-limit plugin's redis block points at,
+    # from ``gateway_rate_limit`` in the config file. Registered alongside
+    # the higress registry for the same reason as the LB redis: the
+    # plugin names a McpBridge registry, and a registry that does not
+    # exist leaves the plugin addressing a cluster that never materializes.
+    rate_limit_registry = rate_limit_redis_registry(cfg, gateway_namespace)
+    registries_to_upsert = [
+        r for r in (target_registry, redis_registry, rate_limit_registry) if r
+    ]
+    prune_names = []
+    if redis_registry is None:
+        from gpustack.routes.plugins.lb.gateway import REDIS_REGISTRY_NAME
+
+        prune_names.append(REDIS_REGISTRY_NAME)
+    if rate_limit_registry is None:
+        prune_names.append(RATE_LIMIT_REDIS_REGISTRY_NAME)
     try:
         if not default_bridge:
             bridge = McpBridge(
@@ -214,46 +270,12 @@ async def ensure_mcp_resources(cfg: Config, api_client: k8s_client.ApiClient):
                 spec=McpBridgeSpec(registries=registries_to_upsert),
             )
             await api.create_mcpbridge(namespace=gateway_namespace, body=bridge)
-        else:
-            should_update = False
-            registries = (
-                default_bridge.spec.registries
-                if default_bridge.spec and default_bridge.spec.registries
-                else []
+        elif _merge_bridge_registries(
+            default_bridge, registries_to_upsert, prune_names
+        ):
+            await api.edit_mcpbridge(
+                namespace=gateway_namespace, name='default', body=default_bridge
             )
-            for upsert in registries_to_upsert:
-                existing = next((r for r in registries if r.name == upsert.name), None)
-                if existing is None:
-                    if default_bridge.spec is None:
-                        default_bridge.spec = McpBridgeSpec()
-                    registries.append(upsert)
-                    default_bridge.spec.registries = registries
-                    should_update = True
-                elif (
-                    existing.type != upsert.type
-                    or existing.domain != upsert.domain
-                    or existing.port != upsert.port
-                    or existing.protocol != upsert.protocol
-                ):
-                    existing.type = upsert.type
-                    existing.domain = upsert.domain
-                    existing.port = upsert.port
-                    existing.protocol = upsert.protocol
-                    should_update = True
-            if redis_registry is None:
-                # A redis_url that was unset or became unusable must not
-                # leave its registry behind: nothing references it, and
-                # the stale gateway config outlives the feature.
-                from gpustack.routes.plugins.lb.gateway import REDIS_REGISTRY_NAME
-
-                remaining = [r for r in registries if r.name != REDIS_REGISTRY_NAME]
-                if len(remaining) != len(registries):
-                    default_bridge.spec.registries = remaining
-                    should_update = True
-            if should_update:
-                await api.edit_mcpbridge(
-                    namespace=gateway_namespace, name='default', body=default_bridge
-                )
     except ApiException as e:
         raise RuntimeError("Failed to ensure ingress resources") from e
 
