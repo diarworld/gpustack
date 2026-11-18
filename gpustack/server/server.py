@@ -79,6 +79,7 @@ from gpustack.schemas.catalog_source import normalize_catalog_yaml
 from gpustack.server.catalog import read_builtin_catalog_text
 from gpustack.server.db import async_session
 from gpustack.server.gateway_auth_reconciler import GatewayAuthReconciler
+from gpustack.server.gateway_rate_limit_reconciler import GatewayRateLimitReconciler
 from gpustack.server.lora_model_routes import (
     cleanup_orphan_lora_routes,
     create_lora_model_routes,
@@ -534,6 +535,11 @@ class Server:
         # regardless of proxy mode, but no-ops when the gateway is disabled.
         gateway_auth_reconciler = GatewayAuthReconciler(self._config)
         tasks.append(asyncio.create_task(gateway_auth_reconciler.start()))
+
+        # Publishes the per-key / per-user rate-limit combinations. No-ops
+        # unless ``gateway_rate_limit.enabled`` is set.
+        gateway_rate_limit_reconciler = GatewayRateLimitReconciler(self._config)
+        tasks.append(asyncio.create_task(gateway_rate_limit_reconciler.start()))
 
         cache_service_controller = CacheServiceController(self._config)
         tasks.append(asyncio.create_task(cache_service_controller.start()))

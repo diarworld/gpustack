@@ -160,6 +160,18 @@ GATEWAY_AUTH_RECONCILE_INTERVAL_SECONDS = int(
     os.getenv("GPUSTACK_GATEWAY_AUTH_RECONCILE_INTERVAL_SECONDS", 30)
 )
 
+# How often the rate-limit reconciler recomputes the gpustack-rate-limit
+# combinations from the database, and the etcd budget those combinations share
+# (the same single-CR-object limit the ext-auth budget guards). Same
+# cost model as above: the pass diffs before writing, so an unchanged
+# recomputation costs one read.
+GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS = int(
+    os.getenv("GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS", 30)
+)
+GATEWAY_RATE_LIMIT_MAX_CR_BYTES = int(
+    os.getenv("GPUSTACK_RATE_LIMIT_MAX_CR_BYTES", 1_100_000)
+)
+
 # Whether a custom API key -- one whose secret the user supplied rather than
 # this server generating it -- may be authenticated at the gateway.
 #

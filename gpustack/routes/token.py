@@ -28,7 +28,11 @@ from gpustack.api.auth import (
     GATEWAY_ASSERTED_KEY_REF_HEADER,
     GATEWAY_DOWNSTREAM_CONN_HEADER,
 )
-from gpustack.security import JWTManager, AUTH_CACHE_HEADER, is_legacy_token_access_key
+from gpustack.security import (
+    JWTManager,
+    AUTH_CACHE_HEADER,
+    gateway_consumer_identity,
+)
 from gpustack.server.gateway_auth_reconciler import gateway_ref_indexable
 
 logger = logging.getLogger(__name__)
@@ -59,17 +63,11 @@ def model_not_found_exception() -> NotFoundException:
 def _build_consumer(access_key: Optional[str], user: User) -> str:
     """The caller identity that travels upstream as ``X-Mse-Consumer``.
 
-    Single definition on purpose: the gateway plugin rebuilds this string
-    locally for PUBLIC routes, where it never calls this endpoint at all, and
-    the two must agree byte for byte or access-log attribution and the
-    rate-limit consumer dimension silently drift apart.
-
-    Cookie/basic identities and deployment tokens have no public access key.
-    Omit their internal marker so logs and rate limits identify them by user.
+    Delegates to :func:`gpustack.security.gateway_consumer_identity` -- the
+    gateway rate-limit reconciler builds per-key match values from the same
+    string, so the definition is shared rather than duplicated.
     """
-    if is_legacy_token_access_key(access_key):
-        return f"gpustack-{user.id}"
-    return f"{access_key}.gpustack-{user.id}"
+    return gateway_consumer_identity(access_key, user.id)
 
 
 async def _resolve_caller(

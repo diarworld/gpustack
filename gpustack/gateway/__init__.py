@@ -54,6 +54,11 @@ from gpustack.gateway.ext_auth import (
     ext_auth_spec,
 )
 from gpustack.gateway.plugins import plugin_entry, plugin_spec_overrides
+from gpustack.gateway.rate_limit import (
+    default_plan_combination,
+    rate_limit_plugin_name,
+    rate_limit_spec,
+)
 from gpustack.routes.plugins import route_plugins
 
 logger = logging.getLogger(__name__)
@@ -658,6 +663,29 @@ def token_usage_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     return resource_name, expected_spec
 
 
+def rate_limit_plugin(cfg: Config) -> Optional[Tuple[str, WasmPluginSpec]]:
+    """The static base of the rate-limit CR, built from
+    ``gateway_rate_limit`` in the config file. None when the feature is off.
+
+    The deployment-wide defaults become one fallback combination, bucketed
+    per user. Per-user and per-key overrides come from the database and are
+    layered on top by the server's rate-limit reconciler, which owns the CR
+    from its first pass on -- this pass is create-only, so the two never
+    fight over one resource (the ai-proxy CR follows the same split).
+
+    Combination construction and the plugin semantics it relies on live in
+    :mod:`gpustack.gateway.rate_limit`, shared with the reconciler.
+    """
+    if not cfg.gateway_rate_limit.enabled:
+        return None
+    default_combo = default_plan_combination(cfg)
+    combinations = [default_combo] if default_combo is not None else []
+    return (
+        rate_limit_plugin_name,
+        rate_limit_spec(cfg, combinations),
+    )
+
+
 def ai_proxy_plugin(cfg: Config) -> Tuple[str, WasmPluginSpec]:
     """The create-only foundation of the ai-proxy CR.
 
@@ -877,6 +905,10 @@ def _spec_diff_for(
         )
     create_only = plugin_name in [
         gpustack_ai_proxy_name,
+        # The rate-limit reconciler owns the CR from its first pass; this
+        # static publication only bootstraps a fresh resource, so the two
+        # never fight over one spec.
+        rate_limit_plugin_name,
     ]
     return partial(spec_replace, expected_spec=plugin_spec, create_only=create_only)
 
@@ -987,6 +1019,9 @@ def initialize_gateway(cfg: Config, timeout: int = 60, interval: int = 5):
         if cfg.server_role() != Config.ServerRole.WORKER:
             plugin_list.append(transformer_plugin(cfg=cfg))
             plugin_list.append(token_usage_plugin(cfg=cfg))
+            rate_limit_entry = rate_limit_plugin(cfg=cfg)
+            if rate_limit_entry is not None:
+                plugin_list.append(rate_limit_entry)
         route_plugin_diffs = _append_route_plugin_entries(cfg, plugin_list)
 
         async def prepare():

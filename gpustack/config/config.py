@@ -17,7 +17,7 @@ from gpustack_runtime.detector import (
     available_manufacturers,
     available_backends,
 )
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from gpustack.utils import validators
 from gpustack.schemas.workers import (
@@ -103,6 +103,76 @@ class GatewayPluginEntry(BaseModel):
     # own ``defaultConfig`` so an operator can transcribe field paths straight
     # out of the plugin's documentation.
     config: Dict[str, Any] = {}
+
+
+class GatewayRateLimitRedis(BaseModel):
+    """Redis backend for the gateway rate-limit plugin.
+
+    With Redis configured the plugin keeps its counters in a shared instance
+    and the limits hold across every gateway replica; without it the plugin
+    falls back to per-instance counters, so a multi-replica gateway enforces
+    roughly ``limit x replicas``. Monthly token budgets tied to billing need
+    the shared backend.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Redis service FQDN reachable from the gateway pods, e.g.
+    # ``redis.gpustack-system.svc.cluster.local``.
+    service_name: str
+    service_port: int = 6379
+    username: Optional[str] = None
+    password: Optional[str] = None
+    # Per-command timeout in milliseconds; the plugin fails open when Redis
+    # does not answer within it, so a too-small value silently disables the
+    # limits under load.
+    timeout: int = 1000
+    database: int = 0
+
+
+class GatewayRateLimitConfig(BaseModel):
+    """Deployment-wide request/token limits enforced by the gateway's
+    ``gpustack-rate-limit`` plugin.
+
+    The defaults here apply to every consumer, bucketed per user: the plugin
+    merges the API-key and UI consumer shapes (``<access_key>.gpustack-<id>``
+    and ``gpustack-<id>``) into one bucket, so a user's API traffic and their
+    dashboard traffic draw on the same allowance. Per-user and per-key
+    overrides are database-driven and layered on top by the server's
+    rate-limit reconciler; these fields are the floor plan for everyone else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Off until asked for: publishing the plugin with no limits configured
+    # changes nothing, so the flag is what makes the feature opt-in.
+    enabled: bool = False
+
+    redis: Optional[GatewayRateLimitRedis] = None
+
+    # Anchors every calendar token budget (daily / monthly). One value per
+    # deployment on purpose -- mixed boundaries across users would make the
+    # monthly numbers impossible to reason about.
+    timezone: str = "UTC"
+
+    rejected_code: int = Field(default=429, ge=100, le=599)
+    # Rendered as an OpenAI-style error envelope; a JSON object literal is
+    # sent verbatim (see the plugin's rejection-response documentation).
+    rejected_msg: str = "Too many requests"
+
+    # Deployment-wide defaults, all optional: unset means no limit of that
+    # kind. Requests and rolling tokens are sliding windows; token budgets
+    # reset on the calendar boundary of ``timezone``.
+    default_rpm: Optional[int] = Field(default=None, ge=1)
+    default_tpm: Optional[int] = Field(default=None, ge=1)
+    default_daily_tokens: Optional[int] = Field(default=None, ge=1)
+    default_monthly_tokens: Optional[int] = Field(default=None, ge=1)
+
+    # Extra plugin fields passed through verbatim, for knobs the server does
+    # not model (e.g. ``enable_on_path_suffix``). Validated by the plugin at
+    # parse time on the gateway; kept separate so this model stays an
+    # allowlist of the fields the server itself acts on.
+    plugin_config: Dict[str, Any] = {}
 
 
 class WorkerConfig(PredefinedConfig):
@@ -363,6 +433,14 @@ class Config(WorkerConfig, BaseSettings):
     # ``ai-statistics`` vs ``gpustack-ai-statistics``, ...). See
     # ``gpustack.gateway.plugins.plugin_spec_overrides``.
     gateway_plugin: Dict[str, GatewayPluginEntry] = {}
+
+    # Deployment-wide rate limits enforced by the gateway's
+    # ``gpustack-rate-limit`` plugin. Not a ``gateway_plugin`` entry because
+    # the server acts on these fields (the reconciler layers per-user and
+    # per-key overrides on top of the defaults), not just forwards them.
+    gateway_rate_limit: GatewayRateLimitConfig = Field(
+        default_factory=GatewayRateLimitConfig
+    )
 
     shuihua_api_base_url: str = "https://hub.do.top"
 

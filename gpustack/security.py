@@ -92,6 +92,22 @@ def is_legacy_token_access_key(access_key: Optional[str]) -> bool:
     return not access_key or access_key == LEGACY_TOKEN_ACCESS_KEY
 
 
+def gateway_consumer_identity(access_key: Optional[str], user_id: int) -> str:
+    """The caller identity that travels upstream as ``x-mse-consumer``.
+
+    Single definition on purpose: the gateway rate-limit reconciler builds its
+    per-key match values from the same string, and the two sides must agree
+    byte for byte or the rate-limit consumer dimension silently drifts apart
+    from the access-log attribution.
+
+    Cookie/basic identities and deployment tokens have no public access key.
+    Omit their internal marker so logs and rate limits identify them by user.
+    """
+    if is_legacy_token_access_key(access_key):
+        return f"gpustack-{user_id}"
+    return f"{access_key}.gpustack-{user_id}"
+
+
 def secret_key_digest_eligible(
     *, secret_key: Union[str, bytes], is_custom: bool, access_key: str
 ) -> bool:

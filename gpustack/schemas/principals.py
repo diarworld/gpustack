@@ -33,7 +33,7 @@ from datetime import datetime
 from enum import Enum
 from typing import ClassVar, List, Optional, TYPE_CHECKING
 
-from sqlalchemy import Enum as SQLEnum, String, Text, text
+from sqlalchemy import BigInteger, Enum as SQLEnum, String, Text, text
 from sqlmodel import (
     Column,
     Field,
@@ -285,6 +285,21 @@ class PrincipalBase(SQLModel):
     is_active: bool = Field(default=True, nullable=False)
     avatar_url: Optional[str] = Field(
         default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    # Gateway token budgets, meaningful on USER rows only (NULL on the other
+    # kinds — they never hold an API key). Enforced by the gpustack-rate-limit
+    # plugin against Redis counters, bucketed per user so every key of the
+    # account draws on the same allowance. None means no budget of that kind:
+    # no deployment default applies to these two, because a default monthly
+    # budget silently capping every account is not a safe thing to imply.
+    # Weekly is a rolling 7-day window; monthly resets on the calendar
+    # boundary of the deployment timezone.
+    weekly_token_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    monthly_token_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
     )
 
     def model_post_init(self, __context) -> None:

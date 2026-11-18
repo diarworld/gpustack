@@ -119,9 +119,17 @@ everywhere at once.
 !!! note
 
     Editing the resource requires access to the cluster the gateway runs in, and
-    `higress-system` above is the default gateway namespace — substitute yours if
+    `higress-system` above is the default gateway namespace - substitute yours if
     it was changed. Modifying the GPUStack database directly is not a supported
     alternative and can leave the deployment inconsistent.
+
+## Rate Limits
+
+An API key can carry its own rate limits — requests per minute, tokens per
+minute, and a daily token budget — enforced at the gateway before traffic
+reaches a model. Set them on the key or configure deployment-wide defaults;
+see [Rate Limiting](rate-limiting.md) for how the limits interact with the
+per-user budgets.
 
 !!! warning "Who can read this namespace"
 

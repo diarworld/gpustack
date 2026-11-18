@@ -1,7 +1,7 @@
 from enum import Enum
 from datetime import datetime
 from typing import ClassVar, Optional, List, TYPE_CHECKING
-from sqlalchemy import Column, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import BigInteger, Column, ForeignKey, Integer, UniqueConstraint
 from sqlmodel import Field, SQLModel, Text, JSON, Relationship
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -40,6 +40,20 @@ class ApiKeyUpdate(SQLModel):
     scope: List[PermissionScope] = Field(
         default=[PermissionScope.ALL],
         sa_column=Column(JSON, nullable=False),
+    )
+    # Gateway rate limits, enforced by the gpustack-rate-limit plugin against
+    # Redis counters. None inherits the deployment-wide default from
+    # ``gateway_rate_limit`` (and no default means no limit of that kind).
+    # Requests and rolling tokens are sliding windows; the daily token budget
+    # resets on the calendar boundary of the deployment timezone.
+    rpm_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    tpm_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    daily_token_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
     )
 
 

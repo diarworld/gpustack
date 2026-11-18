@@ -237,6 +237,9 @@ async def create_api_key(
             allowed_model_names=key_in.allowed_model_names,
             is_custom=key_in.custom is not None,
             scope=key_in.scope,
+            rpm_limit=key_in.rpm_limit,
+            tpm_limit=key_in.tpm_limit,
+            daily_token_limit=key_in.daily_token_limit,
         )
         api_key = await ApiKey.create(session, api_key)
     except Exception as e:

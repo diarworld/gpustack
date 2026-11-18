@@ -41,6 +41,13 @@ The UI additionally limits passwords to 6–64 characters.
 4. Update the attributes as needed.
 5. Click the `Save` button.
 
+### Token Budgets
+
+A user account can carry weekly and monthly token budgets, shared across all
+of the user's API keys and their UI sessions and enforced at the gateway. Set
+them in the user's edit form; see [Rate Limiting](rate-limiting.md) for the
+enforcement details.
+
 ## Deactivate User
 
 1. Navigate to the `Users` page.
