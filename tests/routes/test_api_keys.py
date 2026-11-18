@@ -82,6 +82,31 @@ async def test_org_member_lists_only_own_api_keys_in_current_org(monkeypatch):
     assert captured["fields"] == {"owner_principal_id": 10, "user_id": 2}
 
 
+def test_to_public_carries_the_rate_limit_fields():
+    """The edit dialog pre-fills from this projection: leaving the gateway
+    rate limits out renders limits that are set in the database as empty
+    fields, and a save then looks like a reset to whoever trusts it."""
+    api_key = ApiKey(
+        id=5,
+        name="team-key",
+        user_id=2,
+        owner_principal_id=10,
+        access_key="access",
+        hashed_secret_key="secret",
+        created_at=datetime(2026, 1, 1),
+        updated_at=datetime(2026, 1, 1),
+        rpm_limit=60,
+        tpm_limit=100_000,
+        daily_token_limit=500_000,
+    )
+
+    public = api_keys._api_key_to_public(api_key)
+
+    assert public.rpm_limit == 60
+    assert public.tpm_limit == 100_000
+    assert public.daily_token_limit == 500_000
+
+
 @pytest.mark.asyncio
 async def test_org_owner_can_delete_other_users_api_key_in_current_org(monkeypatch):
     deleted = {}

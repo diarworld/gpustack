@@ -69,6 +69,13 @@ def _api_key_to_public(
         allowed_model_names=api_key.allowed_model_names,
         is_custom=api_key.is_custom,
         scope=api_key.scope,
+        # The gateway rate limits are part of the key's editable state: the
+        # edit dialog pre-fills from this response, so leaving them out
+        # renders set limits as empty fields and a save would look like a
+        # no-op reset to whoever trusts the dialog.
+        rpm_limit=api_key.rpm_limit,
+        tpm_limit=api_key.tpm_limit,
+        daily_token_limit=api_key.daily_token_limit,
     )
 
 
