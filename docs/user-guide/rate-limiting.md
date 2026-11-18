@@ -84,17 +84,74 @@ Changes take effect within one reconcile interval (30 seconds by default, see
 
 The rate limiter fails open: if Redis is unreachable, requests are allowed
 through and a warning is logged, rather than blocking traffic because of the
-limiter's own infrastructure. Monitor the `gpustack_rate_limit_rejected_total`
-and `gpustack_rate_limit_request_total` counters (exported by the gateway's
-Prometheus endpoint) for evidence that limits are being enforced.
+limiter's own infrastructure. Monitor the rejection counters in the Metrics
+section below for evidence that limits are being enforced.
 
 ## Metrics
 
-The gateway emits three counters per rate-limit decision:
+The plugin declares three counters per rate-limit decision:
 
-- `gpustack_rate_limit_request_total` — requests that ran limit checks,
-  labelled `passed` / `limited`.
-- `gpustack_rate_limit_rejected_total` — rejected requests, labelled with the
-  triggering combination and window.
-- `gpustack_rate_limit_value_total` — the counts written into each window
-  bucket (one write per declared window per request).
+- `gpustack_rate_limit_request_total` — requests that ran limit checks, split
+  into `result="passed"` and `result="limited"`.
+- `gpustack_rate_limit_rejected_total` — rejected requests, attributed to the
+  combination and window that triggered the rejection.
+- `gpustack_rate_limit_value_total` — the spend written into each window
+  bucket (1 per request for query windows, the token count for token windows).
+
+The Higress AI statistics plugin fuses these into the route-level Envoy
+metrics, so on the gateway's Prometheus endpoint they are exposed under the
+`route_upstream_model_consumer_metric_` prefix, with the combination and
+window flattened into the name and the AI dimensions attached as labels:
+
+```promql
+route_upstream_model_consumer_metric_gpustack_rate_limit_request_total_rule_gpustack_rate_limit_result_passed{ai_route="ai-route-route-1.internal",ai_cluster="outbound_80__model-1-46.static",ai_model="glm-5.3-flash",ai_consumer="a3d73e9f0c402120.gpustack-6"}
+```
+
+- `ai_consumer` — the authenticated consumer, e.g. `a3d73e9f0c402120.gpustack-6`.
+- `ai_route`, `ai_cluster`, `ai_model` — the AI route and the model instance
+  the request was headed for.
+- The combination and window become name segments (non-alphanumerics
+  flattened to `_`):
+  `..._rejected_total_rule_gpustack_rate_limit_combo_<combination>_kind_<query|token_rolling|token_calendar>_period_<60s|604800s|each_day|each_month>_bucket_consumer_<consumer>`.
+
+The counters are exported by the gateway pods on
+`:15020/stats/prometheus`; the pods carry the standard
+`prometheus.io/scrape: "true"`, `prometheus.io/port: "15020"` and
+`prometheus.io/path: "/stats/prometheus"` annotations, so a Prometheus that
+scrapes pod annotations picks them up. Example queries:
+
+```promql
+# rejections per consumer
+sum by (ai_consumer) (
+  rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_rejected_total.*"}[5m])
+)
+
+# which combination and window produce them (in the name, not a label)
+sum by (__name__) (
+  rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_rejected_total.*"}[5m])
+)
+
+# enforcement sanity: rejected share of checked requests
+sum (rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_request_total_rule_gpustack_rate_limit_result_limited"}[5m]))
+/
+sum (rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_request_total_rule_gpustack_rate_limit_result_.*"}[5m]))
+```
+
+!!! note
+
+    On Higress 2.1.x with the AI statistics plugin enabled the bare
+    `gpustack_rate_limit_*` names do not exist in the exposition — always
+    query through the `route_upstream_model_consumer_metric_` prefix. For
+    what is currently counted inside each window, the Redis keys named by
+    `x-ratelimit-limited-key` are the source of truth.
+
+## Reconciler Events
+
+The server runs a reconciler that watches the API-key and user tables and
+republishes the rate-limit WasmPlugin CR within one reconcile interval (30
+seconds by default, `GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS`).
+Its events and log lines carry the `gateway_rate_limit_reconciler` source
+tag (for example `gateway_rate_limit_reconciler.api_key`). That tag marks
+an event source, not a Prometheus metric — the reconciler itself exports no
+metrics. Seeing it in the event log means a limit change was picked up and
+pushed to the gateway.
