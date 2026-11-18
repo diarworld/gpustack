@@ -118,31 +118,68 @@ The counters are exported by the gateway pods on
 `:15020/stats/prometheus`; the pods carry the standard
 `prometheus.io/scrape: "true"`, `prometheus.io/port: "15020"` and
 `prometheus.io/path: "/stats/prometheus"` annotations, so a Prometheus that
-scrapes pod annotations picks them up. Example queries:
+scrapes pod annotations picks them up.
+
+### Shortening the Names with Relabeling
+
+Envoy stats have no label dimensions — the plugin can only encode them in
+the stat name, and the AI skeleton prefix is what makes Higress's built-in
+bootstrap extractors produce the `ai_*` labels. The cluster-side extractor
+config is fixed on this Higress version (an EnvoyFilter BOOTSTRAP patch is
+not honored), so the way to get short names with the ids as labels is
+`metric_relabel_configs` on the Prometheus side. Applied to the gateway
+scrape job, this turns the names above into
+`gpustack_rate_limit_{request,rejected,value}_total` with
+`rl_combo` / `rl_kind` / `rl_period` / `rl_bucket` / `rl_result` labels:
+
+```yaml
+metric_relabel_configs:
+  # ids out of the flattened name, into labels — these rules read the
+  # ORIGINAL name, so they must come before the rename below.
+  - source_labels: [__name__]
+    regex: gpustack_rate_limit_request_total_rule_.*_result_(.+)
+    target_label: rl_result
+  - source_labels: [__name__]
+    regex: .*_combo_(.+?)_kind_.*
+    target_label: rl_combo
+  - source_labels: [__name__]
+    regex: .*_kind_(.+?)_period_.*
+    target_label: rl_kind
+  - source_labels: [__name__]
+    regex: .*_period_(.+?)_bucket_consumer_.*
+    target_label: rl_period
+  - source_labels: [__name__]
+    regex: .*_bucket_consumer_(.+)
+    target_label: rl_bucket
+  # shorten the name last
+  - source_labels: [__name__]
+    regex: route_upstream_model_consumer_metric_(gpustack_rate_limit_(?:request|rejected|value)_total).*
+    target_label: __name__
+    replacement: ${1}
+```
+
+Example queries in terms of the relabeled names:
 
 ```promql
 # rejections per consumer
-sum by (ai_consumer) (
-  rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_rejected_total.*"}[5m])
-)
+sum by (ai_consumer) (rate(gpustack_rate_limit_rejected_total[5m]))
 
-# which combination and window produce them (in the name, not a label)
-sum by (__name__) (
-  rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_rejected_total.*"}[5m])
-)
+# which combination and window produce them
+sum by (rl_combo, rl_kind, rl_period) (rate(gpustack_rate_limit_rejected_total[5m]))
 
 # enforcement sanity: rejected share of checked requests
-sum (rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_request_total_rule_gpustack_rate_limit_result_limited"}[5m]))
+sum (rate(gpustack_rate_limit_request_total{rl_result="limited"}[5m]))
 /
-sum (rate({__name__=~"route_upstream_model_consumer_metric_gpustack_rate_limit_request_total_rule_gpustack_rate_limit_result_.*"}[5m]))
+sum (rate(gpustack_rate_limit_request_total[5m]))
 ```
 
 !!! note
 
     On Higress 2.1.x with the AI statistics plugin enabled the bare
-    `gpustack_rate_limit_*` names do not exist in the exposition — always
-    query through the `route_upstream_model_consumer_metric_` prefix. For
-    what is currently counted inside each window, the Redis keys named by
+    `gpustack_rate_limit_*` names do not exist in the raw exposition — they
+    appear only after the relabeling above. Without it, always query through
+    the `route_upstream_model_consumer_metric_` prefix. For what is currently
+    counted inside each window, the Redis keys named by
     `x-ratelimit-limited-key` are the source of truth.
 
 ## Reconciler Events
