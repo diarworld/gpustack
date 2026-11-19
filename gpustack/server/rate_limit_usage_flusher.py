@@ -23,15 +23,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
+import redis.asyncio as redis_asyncio
 from sqlalchemy import delete
 from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.config.config import Config
+from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit_usage import (
+    CALENDAR_PERIODS,
+    CONSUMER_DIM_PREFIX,
     DEFAULT_PLAN_COMBO,
     ROLLING_TOKEN_PERIOD,
     RULE_NAME,
+    USER_IDENTITY_PREFIX,
     RateLimitUsageReader,
+    RateLimitWindowState,
     RateLimitWindowSpec,
     calendar_elapsed_seconds,
     expected_windows,
@@ -61,24 +67,17 @@ RETENTION_DAYS = 90
 # SCAN hint per call; the loop runs until the cursor wraps to 0 regardless.
 SCAN_BATCH = 500
 
-# The calendar suffixes the plugin's PeriodKind declares (the reconciler never
-# publishes each_year, but its counters must still parse if they appear).
-_CALENDAR_SUFFIXES = ("each_day", "each_month", "each_year")
-
-_CONSUMER_PREFIX = "consumer="
-_IDENTITY_USER_PREFIX = "gpustack-"
-
 
 @dataclass
 class ParsedKey:
     """The identity one Redis counter key carries, structurally parsed.
 
     ``combo`` is the key's second segment (``default-plan`` / ``user-<id>`` /
-    ``key-<id>``), ``identity`` the value of its single ``consumer=`` dim
-    fragment, and the (kind, period, window_seconds) triple the suffix's
-    metric: rolling suffixes render as ``<seconds>s``, calendar ones as
-    ``each_<unit>`` with ``window_seconds`` unset (their length follows the
-    calendar, not a constant).
+    ``key-<id>``), ``identity`` the value of its single consumer-dim
+    fragment (``CONSUMER_DIM_PREFIX`` + identity), and the (kind, period,
+    window_seconds) triple the suffix's metric: rolling suffixes render as
+    ``<seconds>s``, calendar ones as ``each_<unit>`` with ``window_seconds``
+    unset (their length follows the calendar, not a constant).
     """
 
     combo: str
@@ -111,7 +110,7 @@ def _parse_suffix(suffix: str) -> Tuple[str, str, Optional[int]]:
         window = _rolling_seconds(period)
         return ("query", period, window) if window is not None else (None, "", None)
     if prefix == "t":
-        if period in _CALENDAR_SUFFIXES:
+        if period in CALENDAR_PERIODS:
             return ("token_calendar", period, None)
         window = _rolling_seconds(period)
         return (
@@ -142,7 +141,9 @@ def parse_rate_limit_key(key: str) -> Optional[ParsedKey]:
         return None
     dims = segments[2:-1]
     consumers = [
-        dim[len(_CONSUMER_PREFIX) :] for dim in dims if dim.startswith(_CONSUMER_PREFIX)
+        dim[len(CONSUMER_DIM_PREFIX) :]
+        for dim in dims
+        if dim.startswith(CONSUMER_DIM_PREFIX)
     ]
     if len(consumers) != 1 or not consumers[0]:
         return None
@@ -172,7 +173,7 @@ def _user_from_identity(identity: str) -> int:
     0 (unattributable) when the segment does not parse: the row still lands,
     keyed on user_id 0, rather than being silently dropped.
     """
-    user_id = _int_tail(identity, _IDENTITY_USER_PREFIX)
+    user_id = _int_tail(identity, USER_IDENTITY_PREFIX)
     if user_id is not None:
         return user_id
     logger.debug("Unattributable default-plan consumer: %s", identity)
@@ -251,9 +252,9 @@ class RateLimitUsageFlusher:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(
-                    "Rate-limit usage flush failed: %s: %s", type(e).__name__, e
-                )
+                # The traceback is what makes an intermittent failure (a DB
+                # blip, a Redis hiccup) diagnosable after the fact.
+                logger.exception(f"Failed to flush gateway rate-limit usage: {e}")
             await asyncio.sleep(self._interval)
 
     async def _flush_once(self):
@@ -267,43 +268,48 @@ class RateLimitUsageFlusher:
             # start() only loops with a Redis backend; defensive no-op for
             # direct _flush_once callers.
             return
-        # The SCAN rides the reader's own connection pool: one client per
-        # process is the contract (reader_from_config), and the flusher's
-        # path-limited scope keeps the attribute access internal to this
-        # module rather than widening the toolkit's surface.
-        discovered = await self._discover(self._reader._client)
-        if not discovered:
-            return
+        discovered = await self._discover(self._reader.client)
         async with async_session() as session:
-            kept = await self._attribute(session, rlc, discovered)
-            if kept:
-                specs = [
-                    RateLimitWindowSpec(
-                        kind=item.kind,
-                        period=item.period,
-                        window_seconds=item.window_seconds,
-                        # The reader derives totals from the ZSET members; the
-                        # limit rides along only to keep the spec complete.
-                        limit=item.quota or 0,
-                        redis_key=redis_key,
+            if discovered:
+                kept = await self._attribute(session, rlc, discovered)
+                if kept:
+                    specs = [
+                        RateLimitWindowSpec(
+                            kind=item.kind,
+                            period=item.period,
+                            window_seconds=item.window_seconds,
+                            # The reader derives totals from the ZSET members;
+                            # the limit rides along only to keep the spec
+                            # complete.
+                            limit=item.quota or 0,
+                            redis_key=redis_key,
+                        )
+                        for redis_key, item in kept
+                    ]
+                    states, usage_error = await read_windows(
+                        self._reader, specs, now=now, timezone_name=rlc.timezone
                     )
-                    for redis_key, item in kept
-                ]
-                states, usage_error = await read_windows(
-                    self._reader, specs, now=now, timezone_name=rlc.timezone
-                )
-                if usage_error is not None:
-                    # Fail open: the whole cycle is dropped and the DB left
-                    # untouched rather than mixing fresh and stale counters.
-                    logger.warning("Rate-limit usage flush skipped: %s", usage_error)
-                    return
-                await self._upsert(
-                    session, [item for _, item in kept], states, now, rlc.timezone
-                )
+                    if usage_error is not None:
+                        # Fail open: read_windows already logged the class
+                        # name. The whole cycle is dropped before any DB
+                        # write rather than mixing fresh and stale counters.
+                        return
+                    await self._upsert(
+                        session,
+                        [item for _, item in kept],
+                        states,
+                        now,
+                        rlc.timezone,
+                    )
+            # The retention sweep runs every cycle that reaches the database:
+            # a decommissioned plugin or quiet counters must not strand
+            # stale snapshots behind the early returns above.
             await self._prune(session, now)
             await session.commit()
 
-    async def _discover(self, client) -> List[Tuple[str, ParsedKey]]:
+    async def _discover(
+        self, client: redis_asyncio.Redis
+    ) -> List[Tuple[str, ParsedKey]]:
         """Every persistable window found in one SCAN sweep.
 
         Explicit cursor loop (not ``scan_iter``): the plugin's key space is
@@ -334,8 +340,8 @@ class RateLimitUsageFlusher:
 
     async def _attribute(
         self,
-        session,
-        rlc,
+        session: AsyncSession,
+        rlc: GatewayRateLimitConfig,
         discovered: List[Tuple[str, ParsedKey]],
     ) -> List[Tuple[str, Attribution]]:
         """Resolve each discovered key's row identity and quota.
@@ -385,7 +391,7 @@ class RateLimitUsageFlusher:
 
     def _resolve(
         self,
-        rlc,
+        rlc: GatewayRateLimitConfig,
         redis_key: str,
         parsed: ParsedKey,
         api_keys: Dict[int, ApiKey],
@@ -401,7 +407,9 @@ class RateLimitUsageFlusher:
         logger.debug("Unknown combo segment on %s", redis_key)
         return None
 
-    def _resolve_default_plan(self, rlc, parsed: ParsedKey) -> Attribution:
+    def _resolve_default_plan(
+        self, rlc: GatewayRateLimitConfig, parsed: ParsedKey
+    ) -> Attribution:
         """The deployment defaults' combo: the user id comes from the
         captured ``gpustack-<id>`` dim, not from any database row."""
         user_id = _user_from_identity(parsed.identity)
@@ -422,7 +430,7 @@ class RateLimitUsageFlusher:
 
     def _resolve_user_budget(
         self,
-        rlc,
+        rlc: GatewayRateLimitConfig,
         parsed: ParsedKey,
         budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
     ) -> Optional[Attribution]:
@@ -453,7 +461,7 @@ class RateLimitUsageFlusher:
         parsed: ParsedKey,
         api_keys: Dict[int, ApiKey],
         budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
-        rlc,
+        rlc: GatewayRateLimitConfig,
     ) -> Optional[Attribution]:
         """The non-fallback combo of one explicitly-limited API key."""
         api_key_id = _int_tail(parsed.combo, "key-")
@@ -500,9 +508,9 @@ class RateLimitUsageFlusher:
 
     async def _upsert(
         self,
-        session,
+        session: AsyncSession,
         items: List[Attribution],
-        states,
+        states: List[RateLimitWindowState],
         now: datetime,
         timezone_name: str,
     ):
@@ -541,7 +549,7 @@ class RateLimitUsageFlusher:
             existing.quota = item.quota
             existing.updated_at = now
 
-    async def _prune(self, session, now: datetime):
+    async def _prune(self, session: AsyncSession, now: datetime):
         """Drop snapshots older than the retention window."""
         cutoff = now - timedelta(days=RETENTION_DAYS)
         await session.exec(

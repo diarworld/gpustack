@@ -25,6 +25,7 @@ from gpustack.schemas.gateway_rate_limit_usages import GatewayRateLimitUsage
 from gpustack.schemas.principals import Principal
 from gpustack.server import rate_limit_usage_flusher as flusher_module
 from gpustack.server.rate_limit_usage_flusher import (
+    SCAN_BATCH,
     ParsedKey,
     RateLimitUsageFlusher,
     parse_rate_limit_key,
@@ -82,14 +83,17 @@ class FakeRedis:
     """Stand-in for redis.asyncio.Redis exposing SCAN and ZRANGEBYSCORE.
 
     Seeded as ``{key: [(score, member), ...]}``; SCAN filters by fnmatch.
-    The zrangebyscore bound parsing mirrors redis-py: a leading ``(`` marks
-    the bound exclusive, bare numbers inclusive. With ``fail_reads`` set,
-    every ZRANGEBYSCORE raises.
+    With ``scan_pages`` > 1 the first SCAN defers half the matching keys to
+    a second page (cursor 1), exercising the flusher's cursor loop. The
+    zrangebyscore bound parsing mirrors redis-py: a leading ``(`` marks the
+    bound exclusive, bare numbers inclusive. With ``fail_reads`` set, every
+    ZRANGEBYSCORE raises.
     """
 
-    def __init__(self, members, *, fail_reads=False):
+    def __init__(self, members, *, fail_reads=False, scan_pages=1):
         self._members = members
         self._fail_reads = fail_reads
+        self._scan_pages = scan_pages
         self.scan_calls = []
 
     async def scan(self, cursor=0, match=None, count=None):
@@ -97,7 +101,14 @@ class FakeRedis:
         hits = [
             key for key in self._members if match is None or fnmatch.fnmatch(key, match)
         ]
-        return 0, hits
+        if self._scan_pages <= 1:
+            return 0, hits
+        # Two-page sweep: the first call hands back a live cursor and only
+        # half the keyspace; the loop must come back for the rest.
+        midpoint = len(hits) // 2
+        if cursor == 0:
+            return 1, hits[:midpoint]
+        return 0, hits[midpoint:]
 
     @staticmethod
     def _bound(value):
@@ -224,6 +235,28 @@ def frozen_now(monkeypatch):
     return FIXED_NOW
 
 
+class ShiftingDateTime(datetime):
+    """``datetime.now()`` advanced by ``offset_seconds`` from FIXED_NOW;
+    a test bumps the class attribute between cycles to move the shared
+    clock (the fixture restores it)."""
+
+    offset_seconds = 0
+
+    @classmethod
+    def now(cls, tz=None):
+        value = FIXED_NOW + timedelta(seconds=cls.offset_seconds)
+        if tz is not None:
+            return value.astimezone(tz)
+        return value.replace(tzinfo=None)
+
+
+@pytest.fixture
+def shifting_now(monkeypatch):
+    monkeypatch.setattr(flusher_module, "datetime", ShiftingDateTime)
+    monkeypatch.setattr(ShiftingDateTime, "offset_seconds", 0)
+    return ShiftingDateTime
+
+
 def _flusher(cfg) -> RateLimitUsageFlusher:
     return RateLimitUsageFlusher(SimpleNamespace(gateway_rate_limit=cfg))
 
@@ -247,6 +280,16 @@ async def _run_cycle(monkeypatch, flusher, redis, session):
                 combo="default-plan",
                 kind="token_calendar",
                 period="each_day",
+                window_seconds=None,
+                identity="gpustack-7",
+            ),
+        ),
+        (
+            f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_year",
+            ParsedKey(
+                combo="default-plan",
+                kind="token_calendar",
+                period="each_year",
                 window_seconds=None,
                 identity="gpustack-7",
             ),
@@ -415,8 +458,9 @@ async def test_per_minute_windows_are_not_persisted(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unparseable_keys_touch_nothing(frozen_now, monkeypatch):
-    """A sweep finding only off-layout keys opens no session at all."""
+async def test_unparseable_keys_write_nothing_but_still_prune(frozen_now, monkeypatch):
+    """An off-layout-only sweep upserts nothing, yet the retention DELETE
+    still runs: quiet counters must not strand stale snapshots."""
     redis = FakeRedis(
         _seed(
             {
@@ -432,8 +476,8 @@ async def test_unparseable_keys_touch_nothing(frozen_now, monkeypatch):
     await _run_cycle(monkeypatch, _flusher(_cfg()), redis, session)
 
     assert session.added == []
-    assert session.statements == []
-    assert session.commit_calls == 0
+    assert [type(statement).__name__ for statement in session.statements] == ["Delete"]
+    assert session.commit_calls == 1
 
 
 @pytest.mark.asyncio
@@ -457,9 +501,88 @@ async def test_unknown_combo_is_skipped_without_raising(frozen_now, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_scan_sweep_walks_every_page(frozen_now, monkeypatch):
+    """A non-zero next cursor defers part of the keyspace to a second page:
+    the sweep walks every page and propagates the match/count contract to
+    each call."""
+    redis = FakeRedis(
+        _seed(
+            {
+                DAY_KEY: [(100, "a", 700)],
+                f"{rate_limit_plugin_name}|user-7|consumer=gpustack-7|t:604800s": [
+                    (30, "w", 900)
+                ],
+            }
+        ),
+        scan_pages=2,
+    )
+    session = FakeSession(users=[_user(7, weekly=100_000)])
+    await _run_cycle(monkeypatch, _flusher(_cfg()), redis, session)
+
+    assert redis.scan_calls == [
+        (0, f"{rate_limit_plugin_name}|*", SCAN_BATCH),
+        (1, f"{rate_limit_plugin_name}|*", SCAN_BATCH),
+    ]
+    # Keys from both pages produced their rows.
+    assert {row.period for row in session.added} == {"each_day", "604800s"}
+
+
+@pytest.mark.asyncio
+async def test_rolling_window_inserts_a_new_row_each_cycle(shifting_now, monkeypatch):
+    """Rolling windows slide with the shared clock: a second cycle lands on
+    a different window start and INSERTs a new row — the row-per-cycle churn
+    the unique key plus retention are designed to absorb."""
+    redis = FakeRedis(
+        _seed(
+            {
+                f"{rate_limit_plugin_name}|user-7|consumer=gpustack-7|t:604800s": [
+                    (30, "w", 900)
+                ]
+            }
+        )
+    )
+    session = FakeSession(users=[_user(7, weekly=100_000)])
+    flusher = _flusher(_cfg())
+    await _run_cycle(monkeypatch, flusher, redis, session)
+
+    shifting_now.offset_seconds = 60
+    await _run_cycle(monkeypatch, flusher, redis, session)
+
+    assert session.commit_calls == 2
+    assert len(session.added) == 2  # both cycles INSERTed, neither updated
+    starts = sorted(row.window_start for row in session.usages)
+    assert starts == [
+        FIXED_NOW - timedelta(seconds=604800),
+        FIXED_NOW + timedelta(seconds=60) - timedelta(seconds=604800),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_key_combo_without_its_row_keeps_the_key_attribution(
+    frozen_now, monkeypatch
+):
+    """The combo segment is the authoritative attribution: a snapshot whose
+    key row has vanished still lands, keyed on user 0 with an unresolvable
+    quota — the row outlives the key it names."""
+    gone_key = f"{rate_limit_plugin_name}|key-99|consumer=ak-gone.gpustack-7|t:each_day"
+    redis = FakeRedis(_seed({gone_key: [(100, "a", 700)]}))
+    session = FakeSession()
+    await _run_cycle(monkeypatch, _flusher(_cfg()), redis, session)
+
+    (row,) = session.added
+    assert (row.combo_name, row.user_id, row.api_key_id, row.quota) == (
+        "key-99",
+        0,
+        99,
+        None,
+    )
+    assert row.usage == 700
+
+
+@pytest.mark.asyncio
 async def test_read_failure_leaves_db_untouched(frozen_now, monkeypatch, caplog):
     """A failed batch read drops the whole cycle — no upserts, no commit —
-    and only the exception's class name surfaces in the warning."""
+    and read_windows' single class-name-only warning is the only trace."""
     redis = FakeRedis(_seed({DAY_KEY: [(100, "a", 700)]}), fail_reads=True)
     session = FakeSession(users=[_user(7)])
     with caplog.at_level(logging.WARNING):
@@ -467,7 +590,7 @@ async def test_read_failure_leaves_db_untouched(frozen_now, monkeypatch, caplog)
 
     assert session.added == []
     assert session.commit_calls == 0
-    assert "RedisError" in caplog.text
+    assert "rate-limit window reads failed: RedisError" in caplog.text
     assert "redis-host" not in caplog.text
 
 

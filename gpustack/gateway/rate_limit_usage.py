@@ -72,8 +72,17 @@ DAY_PERIOD = "each_day"
 MONTH_PERIOD = "each_month"
 
 # The plugin's full calendar vocabulary: the pair above plus each_year, which
-# the plugin declares but the reconciler never publishes.
-_CALENDAR_PERIODS = (DAY_PERIOD, MONTH_PERIOD, "each_year")
+# the plugin declares but the reconciler never publishes. Public: read-side
+# consumers (the usage flusher) parse every suffix the plugin can write.
+CALENDAR_PERIODS = (DAY_PERIOD, MONTH_PERIOD, "each_year")
+
+# The key layout's dim-fragment and identity vocabulary: the consumer
+# dimension renders as ``consumer=<identity>``, and the user-bucketed
+# identity the fallback combos capture is ``gpustack-<user_id>``. The byte
+# layout of the Redis keys is the plugin's documented one (see the module
+# docstring), so every builder and parser composes from these constants.
+CONSUMER_DIM_PREFIX = "consumer="
+USER_IDENTITY_PREFIX = "gpustack-"
 
 
 @dataclass
@@ -112,7 +121,9 @@ def _window(
         period=period,
         window_seconds=window_seconds,
         limit=limit,
-        redis_key=f"{RULE_NAME}|{combo}|consumer={identity}|{prefix}:{period}",
+        redis_key=(
+            f"{RULE_NAME}|{combo}|{CONSUMER_DIM_PREFIX}{identity}|{prefix}:{period}"
+        ),
     )
 
 
@@ -122,7 +133,7 @@ def _default_plan_windows(
     """The deployment defaults exactly as ``default_plan_combination``
     renders them: a window exists only when its limit is configured. The
     match is the user capture, so every window buckets on ``gpustack-<id>``."""
-    identity = f"gpustack-{user_id}"
+    identity = f"{USER_IDENTITY_PREFIX}{user_id}"
     combo = DEFAULT_PLAN_COMBO
     windows: List[RateLimitWindowSpec] = []
     if rlc.default_rpm:
@@ -188,7 +199,7 @@ def _user_budget_windows(
     ``user_budget_combination``. Its capture merges the API-key and UI
     consumer shapes onto the same ``gpustack-<id>`` bucket the default plan
     uses, which is why both fallback combos' keys share the identity."""
-    identity = f"gpustack-{user_id}"
+    identity = f"{USER_IDENTITY_PREFIX}{user_id}"
     combo = user_budget_combo(user_id)
     windows: List[RateLimitWindowSpec] = []
     if weekly:
@@ -364,7 +375,7 @@ def _calendar_period_bounds(
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    if period not in _CALENDAR_PERIODS:
+    if period not in CALENDAR_PERIODS:
         raise ValueError(f"unknown calendar period: {period!r}")
     local = now.astimezone(zone)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -443,6 +454,12 @@ class RateLimitUsageReader:
 
     def __init__(self, client: redis_asyncio.Redis):
         self._client = client
+
+    @property
+    def client(self) -> redis_asyncio.Redis:
+        """The underlying client, for SCAN-style sweeps by long-lived
+        consumers (the usage flusher); tests reach the dial plan through it."""
+        return self._client
 
     async def window_state(
         self, redis_key: str, *, window_seconds: int, now: int

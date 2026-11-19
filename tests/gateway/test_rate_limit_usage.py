@@ -348,6 +348,13 @@ def test_reader_from_config_without_redis_is_none():
     assert reader_from_config(cfg) is None
 
 
+def test_reader_exposes_its_client():
+    """The property hands back exactly the injected client: long-lived
+    consumers (the usage flusher) SCAN through the same pool they read with."""
+    client = _FakeRedis({})
+    assert RateLimitUsageReader(client).client is client
+
+
 def test_reader_from_config_dials_gateway_service():
     redis_cfg = GatewayRateLimitRedis(
         service_name="rate-limit-redis",
