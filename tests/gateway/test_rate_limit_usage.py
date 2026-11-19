@@ -84,7 +84,7 @@ class _FakeRedis:
             return float(value[1:]), True
         return float(value), False
 
-    async def zrangebyscore(self, key, lo, hi, withscores=False):
+    def _zrangebyscore_sync(self, key, lo, hi, withscores=False):
         lo_value, lo_exclusive = self._bound(lo)
         hi_value, hi_exclusive = self._bound(hi)
         hits = [
@@ -97,6 +97,38 @@ class _FakeRedis:
         if not withscores:
             return [member for member, _ in hits]
         return hits
+
+    async def zrangebyscore(self, key, lo, hi, withscores=False):
+        return self._zrangebyscore_sync(key, lo, hi, withscores)
+
+    def pipeline(self, transaction=False):
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    """Queues ZRANGEBYSCORE commands and replays them on ``execute`` — the
+    slice of redis-py's pipeline the batched reader uses."""
+
+    def __init__(self, client):
+        self._client = client
+        self._commands = []
+
+    def zrangebyscore(self, key, lo, hi, withscores=False):
+        self._commands.append((key, lo, hi, withscores))
+        return self
+
+    async def execute(self, raise_on_error=True):
+        results = []
+        for key, lo, hi, withscores in self._commands:
+            try:
+                results.append(
+                    self._client._zrangebyscore_sync(key, lo, hi, withscores)
+                )
+            except Exception as exc:
+                if raise_on_error:
+                    raise
+                results.append(exc)
+        return results
 
 
 def test_default_plan_keys():

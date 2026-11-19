@@ -28,12 +28,12 @@ which keys exist for a given request path:
 
 Live reads sit on top of the specs: :class:`RateLimitUsageReader` totals the
 plugin's counters per window -- :meth:`~RateLimitUsageReader.read_window` is
-the per-window entry point, and :func:`read_windows` the batch helper the
-endpoint and the flusher call -- applying the reset semantics each window
-kind actually has.
+the per-window entry point, :meth:`~RateLimitUsageReader.window_states` the
+pipelined batch, and :func:`read_windows` the fail-open wrapper the endpoint
+and the flusher call -- applying the reset semantics each window kind
+actually has.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -496,7 +496,7 @@ class RateLimitUsageReader:
     ) -> RateLimitWindowState:
         """Window state with the reset semantics each kind actually has:
         rolling = member aging, calendar = period boundary. The only entry
-        point endpoint/flusher code should call.
+        point for a single window; batches go through :meth:`window_states`.
 
         The one ``now`` drives both the read instant and the calendar
         boundary math, so the two cannot drift apart; ``timezone_name`` is
@@ -511,9 +511,98 @@ class RateLimitUsageReader:
         window_seconds = spec.window_seconds or calendar_elapsed_seconds(
             spec.period, now, timezone_name
         )
-        state = await self.window_state(
-            spec.redis_key, window_seconds=window_seconds, now=int(now.timestamp())
+        members = await self._client.zrangebyscore(
+            spec.redis_key,
+            f"({int(now.timestamp()) - window_seconds}",
+            int(now.timestamp()),
+            withscores=True,
         )
+        return self._state_from_members(
+            spec,
+            members,
+            window_seconds=window_seconds,
+            now=now,
+            timezone_name=timezone_name,
+        )
+
+    async def window_states(
+        self,
+        specs: List[RateLimitWindowSpec],
+        *,
+        now: datetime,
+        timezone_name: str,
+    ) -> List[RateLimitWindowState]:
+        """Every window state in one pipeline round trip.
+
+        The endpoint reads a whole user's picture and the flusher sweeps
+        every user's windows -- hundreds of windows a batch. One concurrent
+        ``ZRANGEBYSCORE`` per window blew through the client's connection
+        pool (redis-py raises ``MaxConnectionsError`` past its cap) and
+        cost a round trip each; a pipeline queues every command on ONE
+        connection, so batch size costs no connections at all.
+
+        One ``now`` drives every read and every calendar boundary, so the
+        states describe a single instant. ``now`` must be timezone-aware.
+        Any command-level failure raises -- :func:`read_windows` turns that
+        into the fail-open blank batch.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        now_ts = int(now.timestamp())
+        pipe = self._client.pipeline(transaction=False)
+        bounds: List[int] = []
+        for spec in specs:
+            # Calendar specs carry no fixed length: bound the read to the
+            # live portion of the running period.
+            window_seconds = spec.window_seconds or calendar_elapsed_seconds(
+                spec.period, now, timezone_name
+            )
+            bounds.append(window_seconds)
+            pipe.zrangebyscore(
+                spec.redis_key,
+                f"({now_ts - window_seconds}",
+                now_ts,
+                withscores=True,
+            )
+        results = await pipe.execute(raise_on_error=False)
+        first_error = next((r for r in results if isinstance(r, BaseException)), None)
+        if first_error is not None:
+            raise first_error
+        return [
+            self._state_from_members(
+                spec,
+                members,
+                window_seconds=window_seconds,
+                now=now,
+                timezone_name=timezone_name,
+            )
+            for spec, window_seconds, members in zip(specs, bounds, results)
+        ]
+
+    def _state_from_members(
+        self,
+        spec: RateLimitWindowSpec,
+        members: List[Union[str, bytes]],
+        *,
+        window_seconds: int,
+        now: datetime,
+        timezone_name: str,
+    ) -> RateLimitWindowState:
+        """Sum the pruned members and apply the reset semantics each window
+        kind actually has: rolling = member aging, calendar = the period's
+        end. Shared by the single and batched reads so the two cannot drift
+        apart."""
+        if not members:
+            state = RateLimitWindowState(used=0, reset_seconds=0)
+        else:
+            used = sum(parse_member_count(member) for member, _ in members)
+            oldest = min(score for _, score in members)
+            state = RateLimitWindowState(
+                used=used,
+                reset_seconds=max(
+                    0, ceil(oldest + window_seconds - int(now.timestamp()))
+                ),
+            )
         if spec.window_seconds is None:
             # Member aging is meaningless for a calendar quota; the count
             # drops at the period boundary.
@@ -539,27 +628,15 @@ async def read_windows(
     and stale counters. Only the exception's class name surfaces — its
     message can carry hostnames.
 
-    This is the batch entry point the usage endpoint and the flusher share;
-    :meth:`RateLimitUsageReader.read_window` underneath applies the reset
-    semantics each window kind actually has.
-
-    Returns:
-        (states, error): one state per spec, aligned with ``specs``, or all
-        ``None`` with ``error`` set to the first failure's class name.
+    This is the batch entry point the usage endpoint and the flusher share.
     """
-    results = await asyncio.gather(
-        *(
-            reader.read_window(spec, now=now, timezone_name=timezone_name)
-            for spec in specs
-        ),
-        return_exceptions=True,
-    )
-    first_error = next((r for r in results if isinstance(r, BaseException)), None)
-    if first_error is None:
-        return list(results), None
-    usage_error = type(first_error).__name__
-    logger.warning("rate-limit window reads failed: %s", usage_error)
-    return [None] * len(specs), usage_error
+    try:
+        states = await reader.window_states(specs, now=now, timezone_name=timezone_name)
+        return states, None
+    except Exception as exc:
+        usage_error = type(exc).__name__
+        logger.warning("rate-limit window reads failed: %s", usage_error)
+        return [None] * len(specs), usage_error
 
 
 def reader_from_config(cfg: Config) -> Optional[RateLimitUsageReader]:

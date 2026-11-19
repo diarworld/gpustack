@@ -125,13 +125,17 @@ class FakeReader:
         self._states = states or {}
         self._error = error
 
-    async def read_window(self, spec, *, now, timezone_name):
-        self.specs.append(spec)
-        if spec.redis_key in self._states:
-            return self._states[spec.redis_key]
-        if self._error is not None:
-            raise self._error
-        return RateLimitWindowState(used=3, reset_seconds=10)
+    async def window_states(self, specs, *, now, timezone_name):
+        self.specs.extend(specs)
+        states = []
+        for spec in specs:
+            if spec.redis_key in self._states:
+                states.append(self._states[spec.redis_key])
+            elif self._error is not None:
+                raise self._error
+            else:
+                states.append(RateLimitWindowState(used=3, reset_seconds=10))
+        return states
 
 
 class FakeRedis:
@@ -151,7 +155,7 @@ class FakeRedis:
             return float(value[1:]), True
         return float(value), False
 
-    async def zrangebyscore(self, key, lo, hi, withscores=False):
+    def _zrangebyscore_sync(self, key, lo, hi, withscores=False):
         lo_value, lo_exclusive = self._bound(lo)
         hi_value, hi_exclusive = self._bound(hi)
         hits = [
@@ -164,6 +168,38 @@ class FakeRedis:
         if not withscores:
             return [member for member, _ in hits]
         return hits
+
+    async def zrangebyscore(self, key, lo, hi, withscores=False):
+        return self._zrangebyscore_sync(key, lo, hi, withscores)
+
+    def pipeline(self, transaction=False):
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    """Queues ZRANGEBYSCORE commands and replays them on ``execute`` — the
+    slice of redis-py's pipeline the batched reader uses."""
+
+    def __init__(self, client):
+        self._client = client
+        self._commands = []
+
+    def zrangebyscore(self, key, lo, hi, withscores=False):
+        self._commands.append((key, lo, hi, withscores))
+        return self
+
+    async def execute(self, raise_on_error=True):
+        results = []
+        for key, lo, hi, withscores in self._commands:
+            try:
+                results.append(
+                    self._client._zrangebyscore_sync(key, lo, hi, withscores)
+                )
+            except Exception as exc:
+                if raise_on_error:
+                    raise
+                results.append(exc)
+        return results
 
 
 class FrozenDateTime(datetime):
