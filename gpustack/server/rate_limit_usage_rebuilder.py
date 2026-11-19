@@ -40,7 +40,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlmodel import select
@@ -120,10 +119,6 @@ class RateLimitUsageRebuilder:
     def __init__(self, config: Config):
         self._config = config
         self._warmed = False
-        rlc = config.gateway_rate_limit
-        # The details table's ``date`` column holds this timezone's calendar
-        # date, so the scan bounds follow it, not UTC.
-        self._timezone = rlc.timezone if rlc is not None else "UTC"
 
     async def start(self):
         if self._config.gateway_rate_limit is None:
@@ -246,19 +241,19 @@ class RateLimitUsageRebuilder:
         than resurrect it. ``cutoffs`` tells which (user, kind) pairs the
         ``forgiven`` map governs; the rest read ``plain``.
 
-        The range rides the indexed ``date`` column, which holds the
-        deployment timezone's calendar date -- it can sit a day ahead of or
-        behind the UTC date, so the bounds are padded and the real filter
-        runs per row on the coalesced completion stamp. Keyless rows (UI
-        traffic) bucket under ``api_key_id`` None and feed only user-level
-        combos.
+        The range rides the indexed ``date`` column, which holds the server
+        process's local calendar date -- it can sit a day ahead of or behind
+        the UTC date and of the gateway's calendar timezone alike, so the
+        bounds are padded by a day on both ends and the real filter runs per
+        row on the coalesced completion stamp. Keyless rows (UI traffic)
+        bucket under ``api_key_id`` None and feed only user-level combos.
         """
-        local_now = now.astimezone(ZoneInfo(self._timezone))
+        # The scan is only a pre-range; the +1-day pads keep it correct for
+        # any server offset while the row-level ts filter does the real work.
         min_date = (
-            (datetime.fromtimestamp(min_start_ts, timezone.utc) - timedelta(days=1))
-            .astimezone(ZoneInfo(self._timezone))
-            .date()
-        )
+            datetime.fromtimestamp(min_start_ts, timezone.utc) - timedelta(days=1)
+        ).date()
+        max_date = now.date() + timedelta(days=1)
         async with async_session() as session:
             resets = (await session.exec(select(GatewayRateLimitReset))).all()
             rows = (
@@ -275,7 +270,7 @@ class RateLimitUsageRebuilder:
                         ModelUsageDetails.completion_token_count,
                     ).where(
                         ModelUsageDetails.date >= min_date,
-                        ModelUsageDetails.date <= local_now.date(),
+                        ModelUsageDetails.date <= max_date,
                     )
                 )
             ).all()

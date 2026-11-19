@@ -436,20 +436,19 @@ async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scan_bounds_follow_the_local_date(frozen_now, monkeypatch):
-    """``model_usage_details.date`` holds the deployment timezone's date,
-    which runs ahead of UTC: at 12:00 UTC in a +13 timezone it is already
-    tomorrow locally, and the locally-dated rows of that day must be in
-    the scan range."""
-    rlc = _cfg(timezone="Pacific/Auckland")
+async def test_scan_covers_rows_dated_outside_the_utc_day(frozen_now, monkeypatch):
+    """``model_usage_details.date`` holds the server's local date, which
+    runs a day ahead of UTC on a +08:00 server with a UTC gateway: rows of
+    the locally-current day must stay inside the scan range."""
+    rlc = _cfg()
     user7 = _user(7)
     key42 = _key(42, access_key="ak-abc", user_id=7)
-    # 11:30 UTC = 00:30 local (Nov 20): the row is dated tomorrow-UTC.
+    # 11:30 UTC = 00:30 local next day: the row is dated tomorrow-UTC.
     rows = [_row(7, 42, datetime(2026, 11, 19, 11, 30), 300, 0)]
 
     client, shared, rebuild = await _run(monkeypatch, rlc, [user7], [key42], rows)
 
-    # The scan's upper date bound is the local date, not the UTC one.
+    # The scan's upper date bound is padded past the UTC date.
     rows_statement = next(
         str(s.compile(compile_kwargs={"literal_binds": True}))
         for s in shared.statements
