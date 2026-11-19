@@ -19,12 +19,14 @@ from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowSpec,
     calendar_elapsed_seconds,
     calendar_window_seconds,
+    default_plan_windows,
     expected_windows,
     parse_member_count,
     read_windows,
     reader_from_config,
     source_for,
-    user_budget_combo,
+    user_limit_combo,
+    user_limit_windows,
 )
 from gpustack.security import gateway_consumer_identity
 
@@ -50,9 +52,17 @@ class _KeyStub:
     id: int
     access_key: Optional[str]
     user_id: int
+    daily_token_limit: Optional[int] = None
+
+
+@dataclass
+class _UserStub:
+    """The Principal attributes the user-level window reconstruction reads."""
+
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
-    daily_token_limit: Optional[int] = None
+    weekly_token_limit: Optional[int] = None
+    monthly_token_limit: Optional[int] = None
 
 
 def _shapes(windows):
@@ -131,8 +141,8 @@ class _FakePipeline:
         return results
 
 
-def test_default_plan_keys():
-    windows = expected_windows(_cfg(), 6, None, None, None)
+def test_default_plan_windows_are_the_fallback_set():
+    windows = default_plan_windows(_cfg(), 6)
     prefix = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-6"
     assert _shapes(windows) == [
         ("query", "60s", 60, 10, f"{prefix}|q:60s"),
@@ -142,106 +152,104 @@ def test_default_plan_keys():
     ]
 
 
-def test_fallback_adds_user_budget_windows():
-    windows = expected_windows(_cfg(), 6, None, 100_000, 200_000)
-    default_prefix = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-6"
-    user_prefix = f"{rate_limit_plugin_name}|user-6|consumer=gpustack-6"
-    # Default-plan windows lead; the user budget combo appends. Both fallback
-    # combos bucket on the captured gpustack-<id> segment, so their keys share
-    # the identity even though the match rules differ.
-    assert [w.redis_key for w in windows] == [
-        f"{default_prefix}|q:60s",
-        f"{default_prefix}|t:60s",
-        f"{default_prefix}|t:each_day",
-        f"{default_prefix}|t:each_month",
-        f"{user_prefix}|t:604800s",
-        f"{user_prefix}|t:each_month",
+def test_user_windows_carry_deployment_defaults():
+    """A user without settings still gets the deployment plan: the key
+    combos their requests also match suppress the fallback default plan, so
+    inheriting is what keeps rpm/tpm/monthly in force."""
+    windows = expected_windows(_cfg(), 6, None, None)
+    prefix = f"{rate_limit_plugin_name}|user-6|consumer=gpustack-6"
+    assert _shapes(windows) == [
+        ("query", "60s", 60, 10, f"{prefix}|q:60s"),
+        ("token_rolling", "60s", 60, 60_000, f"{prefix}|t:60s"),
+        ("token_calendar", "each_month", None, 20_000_000, f"{prefix}|t:each_month"),
     ]
-    by_key = {w.redis_key: w.limit for w in windows}
-    assert by_key[f"{user_prefix}|t:604800s"] == 100_000
-    assert by_key[f"{user_prefix}|t:each_month"] == 200_000
-    assert windows[4].window_seconds == WEEK_IN_SECONDS
 
 
-def test_explicit_key_windows():
-    key = _KeyStub(id=42, access_key="ak-abc123", user_id=6, rpm_limit=5)
-    windows = expected_windows(_cfg(), 6, key, 100_000, 200_000)
+def test_user_windows_override_defaults_and_add_weekly():
+    user = _UserStub(
+        rpm_limit=30,
+        tpm_limit=200_000,
+        weekly_token_limit=100_000,
+        monthly_token_limit=200_000_000,
+    )
+    windows = expected_windows(_cfg(), 6, None, user)
+    prefix = f"{rate_limit_plugin_name}|user-6|consumer=gpustack-6"
+    assert _shapes(windows) == [
+        ("query", "60s", 60, 30, f"{prefix}|q:60s"),
+        ("token_rolling", "60s", 60, 200_000, f"{prefix}|t:60s"),
+        ("token_rolling", "604800s", WEEK_IN_SECONDS, 100_000, f"{prefix}|t:604800s"),
+        (
+            "token_calendar",
+            "each_month",
+            None,
+            200_000_000,
+            f"{prefix}|t:each_month",
+        ),
+    ]
+
+
+def test_key_adds_its_own_day_quota_on_top():
+    """The user combo ANDs with the key combo: the shared caps bind every
+    key, and the key's day quota buckets on its full consumer string."""
+    key = _KeyStub(id=42, access_key="ak-abc123", user_id=6)
+    user = _UserStub(weekly_token_limit=100_000)
+    windows = expected_windows(_cfg(), 6, key, user)
     identity = gateway_consumer_identity("ak-abc123", 6)
     # Pin the documented identity format: the consumer string ext-auth
     # injects for an API-key request is <access_key>.gpustack-<user_id>.
     assert identity == "ak-abc123.gpustack-6"
-    prefix = f"{rate_limit_plugin_name}|key-42|consumer={identity}"
+    user_prefix = f"{rate_limit_plugin_name}|user-6|consumer=gpustack-6"
+    key_prefix = f"{rate_limit_plugin_name}|key-42|consumer={identity}"
     assert _shapes(windows) == [
-        ("query", "60s", 60, 5, f"{prefix}|q:60s"),
-        # Unset key fields inherit the deployment default: the fallback is
-        # suppressed for these requests, so without inheritance the guard
-        # would silently vanish.
-        ("token_rolling", "60s", 60, 60_000, f"{prefix}|t:60s"),
-        # The owner's budgets are folded into the key combo.
-        ("token_rolling", "604800s", WEEK_IN_SECONDS, 100_000, f"{prefix}|t:604800s"),
-        ("token_calendar", "each_day", None, 2_000_000, f"{prefix}|t:each_day"),
-        ("token_calendar", "each_month", None, 200_000, f"{prefix}|t:each_month"),
-    ]
-    # A non-fallback match suppresses the fallback group: no default-plan or
-    # user budget keys exist for this request path.
-    assert all(
-        "default-plan|" not in w.redis_key and "user-6|" not in w.redis_key
-        for w in windows
-    )
-
-
-def test_key_combo_monthly_has_no_default_fallback():
-    """Monthly follows the owner's budget only -- unlike daily, it has no
-    deployment default to inherit on key combos."""
-    key = _KeyStub(id=7, access_key="ak-x", user_id=6, rpm_limit=5)
-    windows = expected_windows(_cfg(), 6, key, None, None)
-    assert [(w.kind, w.period) for w in windows] == [
-        ("query", "60s"),
-        ("token_rolling", "60s"),
-        ("token_calendar", "each_day"),
+        ("query", "60s", 60, 10, f"{user_prefix}|q:60s"),
+        ("token_rolling", "60s", 60, 60_000, f"{user_prefix}|t:60s"),
+        (
+            "token_rolling",
+            "604800s",
+            WEEK_IN_SECONDS,
+            100_000,
+            f"{user_prefix}|t:604800s",
+        ),
+        (
+            "token_calendar",
+            "each_month",
+            None,
+            20_000_000,
+            f"{user_prefix}|t:each_month",
+        ),
+        # The key's own day quota inherits the deployment default.
+        ("token_calendar", "each_day", None, 2_000_000, f"{key_prefix}|t:each_day"),
     ]
 
 
-def test_unlimited_key_falls_back_to_user_capture_identity():
-    """A key without explicit limits matches no non-fallback combo: the
-    fallback group governs, bucketed on the captured gpustack-<id> segment
-    rather than the key's full consumer string."""
-    key = _KeyStub(id=42, access_key="ak-abc123", user_id=6)
-    windows = expected_windows(_cfg(), 6, key, None, None)
-    prefix = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-6"
-    assert [w.redis_key for w in windows] == [
-        f"{prefix}|q:60s",
-        f"{prefix}|t:60s",
-        f"{prefix}|t:each_day",
-        f"{prefix}|t:each_month",
+def test_key_daily_limit_overrides_default():
+    key = _KeyStub(id=7, access_key="ak-x", user_id=6, daily_token_limit=1_000)
+    windows = expected_windows(_cfg(), 6, key, None)
+    key_windows = [w for w in windows if w.redis_key.split("|")[1] == "key-7"]
+    assert [(w.kind, w.period, w.limit) for w in key_windows] == [
+        ("token_calendar", "each_day", 1_000)
     ]
 
 
-def test_legacy_token_key_governs_fallback_windows():
+def test_legacy_token_key_governs_user_windows_only():
     """Deployment-token rows never bind a key combo: the reconciler skips
-    them when publishing combos, so their requests are governed by the
-    fallback group exactly like unkeyed traffic -- even when the row carries
-    explicit limits."""
-    key = _KeyStub(id=42, access_key="", user_id=6, rpm_limit=5)
-    windows = expected_windows(_cfg(), 6, key, 100_000, 200_000)
+    them when publishing combos, so only the user combo governs their
+    requests."""
+    key = _KeyStub(id=42, access_key="", user_id=6)
+    windows = expected_windows(_cfg(), 6, key, None)
     assert all("key-42|" not in w.redis_key for w in windows)
     # Same window set an unkeyed request path gets.
     assert [w.redis_key for w in windows] == [
-        w.redis_key for w in expected_windows(_cfg(), 6, None, 100_000, 200_000)
+        w.redis_key for w in expected_windows(_cfg(), 6, None, None)
     ]
-    # source_for classifies by the key row's own limits, not by which combo
-    # the reconciler published.
-    assert source_for(key, 100_000, 200_000) == "key"
 
 
 def test_source_for():
-    limited = _KeyStub(id=1, access_key="ak-1", user_id=6, rpm_limit=5)
-    unlimited = _KeyStub(id=2, access_key="ak-2", user_id=6)
-    assert source_for(limited, 100_000, 200_000) == "key"
-    assert source_for(unlimited, 100_000, None) == "user+default"
-    assert source_for(unlimited, None, 200_000) == "user+default"
-    assert source_for(unlimited, None, None) == "default"
-    assert source_for(None, None, None) == "default"
+    key = _KeyStub(id=1, access_key="ak-1", user_id=6)
+    legacy = _KeyStub(id=2, access_key="", user_id=6)
+    assert source_for(key) == "user+key"
+    assert source_for(legacy) == "user+key"
+    assert source_for(None) == "user"
 
 
 def test_calendar_window_seconds_utc():
@@ -304,12 +312,12 @@ def test_no_windows_when_nothing_configured():
         default_daily_tokens=None,
         default_monthly_tokens=None,
     )
-    assert expected_windows(rlc, 6, None, None, None) == []
+    assert expected_windows(rlc, 6, None, None) == []
 
 
 def test_unset_defaults_skip_their_windows():
     rlc = _cfg(default_tpm=None, default_daily_tokens=None, default_monthly_tokens=None)
-    windows = expected_windows(rlc, 6, None, None, None)
+    windows = expected_windows(rlc, 6, None, None)
     assert [(w.kind, w.period) for w in windows] == [("query", "60s")]
 
 
@@ -414,7 +422,12 @@ def test_reader_from_config_dials_gateway_service():
 async def test_specs_and_reader_round_trip():
     """The reader consumes exactly the keys expected_windows derives: every
     spec's totals land on its own key and nowhere else."""
-    windows = expected_windows(_cfg(), 6, None, 100_000, 200_000)
+    windows = expected_windows(
+        _cfg(),
+        6,
+        None,
+        _UserStub(weekly_token_limit=100_000, monthly_token_limit=200_000),
+    )
     seed = {}
     expected_used = {}
     for i, spec in enumerate(windows):
@@ -495,13 +508,22 @@ async def test_read_window_rejects_naive_now():
         )
 
 
-def test_user_budget_combo_is_the_key_segment():
-    """The read side filters budget windows on this segment: it must stay
-    identical to what ``_user_budget_windows`` renders into the key."""
-    assert user_budget_combo(6) == "user-6"
-    windows = expected_windows(_cfg(), 6, None, 100_000, 200_000)
-    budget = [w for w in windows if w.redis_key.split("|")[1] == user_budget_combo(6)]
-    assert [(w.kind, w.period, w.limit) for w in budget] == [
+def test_user_limit_combo_is_the_key_segment():
+    """The read side filters user windows on this segment: it must stay
+    identical to what ``user_limit_windows`` renders into the key."""
+    assert user_limit_combo(6) == "user-6"
+    windows = expected_windows(
+        _cfg(),
+        6,
+        None,
+        _UserStub(weekly_token_limit=100_000, monthly_token_limit=200_000),
+    )
+    user_windows = [
+        w for w in windows if w.redis_key.split("|")[1] == user_limit_combo(6)
+    ]
+    assert [(w.kind, w.period, w.limit) for w in user_windows] == [
+        ("query", "60s", 10),
+        ("token_rolling", "60s", 60_000),
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]

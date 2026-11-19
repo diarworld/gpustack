@@ -8,7 +8,7 @@ through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Request
 from sqlmodel import select
@@ -17,17 +17,13 @@ from gpustack.api.exceptions import NotFoundException
 from gpustack.api.tenant import TenantContext, is_platform_wide
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit_usage import (
-    DEFAULT_PLAN_COMBO,
-    DAY_PERIOD,
-    MONTH_PERIOD,
-    ROLLING_WEEKLY_PERIOD,
     RateLimitWindowState,
     RateLimitWindowSpec,
-    expected_windows,
+    key_windows,
     read_windows,
     reader_from_config,
     source_for,
-    user_budget_combo,
+    user_limit_windows,
 )
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.rate_limits import (
@@ -143,46 +139,21 @@ async def get_rate_limits(
         )
 
     target = await _resolve_target(session, user, ctx, user_id)
-    weekly = target.weekly_token_limit
-    monthly = target.monthly_token_limit
 
-    # With key=None the spec builder returns the deployment defaults first
-    # and this user's budget combo second. Both combos bucket their counters
-    # on the user (the plugin captures ``gpustack-<id>`` out of every
-    # consumer shape), so every counter here is this user's own traffic. The
-    # user block composes the effective per-period view: a budget window
-    # overrides the default plan on the period it covers (both counters tick,
-    # the budget is always the tighter cap), and the default plan fills the
-    # periods the user has no budget for. Per-minute caps stay out — the
-    # per-key table renders those.
-    all_user_windows = expected_windows(
-        rlc, target.id, key=None, weekly=weekly, monthly=monthly
-    )
-    budget_combo = user_budget_combo(target.id)
-    default_by_period: Dict[str, RateLimitWindowSpec] = {}
-    budget_by_period: Dict[str, RateLimitWindowSpec] = {}
-    for spec in all_user_windows:
-        combo = spec.redis_key.split("|")[1]
-        if combo == budget_combo:
-            budget_by_period[spec.period] = spec
-        elif combo == DEFAULT_PLAN_COMBO:
-            default_by_period[spec.period] = spec
-    user_specs: List[RateLimitWindowSpec] = []
-    if DAY_PERIOD in default_by_period:
-        user_specs.append(default_by_period[DAY_PERIOD])
-    if ROLLING_WEEKLY_PERIOD in budget_by_period:
-        user_specs.append(budget_by_period[ROLLING_WEEKLY_PERIOD])
-    if MONTH_PERIOD in budget_by_period:
-        user_specs.append(budget_by_period[MONTH_PERIOD])
-    elif MONTH_PERIOD in default_by_period:
-        user_specs.append(default_by_period[MONTH_PERIOD])
+    # The user limit combo is non-fallback and governs every request of the
+    # user, so these windows are the effective user-level picture: requests
+    # and tokens per minute (the user's setting or the deployment default),
+    # the weekly budget (setting only) and the monthly quota (setting or
+    # default). All bucket on ``gpustack-<id>`` -- the user's own traffic
+    # across all their keys.
+    user_specs = user_limit_windows(rlc, target.id, target)
 
-    # Same treatment as the reconciler's key pass: every live key of the
-    # target, skipping deployment-token rows. Soft-deleted keys no longer
-    # authenticate, so they enforce nothing and stay out of the per-key
-    # view. Legacy rows are skipped because the reconciler never publishes
-    # a ``key-<id>`` combo for them — the fallback group governs their
-    # requests — so they carry no per-key windows to show.
+    # Every live key of the target adds its own day quota on top, skipping
+    # deployment-token rows. Soft-deleted keys no longer authenticate, so
+    # they enforce nothing and stay out of the per-key view. Legacy rows are
+    # skipped because the reconciler never publishes a ``key-<id>`` combo
+    # for them -- only the user combo governs their requests -- so they
+    # carry no per-key windows to show.
     keys = (
         await session.exec(
             select(ApiKey)
@@ -191,12 +162,7 @@ async def get_rate_limits(
         )
     ).all()
     live_keys = [key for key in keys if not is_legacy_token_access_key(key.access_key)]
-    key_specs = {
-        key.id: expected_windows(
-            rlc, target.id, key=key, weekly=weekly, monthly=monthly
-        )
-        for key in live_keys
-    }
+    key_specs = {key.id: key_windows(rlc, key) for key in live_keys}
 
     all_specs = list(user_specs)
     for specs in key_specs.values():
@@ -227,8 +193,10 @@ async def get_rate_limits(
         generated_at=now,
         usage_error=usage_error,
         user=UserRateLimits(
-            weekly_limit=weekly,
-            monthly_limit=monthly,
+            rpm_limit=target.rpm_limit,
+            tpm_limit=target.tpm_limit,
+            weekly_limit=target.weekly_token_limit,
+            monthly_limit=target.monthly_token_limit,
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
             ],
@@ -237,10 +205,8 @@ async def get_rate_limits(
             ApiKeyRateLimits(
                 id=key.id,
                 name=key.name,
-                rpm_limit=key.rpm_limit,
-                tpm_limit=key.tpm_limit,
                 daily_token_limit=key.daily_token_limit,
-                source=source_for(key, weekly, monthly),
+                source=source_for(key),
                 windows=[
                     _window_usage(spec, state_by_spec[id(spec)])
                     for spec in key_specs[key.id]

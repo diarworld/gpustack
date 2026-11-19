@@ -287,14 +287,22 @@ class PrincipalBase(SQLModel):
         default=None, sa_column=Column(Text, nullable=True)
     )
 
-    # Gateway token budgets, meaningful on USER rows only (NULL on the other
+    # Gateway rate limits, meaningful on USER rows only (NULL on the other
     # kinds — they never hold an API key). Enforced by the gpustack-rate-limit
     # plugin against Redis counters, bucketed per user so every key of the
-    # account draws on the same allowance. None means no budget of that kind:
-    # no deployment default applies to these two, because a default monthly
-    # budget silently capping every account is not a safe thing to imply.
-    # Weekly is a rolling 7-day window; monthly resets on the calendar
-    # boundary of the deployment timezone.
+    # account draws on the same allowance. ``rpm_limit`` / ``tpm_limit`` /
+    # ``monthly_token_limit`` fall back to the ``gateway_rate_limit``
+    # deployment defaults when NULL; the budgets (weekly / monthly) have no
+    # deployment default, because a default budget silently capping every
+    # account is not a safe thing to imply. Rate limits are sliding
+    # per-minute windows; weekly is a rolling 7-day window; monthly resets on
+    # the calendar boundary of the deployment timezone.
+    rpm_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    tpm_limit: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
     weekly_token_limit: Optional[int] = Field(
         default=None, sa_column=Column(BigInteger, nullable=True)
     )

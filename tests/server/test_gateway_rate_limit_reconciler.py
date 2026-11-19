@@ -7,7 +7,7 @@ from gpustack.server.gateway_rate_limit_reconciler import (
     fit_combinations,
     key_combination,
     reconcile_spec_diff,
-    user_budget_combination,
+    user_limits_combination,
 )
 
 
@@ -20,15 +20,23 @@ def make_cfg(**kwargs):
     return cfg
 
 
-def make_key(id=1, access_key="ak123", user_id=42, **limits):
+def make_key(id=1, access_key="ak123", user_id=42, daily_token_limit=None):
     key = MagicMock()
     key.id = id
     key.access_key = access_key
     key.user_id = user_id
-    key.rpm_limit = limits.get("rpm_limit")
-    key.tpm_limit = limits.get("tpm_limit")
-    key.daily_token_limit = limits.get("daily_token_limit")
+    key.daily_token_limit = daily_token_limit
     return key
+
+
+def make_user(id=42, **limits):
+    user = MagicMock()
+    user.id = id
+    user.rpm_limit = limits.get("rpm_limit")
+    user.tpm_limit = limits.get("tpm_limit")
+    user.weekly_token_limit = limits.get("weekly_token_limit")
+    user.monthly_token_limit = limits.get("monthly_token_limit")
+    return user
 
 
 class TestKeyCombination:
@@ -37,7 +45,7 @@ class TestKeyCombination:
         the two sides sends the key's traffic to a bucket nobody configured.
         The generated form is ``<access_key>.gpustack-<user-id>``."""
         combo = key_combination(
-            make_key(access_key="ab12cd34", rpm_limit=60), (None, None), make_cfg()
+            make_key(access_key="ab12cd34", daily_token_limit=2_000_000), make_cfg()
         )
         (match,) = combo["match"]
         assert match == {
@@ -45,54 +53,37 @@ class TestKeyCombination:
             "value": "ab12cd34.gpustack-42",
         }
 
-    def test_unset_fields_inherit_the_deployment_default(self):
+    def test_day_quota_inherits_the_deployment_default(self):
         """The deployment default is a fallback, and any non-fallback match
-        suppresses it -- so a key combo that declared only the fields the key
-        sets would silently remove the guard the deployment default provides
-        on every other field."""
-        cfg = make_cfg(
-            default_rpm=60, default_tpm=100_000, default_daily_tokens=500_000
-        )
-        combo = key_combination(make_key(tpm_limit=7_000), (None, None), cfg)
+        suppresses it -- inheriting is what keeps a key without an explicit
+        daily limit under the deployment default instead of unbounded."""
+        combo = key_combination(make_key(), make_cfg(default_daily_tokens=500_000))
         assert combo["name"] == "key-1"
-        assert combo["query_limits"] == {"per_minute": 60}
-        assert combo["token_limits"] == {"per_minute": 7_000}
         assert combo["token_quota"] == {"each_day": 500_000}
+        # The day quota is the key's only window; rate limits and budgets
+        # are user-level and live on the user combo.
+        assert "query_limits" not in combo
+        assert "token_limits" not in combo
         assert "is_fallback" not in combo
 
-    def test_explicit_fields_win_over_defaults(self):
+    def test_explicit_daily_wins_over_default(self):
         combo = key_combination(
-            make_key(rpm_limit=10, tpm_limit=20), (None, None), make_cfg(default_rpm=60)
+            make_key(daily_token_limit=1_000),
+            make_cfg(default_daily_tokens=500_000),
         )
-        assert combo["query_limits"] == {"per_minute": 10}
-        assert combo["token_limits"] == {"per_minute": 20}
+        assert combo["token_quota"] == {"each_day": 1_000}
 
-    def test_owner_budgets_are_folded_in(self):
-        """A budgeted user's explicitly-limited key would otherwise bypass the
-        user budget entirely: the key combo suppresses the fallback where the
-        user budget combo lives."""
-        combo = key_combination(make_key(rpm_limit=10), (5_000, 1_000_000), make_cfg())
-        assert combo["token_limits"] == {
-            "per_custom": 5_000,
-            "custom_window_seconds": WEEK_IN_SECONDS,
-        }
-        assert combo["token_quota"] == {"each_month": 1_000_000}
-
-    def test_no_limits_anywhere_renders_nothing(self):
-        combo = key_combination(make_key(), (None, None), make_cfg())
-        assert combo is None
-
-    def test_weekly_budget_is_a_sliding_seven_day_window(self):
-        combo = key_combination(make_key(rpm_limit=1), (2_000, None), make_cfg())
-        assert combo["token_limits"]["custom_window_seconds"] == 7 * 24 * 3600
+    def test_no_daily_anywhere_renders_nothing(self):
+        assert key_combination(make_key(), make_cfg()) is None
 
 
-class TestUserBudgetCombination:
+class TestUserLimitsCombination:
     def test_buckets_both_consumer_shapes_on_the_user_segment(self):
         import re
 
-        combo = user_budget_combination(42, weekly=None, monthly=1_000_000)
-        assert combo["is_fallback"] is True
+        combo = user_limits_combination(
+            make_user(), make_cfg(default_rpm=10, default_monthly_tokens=1_000_000)
+        )
         (match,) = combo["match"]
         expression = match["value"].removeprefix("regexp_capture:")
         assert re.fullmatch(expression, "ak-123.gpustack-42").group(1) == "gpustack-42"
@@ -100,19 +91,47 @@ class TestUserBudgetCombination:
         # A different user's traffic must not land in this bucket.
         assert re.fullmatch(expression, "gpustack-43") is None
 
-    def test_weekly_and_monthly_land_in_separate_limit_kinds(self):
-        """The plugin's monthly quota is calendar-aligned (token_quota) while
-        its weekly window is rolling (token_limits); the two kinds keep their
-        own Redis buckets, so both apply to one request."""
-        combo = user_budget_combination(42, weekly=5_000, monthly=1_000_000)
+    def test_is_non_fallback_so_it_ands_with_key_combos(self):
+        """A user cap must bind every key of the account, explicitly-limited
+        or not: non-fallback combos AND, fallback combos are suppressed the
+        moment any key combo matches."""
+        combo = user_limits_combination(
+            make_user(), make_cfg(default_rpm=10, default_monthly_tokens=1_000_000)
+        )
+        assert "is_fallback" not in combo
+
+    def test_unset_fields_inherit_the_deployment_default(self):
+        combo = user_limits_combination(
+            make_user(),
+            make_cfg(
+                default_rpm=60,
+                default_tpm=100_000,
+                default_monthly_tokens=5_000_000,
+            ),
+        )
+        assert combo["name"] == "user-42"
+        assert combo["query_limits"] == {"per_minute": 60}
+        assert combo["token_limits"] == {"per_minute": 100_000}
+        assert combo["token_quota"] == {"each_month": 5_000_000}
+
+    def test_explicit_fields_win_over_defaults(self):
+        user = make_user(
+            rpm_limit=30,
+            tpm_limit=200_000,
+            weekly_token_limit=5_000,
+            monthly_token_limit=50_000_000,
+        )
+        combo = user_limits_combination(user, make_cfg(default_rpm=60))
+        assert combo["query_limits"] == {"per_minute": 30}
         assert combo["token_limits"] == {
+            "per_minute": 200_000,
             "per_custom": 5_000,
             "custom_window_seconds": WEEK_IN_SECONDS,
         }
-        assert combo["token_quota"] == {"each_month": 1_000_000}
+        assert combo["token_quota"] == {"each_month": 50_000_000}
 
-    def test_nothing_set_renders_nothing(self):
-        assert user_budget_combination(42, None, None) is None
+    def test_nothing_configured_anywhere_renders_nothing(self):
+        assert user_limits_combination(make_user(), make_cfg()) is None
 
 
 class TestFitCombinations:

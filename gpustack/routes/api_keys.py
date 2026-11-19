@@ -69,12 +69,10 @@ def _api_key_to_public(
         allowed_model_names=api_key.allowed_model_names,
         is_custom=api_key.is_custom,
         scope=api_key.scope,
-        # The gateway rate limits are part of the key's editable state: the
-        # edit dialog pre-fills from this response, so leaving them out
-        # renders set limits as empty fields and a save would look like a
-        # no-op reset to whoever trusts the dialog.
-        rpm_limit=api_key.rpm_limit,
-        tpm_limit=api_key.tpm_limit,
+        # The daily token budget is part of the key's editable state: the
+        # edit dialog pre-fills from this response, so leaving it out
+        # renders a set limit as an empty field and a save would look like
+        # a no-op reset to whoever trusts the dialog.
         daily_token_limit=api_key.daily_token_limit,
     )
 
@@ -244,8 +242,6 @@ async def create_api_key(
             allowed_model_names=key_in.allowed_model_names,
             is_custom=key_in.custom is not None,
             scope=key_in.scope,
-            rpm_limit=key_in.rpm_limit,
-            tpm_limit=key_in.tpm_limit,
             daily_token_limit=key_in.daily_token_limit,
         )
         api_key = await ApiKey.create(session, api_key)

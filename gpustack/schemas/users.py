@@ -138,9 +138,13 @@ class UserBase(SQLModel):
     )
     source: Optional[str] = Field(default=AuthProviderEnum.Local.value)
     require_password_change: bool = Field(default=False)
-    # Gateway token budgets, admin-settable. Same names as the Principal
+    # Gateway rate limits, admin-settable. Same names as the Principal
     # columns so ``update_user``'s straight ``model_dump`` write and
-    # ``UserPublic.model_validate(principal)`` both need no mapping.
+    # ``UserPublic.model_validate(principal)`` both need no mapping. NULL
+    # inherits the deployment default from ``gateway_rate_limit``; the
+    # weekly budget has none.
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
     weekly_token_limit: Optional[int] = None
     monthly_token_limit: Optional[int] = None
 

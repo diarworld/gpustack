@@ -12,32 +12,32 @@ How the database maps onto plugin combinations -- the plugin's group
 semantics (non-fallback combos AND; any non-fallback match suppresses every
 fallback) decide the layout:
 
-* **Key combos (non-fallback).** One per API key with an explicit
-  ``rpm_limit`` / ``tpm_limit`` / ``daily_token_limit``, matching that key's
-  exact consumer string. Unset fields inherit the deployment default, because
-  the fallback default is suppressed for every request these combos match --
-  inheriting is what keeps "I set only a TPM cap on this key" from silently
-  removing its RPM guard too.
-* **User budget combos (fallback).** One per user with a
-  ``weekly_token_limit`` / ``monthly_token_limit``, matching that user's
-  consumer shapes via a capture that merges the API-key and UI forms into one
-  bucket. Fallback, so they AND with the deployment default for keys that
-  carry no explicit limits, and are suppressed only where a key combo already
-  matched -- and a key combo folds its owner's budgets in, so a budgeted
-  user's explicitly-limited key keeps drawing on the user's allowance (as its
-  own copy, not a shared bucket -- the one approximation in this design, and
-  it errs in the user's favour rather than silently locking them out).
-* **The default plan** from the config file, unchanged.
+* **User limit combos (non-fallback).** One per active user who owns at
+  least one key, matching the user's consumer shapes via a capture that
+  merges the API-key and UI forms into one shared bucket. Carries everything
+  that caps the user's keys together: requests and tokens per minute (the
+  user's setting or the deployment default) and the weekly / monthly token
+  budgets (setting only -- the monthly falls back to the deployment
+  default). Non-fallback so it ANDs with the key combos below: a user cap
+  must bind every key, explicitly-limited or not.
+* **Key combos (non-fallback).** One per API key, matching that key's exact
+  consumer string, carrying one calendar day quota -- the key's own
+  ``daily_token_limit`` or the deployment default. Unset fields inherit
+  rather than omit, because the fallback default plan is suppressed for
+  every request these combos match; inheriting keeps a key without an
+  explicit daily limit under the deployment default instead of unbounded.
+* **The default plan** from the config file, unchanged: the fallback safety
+  net for requests whose combos were left out under byte pressure or whose
+  consumer no longer matches a live user.
 """
 
 import asyncio
 import json
 import logging
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from kubernetes_asyncio import client as k8s_client
-from sqlalchemy import or_
 from sqlmodel import select
 
 from gpustack import envs
@@ -69,18 +69,26 @@ _WATCH_RETRY_MIN_SECONDS = 1
 _WATCH_RETRY_MAX_SECONDS = 30
 
 
-def key_combination(
-    key: ApiKey, budgets: Tuple[Optional[int], Optional[int]], cfg: Config
-) -> Optional[Dict[str, Any]]:
-    """The combo for one explicitly-limited API key, or None if it renders to
-    nothing.
+def key_combination(key: ApiKey, cfg: Config) -> Optional[Dict[str, Any]]:
+    """The per-key combo: one calendar day quota from the key's own setting
+    or the deployment default, or None if it renders to nothing.
 
-    ``budgets`` is the owner's ``(weekly, monthly)`` token allowance, folded
-    in per the module docstring. Unset key fields inherit the deployment
-    defaults -- see the module docstring for why inheriting is not optional.
+    Rate limits (requests and tokens per minute) and the weekly / monthly
+    token budgets are user-level limits, carried by
+    :func:`user_limits_combination` -- a combo cannot host two windows of
+    the same granularity, and the user's caps must AND with every key's
+    own, so they live in a separate combination that matches the same
+    requests. The daily quota is the one window that is per-key by design.
     """
     rlc = cfg.gateway_rate_limit
-    combo: Dict[str, Any] = {
+    daily = (
+        key.daily_token_limit
+        if key.daily_token_limit is not None
+        else rlc.default_daily_tokens
+    )
+    if not daily:
+        return None
+    return {
         "name": f"key-{key.id}",
         "match": [
             {
@@ -88,56 +96,48 @@ def key_combination(
                 "value": gateway_consumer_identity(key.access_key, key.user_id),
             }
         ],
+        "token_quota": {"each_day": daily},
     }
-    rpm = key.rpm_limit if key.rpm_limit is not None else rlc.default_rpm
+
+
+def user_limits_combination(user: Principal, cfg: Config) -> Optional[Dict[str, Any]]:
+    """The per-user combo: every limit that caps the user's keys together.
+
+    Non-fallback on purpose: non-fallback combos AND, so this binds every
+    request of the user alongside their keys' own day quotas. The match
+    captures the user suffix, merging the API-key and UI consumer shapes
+    into one shared bucket. Unset fields inherit the deployment defaults
+    from ``gateway_rate_limit`` -- every active user with keys gets the
+    deployment plan even when an admin has set nothing, because the key
+    combos these requests also match suppress the fallback default plan.
+    """
+    rlc = cfg.gateway_rate_limit
+    combo: Dict[str, Any] = {
+        "name": f"user-{user.id}",
+        "match": [{"source": "consumer", "value": consumer_user_capture(user.id)}],
+    }
+    rpm = user.rpm_limit if user.rpm_limit is not None else rlc.default_rpm
     if rpm:
         combo["query_limits"] = {"per_minute": rpm}
-    tpm = key.tpm_limit if key.tpm_limit is not None else rlc.default_tpm
-    weekly, monthly = budgets
+    tpm = user.tpm_limit if user.tpm_limit is not None else rlc.default_tpm
     token_limits: Dict[str, Any] = {}
     if tpm:
         token_limits["per_minute"] = tpm
-    if weekly:
-        token_limits["per_custom"] = weekly
+    if user.weekly_token_limit:
+        token_limits["per_custom"] = user.weekly_token_limit
         token_limits["custom_window_seconds"] = WEEK_IN_SECONDS
     if token_limits:
         combo["token_limits"] = token_limits
-    token_quota: Dict[str, int] = {}
-    daily = (
-        key.daily_token_limit
-        if key.daily_token_limit is not None
-        else rlc.default_daily_tokens
+    monthly = (
+        user.monthly_token_limit
+        if user.monthly_token_limit is not None
+        else rlc.default_monthly_tokens
     )
-    if daily:
-        token_quota["each_day"] = daily
     if monthly:
-        token_quota["each_month"] = monthly
-    if token_quota:
-        combo["token_quota"] = token_quota
+        combo["token_quota"] = {"each_month": monthly}
     if not (
         "query_limits" in combo or "token_limits" in combo or "token_quota" in combo
     ):
-        return None
-    return combo
-
-
-def user_budget_combination(
-    user_id: int, weekly: Optional[int], monthly: Optional[int]
-) -> Optional[Dict[str, Any]]:
-    """The fallback combo carrying one user's shared token budgets."""
-    combo: Dict[str, Any] = {
-        "name": f"user-{user_id}",
-        "is_fallback": True,
-        "match": [{"source": "consumer", "value": consumer_user_capture(user_id)}],
-    }
-    if weekly:
-        combo["token_limits"] = {
-            "per_custom": weekly,
-            "custom_window_seconds": WEEK_IN_SECONDS,
-        }
-    if monthly:
-        combo["token_quota"] = {"each_month": monthly}
-    if "token_limits" not in combo and "token_quota" not in combo:
         return None
     return combo
 
@@ -150,9 +150,10 @@ def fit_combinations(
     The default plan is not part of the input and never competes for the
     budget: ``reconcile_spec_diff`` prepends it after this fitting, so byte
     pressure can only drop database-driven combinations. Key combos are
-    served before user budgets: they carry admin-set overrides,
-    and a user budget dropped for want of room degrades to the deployment
-    default, while a dropped key combo could land on either side of it.
+    served before user limit combos: a dropped key combo falls back to the
+    default plan's shared buckets -- tighter than the per-key day quota, but
+    still bounded -- while a dropped user combo would leave the user's
+    requests unbound by their rate caps and budgets.
     """
     kept: List[Dict[str, Any]] = []
     used = 0
@@ -288,49 +289,36 @@ class GatewayRateLimitReconciler:
     async def _build_combinations(self) -> List[Dict[str, Any]]:
         """Every database-driven combination, within the CR byte budget."""
         async with async_session() as session:
-            budgeted_users = (
+            users = (
                 await session.exec(
                     select(Principal).where(
                         Principal.kind == PrincipalType.USER,
                         Principal.is_active.is_(True),
-                        or_(
-                            Principal.weekly_token_limit.is_not(None),
-                            Principal.monthly_token_limit.is_not(None),
-                        ),
                     )
                 )
             ).all()
-            limited_keys = (
-                await session.exec(
-                    select(ApiKey).where(
-                        or_(
-                            ApiKey.rpm_limit.is_not(None),
-                            ApiKey.tpm_limit.is_not(None),
-                            ApiKey.daily_token_limit.is_not(None),
-                        ),
-                    )
-                )
-            ).all()
+            keys = (await session.exec(select(ApiKey))).all()
 
-        budgets = {
-            user.id: (user.weekly_token_limit, user.monthly_token_limit)
-            for user in budgeted_users
-        }
+        # A user without keys never sends inference requests; skipping their
+        # combo keeps the CR tight.
+        keys_by_user: Dict[int, List[ApiKey]] = {}
+        for key in keys:
+            keys_by_user.setdefault(key.user_id, []).append(key)
 
         combinations: List[Dict[str, Any]] = []
-        for key in limited_keys:
+        for user in users:
+            if user.id not in keys_by_user:
+                continue
+            combo = user_limits_combination(user, self._config)
+            if combo is not None:
+                combinations.append(combo)
+        for key in keys:
             # Deployment tokens are not user-facing inference keys, and their
             # consumer string carries no access key -- matching on it would
             # also catch that user's UI traffic.
             if is_legacy_token_access_key(key.access_key):
                 continue
-            combo = key_combination(
-                key, budgets.get(key.user_id, (None, None)), self._config
-            )
-            if combo is not None:
-                combinations.append(combo)
-        for user_id, (weekly, monthly) in budgets.items():
-            combo = user_budget_combination(user_id, weekly, monthly)
+            combo = key_combination(key, self._config)
             if combo is not None:
                 combinations.append(combo)
         return fit_combinations(combinations, self._budget)

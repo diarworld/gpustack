@@ -44,16 +44,19 @@ class RateLimitWindowUsage(BaseModel):
 class UserRateLimits(BaseModel):
     """The caller's user-level limits and their live windows.
 
-    ``windows`` is the effective per-period view: a token budget overrides
-    the deployment default on the period it covers (its quota is the tighter
-    cap), and the default plan fills the periods the user has no budget for.
-    Every window buckets on the user, so its counter is that user's own
-    traffic. Per-minute caps are not folded in here — the per-key table
-    carries them.
+    ``windows`` is the user limit combo exactly as the reconciler publishes
+    it: requests and tokens per minute, the weekly rolling budget and the
+    monthly calendar quota -- unset user fields inherited the deployment
+    default at publish time. Every window buckets on the user, so its
+    counter is that user's own traffic across all their keys. Per-key day
+    quotas live on the ``api_keys`` entries.
     """
 
-    # From the ``users`` table; ``None`` = the user has no budget of that
-    # kind, so the deployment default governs that axis.
+    # From the ``users`` table; ``None`` = the user has no limit of that
+    # kind set, so the deployment default governs that axis (and does so
+    # inside ``windows``, which carry the effective limits).
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
     weekly_limit: Optional[int] = None
     monthly_limit: Optional[int] = None
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
@@ -64,15 +67,13 @@ class ApiKeyRateLimits(BaseModel):
 
     id: int
     name: str
-    # Explicit per-key limits; ``None`` = the field inherits the deployment
-    # default (and may be unset there too, leaving that axis unlimited).
-    rpm_limit: Optional[int] = None
-    tpm_limit: Optional[int] = None
+    # The key's own daily token budget; ``None`` = it inherits the
+    # deployment default (and may be unset there too, leaving the axis
+    # unlimited). Rate and per-minute token caps are user-level.
     daily_token_limit: Optional[int] = None
     # Which published combinations govern the key's requests, mirroring
-    # ``source_for``: ``key`` (the key carries explicit limits and binds its
-    # own combo), ``user+default`` (the fallback group plus the owner's
-    # budgets) or ``default`` (the default plan alone).
+    # ``source_for``: ``user+key`` (the user limit combo plus the key's own
+    # day quota) or ``user`` (the user limit combo alone).
     source: str
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
 

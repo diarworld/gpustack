@@ -38,7 +38,7 @@ NOW_TS = int(FIXED_NOW.timestamp())
 
 DAY_KEY = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_day"
 MONTH_KEY = f"{rate_limit_plugin_name}|user-7|consumer=gpustack-7|t:each_month"
-WEEK_KEY = f"{rate_limit_plugin_name}|key-42|consumer=ak-abc.gpustack-7|t:604800s"
+KEY_DAY_KEY = f"{rate_limit_plugin_name}|key-42|consumer=ak-abc.gpustack-7|t:each_day"
 
 
 def _cfg(**overrides) -> GatewayRateLimitConfig:
@@ -56,16 +56,18 @@ def _cfg(**overrides) -> GatewayRateLimitConfig:
     return GatewayRateLimitConfig(**fields)
 
 
-def _user(id, *, weekly=None, monthly=None) -> Principal:
+def _user(id, *, weekly=None, monthly=None, rpm=None, tpm=None) -> Principal:
     return Principal(
         id=id,
         name=f"user-{id}",
+        rpm_limit=rpm,
+        tpm_limit=tpm,
         weekly_token_limit=weekly,
         monthly_token_limit=monthly,
     )
 
 
-def _key(id, *, access_key="ak", user_id=7, rpm_limit=None) -> ApiKey:
+def _key(id, *, access_key="ak", user_id=7, daily_token_limit=None) -> ApiKey:
     stamp = FIXED_NOW.replace(tzinfo=None)
     return ApiKey(
         id=id,
@@ -73,7 +75,7 @@ def _key(id, *, access_key="ak", user_id=7, rpm_limit=None) -> ApiKey:
         user_id=user_id,
         access_key=access_key,
         hashed_secret_key=f"hash-{id}",
-        rpm_limit=rpm_limit,
+        daily_token_limit=daily_token_limit,
         created_at=stamp,
         updated_at=stamp,
     )
@@ -116,7 +118,7 @@ class FakeRedis:
             return float(value[1:]), True
         return float(value), False
 
-    async def zrangebyscore(self, key, lo, hi, withscores=False):
+    def _zrangebyscore_sync(self, key, lo, hi, withscores=False):
         if self._fail_reads:
             raise RedisError("dial tcp: redis-host:6379")
         lo_value, lo_exclusive = self._bound(lo)
@@ -131,6 +133,38 @@ class FakeRedis:
         if not withscores:
             return [member for member, _ in hits]
         return hits
+
+    async def zrangebyscore(self, key, lo, hi, withscores=False):
+        return self._zrangebyscore_sync(key, lo, hi, withscores)
+
+    def pipeline(self, transaction=False):
+        return _FakePipeline(self)
+
+
+class _FakePipeline:
+    """Queues ZRANGEBYSCORE commands and replays them on ``execute`` — the
+    slice of redis-py's pipeline the batched reader uses."""
+
+    def __init__(self, client):
+        self._client = client
+        self._commands = []
+
+    def zrangebyscore(self, key, lo, hi, withscores=False):
+        self._commands.append((key, lo, hi, withscores))
+        return self
+
+    async def execute(self, raise_on_error=True):
+        results = []
+        for key, lo, hi, withscores in self._commands:
+            try:
+                results.append(
+                    self._client._zrangebyscore_sync(key, lo, hi, withscores)
+                )
+            except Exception as exc:
+                if raise_on_error:
+                    raise
+                results.append(exc)
+        return results
 
 
 def _eq_filters(statement):
@@ -373,7 +407,7 @@ async def test_flush_upserts_token_windows(frozen_now, monkeypatch):
             {
                 DAY_KEY: [(100, "a", 700), (5, "b", 534)],
                 MONTH_KEY: [(60, "m", 5678)],
-                WEEK_KEY: [(30, "w", 910)],
+                KEY_DAY_KEY: [(30, "w", 910)],
             }
         )
     )
@@ -398,11 +432,11 @@ async def test_flush_upserts_token_windows(frozen_now, monkeypatch):
     assert month.user_id == 7 and month.api_key_id == 0
     assert month.usage == 5678 and month.quota == 200_000
 
-    week = by_window[("key-42", "token_rolling", "604800s")]
-    assert week.window_start == FIXED_NOW - timedelta(seconds=604800)
-    assert week.user_id == 7 and week.api_key_id == 42
-    assert week.usage == 910 and week.quota == 100_000
-    assert week.window_seconds == 604800
+    key_day = by_window[("key-42", "token_calendar", "each_day")]
+    assert key_day.window_start == datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    assert key_day.user_id == 7 and key_day.api_key_id == 42
+    assert key_day.usage == 910 and key_day.quota == 2_000_000
+    assert key_day.window_seconds is None
 
     # The key batch reads only live rows.
     assert "api_keys.deleted_at IS NULL" in str(session.statements[0])

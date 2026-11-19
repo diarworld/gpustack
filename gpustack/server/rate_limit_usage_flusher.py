@@ -40,9 +40,11 @@ from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowState,
     RateLimitWindowSpec,
     calendar_elapsed_seconds,
+    default_plan_windows,
     expected_windows,
     read_windows,
     reader_from_config,
+    user_limit_windows,
 )
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.gateway_rate_limit_usages import GatewayRateLimitUsage
@@ -373,18 +375,16 @@ class RateLimitUsageFlusher:
             if user_id is not None
         }
         user_ids.update(k.user_id for k in api_keys.values())
-        budgets: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+        users: Dict[int, Principal] = {}
         if user_ids:
             rows = (
                 await session.exec(select(Principal).where(Principal.id.in_(user_ids)))
             ).all()
-            budgets = {
-                u.id: (u.weekly_token_limit, u.monthly_token_limit) for u in rows
-            }
+            users = {u.id: u for u in rows}
 
         attributed: List[Tuple[str, Attribution]] = []
         for redis_key, parsed in discovered:
-            item = self._resolve(rlc, redis_key, parsed, api_keys, budgets)
+            item = self._resolve(rlc, redis_key, parsed, api_keys, users)
             if item is not None:
                 attributed.append((redis_key, item))
         return attributed
@@ -395,15 +395,15 @@ class RateLimitUsageFlusher:
         redis_key: str,
         parsed: ParsedKey,
         api_keys: Dict[int, ApiKey],
-        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+        users: Dict[int, Principal],
     ) -> Optional[Attribution]:
         """One key's row identity and quota, or None when unattributable."""
         if parsed.combo == DEFAULT_PLAN_COMBO:
             return self._resolve_default_plan(rlc, parsed)
         if parsed.combo.startswith("user-"):
-            return self._resolve_user_budget(rlc, parsed, budgets)
+            return self._resolve_user_combo(rlc, parsed, users)
         if parsed.combo.startswith("key-"):
-            return self._resolve_key_combo(redis_key, parsed, api_keys, budgets, rlc)
+            return self._resolve_key_combo(redis_key, parsed, api_keys, users, rlc)
         logger.debug("Unknown combo segment on %s", redis_key)
         return None
 
@@ -411,11 +411,13 @@ class RateLimitUsageFlusher:
         self, rlc: GatewayRateLimitConfig, parsed: ParsedKey
     ) -> Attribution:
         """The deployment defaults' combo: the user id comes from the
-        captured ``gpustack-<id>`` dim, not from any database row."""
+        captured ``gpustack-<id>`` dim, not from any database row. The
+        fallback plan no longer governs live requests, but its Redis keys
+        linger until their TTLs expire and still deserve attribution."""
         user_id = _user_from_identity(parsed.identity)
         specs = [
             spec
-            for spec in expected_windows(rlc, user_id, None, None, None)
+            for spec in default_plan_windows(rlc, user_id)
             if spec.redis_key.split("|")[1] == DEFAULT_PLAN_COMBO
         ]
         return Attribution(
@@ -428,21 +430,20 @@ class RateLimitUsageFlusher:
             quota=_match_quota(specs, parsed),
         )
 
-    def _resolve_user_budget(
+    def _resolve_user_combo(
         self,
         rlc: GatewayRateLimitConfig,
         parsed: ParsedKey,
-        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+        users: Dict[int, Principal],
     ) -> Optional[Attribution]:
-        """The fallback combo carrying one user's shared token budgets."""
+        """The non-fallback combo carrying one user's shared limits."""
         user_id = _int_tail(parsed.combo, "user-")
         if user_id is None:
             logger.debug("Unparseable user combo: %s", parsed.combo)
             return None
-        weekly, monthly = budgets.get(user_id, (None, None))
         specs = [
             spec
-            for spec in expected_windows(rlc, user_id, None, weekly, monthly)
+            for spec in user_limit_windows(rlc, user_id, users.get(user_id))
             if spec.redis_key.split("|")[1] == parsed.combo
         ]
         return Attribution(
@@ -460,10 +461,10 @@ class RateLimitUsageFlusher:
         redis_key: str,
         parsed: ParsedKey,
         api_keys: Dict[int, ApiKey],
-        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+        users: Dict[int, Principal],
         rlc: GatewayRateLimitConfig,
     ) -> Optional[Attribution]:
-        """The non-fallback combo of one explicitly-limited API key."""
+        """The non-fallback combo of one API key: its own day quota."""
         api_key_id = _int_tail(parsed.combo, "key-")
         if api_key_id is None:
             logger.debug("Unparseable key combo: %s", parsed.combo)
@@ -483,7 +484,6 @@ class RateLimitUsageFlusher:
                 quota=None,
             )
         user_id = key.user_id
-        weekly, monthly = budgets.get(user_id, (None, None))
         identity = gateway_consumer_identity(key.access_key, user_id)
         if identity != parsed.identity:
             # Corroboration only: the combo segment still names the key, so
@@ -494,6 +494,11 @@ class RateLimitUsageFlusher:
                 parsed.identity,
                 identity,
             )
+        specs = [
+            spec
+            for spec in expected_windows(rlc, user_id, key, users.get(user_id))
+            if spec.redis_key.split("|")[1] == parsed.combo
+        ]
         return Attribution(
             combo_name=parsed.combo,
             kind=parsed.kind,
@@ -501,9 +506,7 @@ class RateLimitUsageFlusher:
             window_seconds=parsed.window_seconds,
             user_id=user_id,
             api_key_id=api_key_id,
-            quota=_match_quota(
-                expected_windows(rlc, user_id, key, weekly, monthly), parsed
-            ),
+            quota=_match_quota(specs, parsed),
         )
 
     async def _upsert(

@@ -49,6 +49,7 @@ from gpustack.security import gateway_consumer_identity, is_legacy_token_access_
 
 if TYPE_CHECKING:
     from gpustack.schemas.api_keys import ApiKey
+    from gpustack.schemas.principals import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +97,6 @@ class RateLimitWindowSpec:
     redis_key: str
 
 
-def _has_explicit_limits(key: "ApiKey") -> bool:
-    """Whether the key carries a limit of its own, and so binds a key combo."""
-    return (
-        key.rpm_limit is not None
-        or key.tpm_limit is not None
-        or key.daily_token_limit is not None
-    )
-
-
 def _window(
     kind: str,
     combo: str,
@@ -127,12 +119,16 @@ def _window(
     )
 
 
-def _default_plan_windows(
+def default_plan_windows(
     rlc: GatewayRateLimitConfig, user_id: int
 ) -> List[RateLimitWindowSpec]:
     """The deployment defaults exactly as ``default_plan_combination``
     renders them: a window exists only when its limit is configured. The
-    match is the user capture, so every window buckets on ``gpustack-<id>``."""
+    match is the user capture, so every window buckets on ``gpustack-<id>``.
+
+    The fallback plan no longer governs any live request -- the user limit
+    combos are non-fallback and always match first -- but the flusher still
+    attributes the Redis keys it left behind until their TTLs expire."""
     identity = f"{USER_IDENTITY_PREFIX}{user_id}"
     combo = DEFAULT_PLAN_COMBO
     windows: List[RateLimitWindowSpec] = []
@@ -183,67 +179,42 @@ def _default_plan_windows(
     return windows
 
 
-def user_budget_combo(user_id: int) -> str:
-    """The fallback combo carrying one user's shared token budgets:
-    ``user-<id>``. Published by the reconciler's ``user_budget_combination``
-    and carried verbatim as the second segment of every budget window's
-    Redis key — the segment read-side code filters on to tell a user's
-    budget windows apart from the deployment defaults."""
+class _UserLimits:
+    """The four user-level limit fields off a Principal row, tolerating a
+    missing row (the flusher's default-plan path) as all-None."""
+
+    def __init__(self, user: Optional["Principal"]):
+        self.rpm = getattr(user, "rpm_limit", None)
+        self.tpm = getattr(user, "tpm_limit", None)
+        self.weekly = getattr(user, "weekly_token_limit", None)
+        self.monthly = getattr(user, "monthly_token_limit", None)
+
+
+def user_limit_combo(user_id: int) -> str:
+    """The combo carrying one user's shared limits: ``user-<id>``. Published
+    by the reconciler's ``user_limits_combination`` and carried verbatim as
+    the second segment of every user-level window's Redis key — the segment
+    read-side code filters on."""
     return f"user-{user_id}"
 
 
-def _user_budget_windows(
-    user_id: int, weekly: Optional[int], monthly: Optional[int]
+def user_limit_windows(
+    rlc: GatewayRateLimitConfig, user_id: int, user: Optional["Principal"]
 ) -> List[RateLimitWindowSpec]:
-    """The fallback combo carrying one user's shared token budgets, mirroring
-    ``user_budget_combination``. Its capture merges the API-key and UI
-    consumer shapes onto the same ``gpustack-<id>`` bucket the default plan
-    uses, which is why both fallback combos' keys share the identity."""
+    """The non-fallback combo carrying one user's shared limits, mirroring
+    the reconciler's ``user_limits_combination`` field for field: requests
+    and tokens per minute, the weekly rolling budget and the monthly
+    calendar quota. Unset user fields inherit the deployment defaults --
+    the key combos these requests also match suppress the fallback default
+    plan, so inheriting is what keeps the deployment plan in force. Its
+    capture merges the API-key and UI consumer shapes onto the same
+    ``gpustack-<id>`` bucket."""
     identity = f"{USER_IDENTITY_PREFIX}{user_id}"
-    combo = user_budget_combo(user_id)
-    windows: List[RateLimitWindowSpec] = []
-    if weekly:
-        windows.append(
-            _window(
-                "token_rolling",
-                combo,
-                identity,
-                ROLLING_WEEKLY_PERIOD,
-                WEEK_IN_SECONDS,
-                weekly,
-            )
-        )
-    if monthly:
-        windows.append(
-            _window(
-                "token_calendar",
-                combo,
-                identity,
-                MONTH_PERIOD,
-                None,
-                monthly,
-            )
-        )
-    return windows
+    combo = user_limit_combo(user_id)
+    limits = _UserLimits(user)
 
-
-def _key_windows(
-    rlc: GatewayRateLimitConfig,
-    key: "ApiKey",
-    weekly: Optional[int],
-    monthly: Optional[int],
-) -> List[RateLimitWindowSpec]:
-    """The non-fallback combo for one explicitly-limited key, mirroring the
-    reconciler's ``key_combination`` field for field: unset key fields
-    inherit the deployment default (the fallback is suppressed for these
-    requests, so inheriting is what keeps the guard from disappearing), and
-    the owner's token budgets are folded in. Monthly folds in only when the
-    owner has a budget -- it has no deployment default to fall back on, also
-    like the reconciler's key combos."""
-    identity = gateway_consumer_identity(key.access_key, key.user_id)
-    combo = f"key-{key.id}"
     windows: List[RateLimitWindowSpec] = []
-    rpm = key.rpm_limit if key.rpm_limit is not None else rlc.default_rpm
+    rpm = limits.rpm if limits.rpm is not None else rlc.default_rpm
     if rpm:
         windows.append(
             _window(
@@ -255,7 +226,7 @@ def _key_windows(
                 rpm,
             )
         )
-    tpm = key.tpm_limit if key.tpm_limit is not None else rlc.default_tpm
+    tpm = limits.tpm if limits.tpm is not None else rlc.default_tpm
     if tpm:
         windows.append(
             _window(
@@ -267,7 +238,7 @@ def _key_windows(
                 tpm,
             )
         )
-    if weekly:
+    if limits.weekly:
         windows.append(
             _window(
                 "token_rolling",
@@ -275,25 +246,12 @@ def _key_windows(
                 identity,
                 ROLLING_WEEKLY_PERIOD,
                 WEEK_IN_SECONDS,
-                weekly,
+                limits.weekly,
             )
         )
-    daily = (
-        key.daily_token_limit
-        if key.daily_token_limit is not None
-        else rlc.default_daily_tokens
+    monthly = (
+        limits.monthly if limits.monthly is not None else rlc.default_monthly_tokens
     )
-    if daily:
-        windows.append(
-            _window(
-                "token_calendar",
-                combo,
-                identity,
-                DAY_PERIOD,
-                None,
-                daily,
-            )
-        )
     if monthly:
         windows.append(
             _window(
@@ -308,60 +266,80 @@ def _key_windows(
     return windows
 
 
+def key_windows(
+    rlc: GatewayRateLimitConfig, key: "ApiKey"
+) -> List[RateLimitWindowSpec]:
+    """The non-fallback combo for one key, mirroring the reconciler's
+    ``key_combination``: one calendar day quota -- the key's own
+    ``daily_token_limit`` or the deployment default. Every other window is
+    user-level and lives on the user limit combo; a combo cannot host two
+    windows of the same granularity, and the user's caps must AND with
+    every key's own."""
+    identity = gateway_consumer_identity(key.access_key, key.user_id)
+    combo = f"key-{key.id}"
+    daily = (
+        key.daily_token_limit
+        if key.daily_token_limit is not None
+        else rlc.default_daily_tokens
+    )
+    if not daily:
+        return []
+    return [
+        _window(
+            "token_calendar",
+            combo,
+            identity,
+            DAY_PERIOD,
+            None,
+            daily,
+        )
+    ]
+
+
 def expected_windows(
     rlc: GatewayRateLimitConfig,
     user_id: int,
     key: Optional["ApiKey"],
-    weekly: Optional[int],
-    monthly: Optional[int],
+    user: Optional["Principal"],
 ) -> List[RateLimitWindowSpec]:
     """Every Redis window the plugin enforces for one user's request path.
 
     ``rlc`` is the ``gateway_rate_limit`` config (not the top-level
     ``Config``), ``key`` the API key the request authenticates with -- None
-    for UI traffic -- and ``weekly`` / ``monthly`` the target user's token
-    budgets. A key with any explicit limit yields only its key combo's
-    windows; otherwise the fallback group governs, giving the default plan's
-    windows followed by the user budget combo's.
+    for UI traffic -- and ``user`` the target user's row carrying the four
+    user-level limit fields (``rpm_limit``, ``tpm_limit``,
+    ``weekly_token_limit``, ``monthly_token_limit``). The user limit combo
+    governs every request; a non-legacy key adds its own day quota on top,
+    so the two AND together exactly as the plugin enforces them.
 
     Deployment-token rows (legacy access keys) count as keyless: the
-    reconciler never publishes a ``key-<id>`` combo for them, so their
-    requests are governed by the fallback group regardless of what limits
-    the row carries.
+    reconciler never publishes a ``key-<id>`` combo for them, so only the
+    user combo applies.
 
     Calendar windows carry ``window_seconds=None``: their length is not
     fixed, it follows the boundary in ``rlc.timezone`` (see
     :func:`calendar_window_seconds`).
     """
-    if (
-        key is not None
-        and not is_legacy_token_access_key(key.access_key)
-        and _has_explicit_limits(key)
-    ):
-        return _key_windows(rlc, key, weekly, monthly)
-    return _default_plan_windows(rlc, user_id) + _user_budget_windows(
-        user_id, weekly, monthly
-    )
+    windows = user_limit_windows(rlc, user_id, user)
+    if key is not None and not is_legacy_token_access_key(key.access_key):
+        windows.extend(key_windows(rlc, key))
+    return windows
 
 
-def source_for(
-    key: Optional["ApiKey"], weekly: Optional[int], monthly: Optional[int]
-) -> str:
-    """Which published combinations govern the user's requests: the key's
-    own combo (``key``), the fallback group with a user budget
-    (``user+default``), or the default plan alone (``default``).
+def source_for(key: Optional["ApiKey"]) -> str:
+    """Which published combinations govern the key's requests: the user
+    limit combo plus the key's own day quota (``user+key``), or the user
+    limit combo alone (``user``).
 
     Legacy deployment-token keys are an intentional divergence from
     :func:`expected_windows`: the reconciler never publishes their
-    ``key-<id>`` combo, so the fallback group governs those requests, yet
-    this still reports ``key`` -- the field describes the key row's own
-    explicit limits, which is what the endpoint displays.
+    ``key-<id>`` combo, so only the user combo governs those requests, yet
+    this still reports ``user+key`` -- the field describes the key row's own
+    day quota, which is what the endpoint displays.
     """
-    if key is not None and _has_explicit_limits(key):
-        return "key"
-    if weekly or monthly:
-        return "user+default"
-    return "default"
+    if key is not None:
+        return "user+key"
+    return "user"
 
 
 def _calendar_period_bounds(

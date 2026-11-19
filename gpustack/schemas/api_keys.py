@@ -41,17 +41,12 @@ class ApiKeyUpdate(SQLModel):
         default=[PermissionScope.ALL],
         sa_column=Column(JSON, nullable=False),
     )
-    # Gateway rate limits, enforced by the gpustack-rate-limit plugin against
-    # Redis counters. None inherits the deployment-wide default from
-    # ``gateway_rate_limit`` (and no default means no limit of that kind).
-    # Requests and rolling tokens are sliding windows; the daily token budget
-    # resets on the calendar boundary of the deployment timezone.
-    rpm_limit: Optional[int] = Field(
-        default=None, sa_column=Column(BigInteger, nullable=True)
-    )
-    tpm_limit: Optional[int] = Field(
-        default=None, sa_column=Column(BigInteger, nullable=True)
-    )
+    # Gateway rate limit, enforced by the gpustack-rate-limit plugin against
+    # a Redis counter bucketed per key. None inherits the deployment-wide
+    # daily default from ``gateway_rate_limit`` (and no default means no
+    # limit). Requests and tokens per minute are user-level limits, set on
+    # the user, not here; the daily token budget resets on the calendar
+    # boundary of the deployment timezone.
     daily_token_limit: Optional[int] = Field(
         default=None, sa_column=Column(BigInteger, nullable=True)
     )

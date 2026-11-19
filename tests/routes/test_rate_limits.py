@@ -63,17 +63,19 @@ def _ctx(current_principal_id) -> SimpleNamespace:
     return SimpleNamespace(current_principal_id=current_principal_id)
 
 
-def _user(id, *, is_admin=False, weekly=None, monthly=None) -> User:
+def _user(id, *, is_admin=False, weekly=None, monthly=None, rpm=None, tpm=None) -> User:
     return User(
         id=id,
         name=f"user-{id}",
         is_admin=is_admin,
+        rpm_limit=rpm,
+        tpm_limit=tpm,
         weekly_token_limit=weekly,
         monthly_token_limit=monthly,
     )
 
 
-def _key(id, *, access_key="ak", rpm_limit=None, tpm_limit=None, daily=None) -> ApiKey:
+def _key(id, *, access_key="ak", daily=None) -> ApiKey:
     stamp = FIXED_NOW.replace(tzinfo=None)
     return ApiKey(
         id=id,
@@ -81,8 +83,6 @@ def _key(id, *, access_key="ak", rpm_limit=None, tpm_limit=None, daily=None) -> 
         user_id=7,
         access_key=access_key,
         hashed_secret_key=f"hash-{id}",
-        rpm_limit=rpm_limit,
-        tpm_limit=tpm_limit,
         daily_token_limit=daily,
         created_at=stamp,
         updated_at=stamp,
@@ -230,7 +230,7 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     lookup ever runs)."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1", rpm_limit=30)])
+    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -243,14 +243,15 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     assert response.generated_at == FIXED_NOW
     assert response.user.weekly_limit == 100_000
     assert response.user.monthly_limit == 200_000
-    # The user block composes the effective view: the default day cap, and
-    # the owner's budgets where they override the defaults.
+    # The user block is the user limit combo verbatim: per-minute caps and
+    # monthly inherit the deployment defaults, the weekly budget is set.
     assert _shapes(response.user.windows) == [
-        ("token_calendar", "each_day", 2_000_000),
+        ("query", "60s", 10),
+        ("token_rolling", "60s", 60_000),
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
-    assert response.api_keys[0].source == "key"
+    assert response.api_keys[0].source == "user+key"
     # The listing is scoped to the target's live keys.
     sql = str(session.statements[0])
     assert "api_keys.user_id" in sql
@@ -275,7 +276,8 @@ async def test_admin_reads_another_user(frozen_now, monkeypatch):
     assert session.get_calls == [7]
     assert response.user.weekly_limit == 100_000
     assert _shapes(response.user.windows) == [
-        ("token_calendar", "each_day", 2_000_000),
+        ("query", "60s", 10),
+        ("token_rolling", "60s", 60_000),
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
@@ -320,7 +322,8 @@ async def test_org_pinned_admin_foreign_user_id_degrades_to_self(
     assert session.get_calls == []
     assert response.user.weekly_limit == 111
     assert _shapes(response.user.windows) == [
-        ("token_calendar", "each_day", 2_000_000),
+        ("query", "60s", 10),
+        ("token_rolling", "60s", 60_000),
         ("token_rolling", "604800s", 111),
         ("token_calendar", "each_month", 20_000_000),
     ]
@@ -339,7 +342,7 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
 
     monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1", rpm_limit=30)])
+    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
 
     response = await rate_limits.get_rate_limits(
         session=session, user=user, ctx=_ctx(10), request=_request(_local_cfg())
@@ -347,10 +350,12 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
 
     assert response.mode == "local"
     assert response.usage_error is None
-    # Effective user windows still list their limits; the budget covers the
-    # month, the default plan the day.
+    # Effective user windows still list their limits: minute caps and the
+    # monthly quota inherit the deployment defaults, the weekly budget is
+    # the user's own.
     assert [w.period for w in response.user.windows] == [
-        "each_day",
+        "60s",
+        "60s",
         "604800s",
         "each_month",
     ]
@@ -370,7 +375,7 @@ async def test_reader_failure_blanks_all_counters(frozen_now, monkeypatch):
     exception's class name surfaces (messages can carry hostnames)."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1", rpm_limit=30)])
+    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
     reader = FakeReader(error=RuntimeError("dial tcp: redis-host:6379"))
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -391,17 +396,16 @@ async def test_reader_failure_blanks_all_counters(frozen_now, monkeypatch):
 @pytest.mark.asyncio
 async def test_legacy_key_hidden_and_sources(frozen_now, monkeypatch):
     """Deployment-token rows carry no per-key view (the reconciler publishes
-    no combo for them); explicit-limit keys bind their own combo, unlimited
-    keys ride the fallback group with the owner's budgets."""
+    no combo for them); every live key binds its own day quota on top of the
+    user's shared combo."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
     session = FakeSession(
         users=[user],
         keys=[
-            # Legacy deployment token: explicit limits on the row, but it
-            # must not appear in the per-key view.
-            _key(1, access_key="", rpm_limit=5),
-            _key(2, access_key="ak-explicit", rpm_limit=30),
+            # Legacy deployment token: it must not appear in the per-key view.
+            _key(1, access_key=""),
+            _key(2, access_key="ak-explicit", daily=500_000),
             _key(3, access_key="ak-shared"),
         ],
     )
@@ -414,24 +418,15 @@ async def test_legacy_key_hidden_and_sources(frozen_now, monkeypatch):
 
     by_id = {k.id: k for k in response.api_keys}
     assert set(by_id) == {2, 3}
-    assert by_id[2].source == "key"
-    # The key combo folds in the deployment defaults and the owner budgets.
+    # The explicit daily limit wins over the deployment default.
+    assert by_id[2].source == "user+key"
     assert _shapes(by_id[2].windows) == [
-        ("query", "60s", 30),
-        ("token_rolling", "60s", 60_000),
-        ("token_rolling", "604800s", 100_000),
-        ("token_calendar", "each_day", 2_000_000),
-        ("token_calendar", "each_month", 200_000),
+        ("token_calendar", "each_day", 500_000),
     ]
-    assert by_id[3].source == "user+default"
-    # The fallback group: default plan first, then the user budget combo.
+    assert by_id[3].source == "user+key"
+    # An unset daily limit inherits the deployment default.
     assert _shapes(by_id[3].windows) == [
-        ("query", "60s", 10),
-        ("token_rolling", "60s", 60_000),
         ("token_calendar", "each_day", 2_000_000),
-        ("token_calendar", "each_month", 20_000_000),
-        ("token_rolling", "604800s", 100_000),
-        ("token_calendar", "each_month", 200_000),
     ]
 
 
@@ -441,7 +436,9 @@ async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkey
     the elapsed part of the day, so a member older than the day start but
     inside the last 24h stays out of ``used``."""
     now_ts = int(FIXED_NOW.timestamp())
-    daily_key = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_day"
+    daily_key = (
+        f"{rate_limit_plugin_name}|key-3|consumer=ak-shared.gpustack-7|t:each_day"
+    )
     client = FakeRedis(
         {
             daily_key: [
@@ -469,15 +466,16 @@ async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkey
     assert daily.used == 5
     # ...and the reset is the calendar boundary, not member aging.
     assert daily.reset_seconds == 43_200
-    # A user without budgets rides the default plan alone: the user block's
-    # day window reads the same per-user bucket.
+    # The user block rides the user combo: minute caps and the monthly
+    # quota inherit the deployment defaults (unseeded buckets read zero).
     assert _shapes(response.user.windows) == [
-        ("token_calendar", "each_day", 2_000_000),
+        ("query", "60s", 10),
+        ("token_rolling", "60s", 60_000),
         ("token_calendar", "each_month", 20_000_000),
     ]
-    user_daily = next(w for w in response.user.windows if w.period == "each_day")
-    assert user_daily.used == 5
-    assert user_daily.reset_seconds == 43_200
+    user_monthly = next(w for w in response.user.windows if w.period == "each_month")
+    assert user_monthly.used == 0
+    assert user_monthly.reset_seconds is not None
 
 
 @pytest.mark.asyncio

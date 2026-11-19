@@ -84,8 +84,8 @@ async def test_org_member_lists_only_own_api_keys_in_current_org(monkeypatch):
 
 def test_to_public_carries_the_rate_limit_fields():
     """The edit dialog pre-fills from this projection: leaving the gateway
-    rate limits out renders limits that are set in the database as empty
-    fields, and a save then looks like a reset to whoever trusts it."""
+    daily token budget out renders a limit that is set in the database as an
+    empty field, and a save then looks like a reset to whoever trusts it."""
     api_key = ApiKey(
         id=5,
         name="team-key",
@@ -95,16 +95,14 @@ def test_to_public_carries_the_rate_limit_fields():
         hashed_secret_key="secret",
         created_at=datetime(2026, 1, 1),
         updated_at=datetime(2026, 1, 1),
-        rpm_limit=60,
-        tpm_limit=100_000,
         daily_token_limit=500_000,
     )
 
     public = api_keys._api_key_to_public(api_key)
 
-    assert public.rpm_limit == 60
-    assert public.tpm_limit == 100_000
     assert public.daily_token_limit == 500_000
+    assert not hasattr(public, "rpm_limit")
+    assert not hasattr(public, "tpm_limit")
 
 
 @pytest.mark.asyncio
