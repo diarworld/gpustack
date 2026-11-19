@@ -16,6 +16,7 @@ from fastapi import APIRouter, Request
 from sqlmodel import select
 
 from gpustack.api.exceptions import NotFoundException
+from gpustack.api.tenant import TenantContext, is_platform_wide
 from gpustack.config.config import Config
 from gpustack.gateway.rate_limit_usage import (
     RateLimitUsageReader,
@@ -34,7 +35,11 @@ from gpustack.schemas.rate_limits import (
 )
 from gpustack.schemas.users import User
 from gpustack.security import is_legacy_token_access_key
-from gpustack.server.deps import CurrentUserDep, SessionDep
+from gpustack.server.deps import (
+    CurrentUserDep,
+    SessionDep,
+    TenantContextDep,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,15 +57,20 @@ def _mode(rlc) -> str:
     return "redis" if rlc.redis is not None else "local"
 
 
-async def _resolve_target(session, user: User, user_id: Optional[int]) -> User:
+async def _resolve_target(
+    session, user: User, ctx: TenantContext, user_id: Optional[int]
+) -> User:
     """The user whose limits to show.
 
     Self-scoped by construction: a foreign ``user_id`` is honored only for
-    a platform admin (the same ``user.is_admin`` notion the usage routes
-    use). Anyone else silently gets their own data, so the endpoint never
-    needs a privilege error path — the UI always renders the caller.
+    a platform-wide admin — admin WITHOUT a pinned Org, the same
+    ``is_platform_wide`` gate the usage routes apply to their cross-tenant
+    views. An Org-pinned admin is scoped to their Org like anyone else, so
+    their foreign ``user_id`` quietly degrades to the caller's own data
+    (deny-by-default: the alternative would leak another Org's budgets and
+    API keys).
     """
-    if user_id in (None, user.id) or not user.is_admin:
+    if user_id in (None, user.id) or not is_platform_wide(user, ctx):
         return user
     target = await User.one_by_id(session, user_id)
     if target is None:
@@ -127,17 +137,24 @@ async def _read_states(
 async def get_rate_limits(
     session: SessionDep,
     user: CurrentUserDep,
+    ctx: TenantContextDep,
     request: Request,
     user_id: Optional[int] = None,
 ):
     """The target user's rate-limit picture with live window counters.
 
+    Scoping: self by default; a foreign ``user_id`` is honored only for a
+    platform-wide admin (``is_platform_wide`` — admin without a pinned
+    Org, the usage routes' cross-tenant gate); anything else — non-admins
+    and Org-pinned admins alike — silently degrades to the caller's own
+    data.
+
     Args:
         session: async DB session.
         user: the authenticated caller.
+        ctx: the request's tenant context; gates the admin expansion.
         request: the FastAPI request; the server config lives on app.state.
-        user_id: whose limits to show; defaults to the caller. Ignored for
-            non-admin callers (they always get their own data).
+        user_id: whose limits to show; defaults to the caller.
 
     Returns:
         RateLimitsResponse: limits with live counters in redis mode, windows
@@ -159,7 +176,7 @@ async def get_rate_limits(
             mode=mode, generated_at=now, user=UserRateLimits(), api_keys=[]
         )
 
-    target = await _resolve_target(session, user, user_id)
+    target = await _resolve_target(session, user, ctx, user_id)
     weekly = target.weekly_token_limit
     monthly = target.monthly_token_limit
 

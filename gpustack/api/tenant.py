@@ -455,6 +455,24 @@ def bypass_tenant_filter(ctx: TenantContext) -> bool:
     return False
 
 
+def is_platform_wide(user, ctx: Optional[TenantContext]) -> bool:
+    """Platform admin acting without a pinned Org — the cross-tenant view.
+
+    The one context where cross-tenant reads (another user's data, the
+    Organization dimension) are meaningful: an Org-pinned admin is scoped
+    to their Org like anyone else, so callers must degrade to self-scoped
+    behavior when this answers False.
+
+    ``is_admin`` is read straight off the user: a defaulted lookup would
+    answer "not an admin" for a renamed or missing field, which is a
+    permission decision made by a typo. ``ctx`` is optional by contract —
+    some GET handlers call in without one.
+    """
+    return bool(user.is_admin) and (
+        ctx is None or getattr(ctx, "current_principal_id", None) is None
+    )
+
+
 def cluster_scoped_system(ctx: Optional[TenantContext]) -> bool:
     """True for SYSTEM service accounts that belong to exactly one
     cluster (worker registration / cluster bootstrap accounts). Their

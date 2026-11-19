@@ -54,6 +54,13 @@ def _request(cfg) -> SimpleNamespace:
     )
 
 
+def _ctx(current_principal_id) -> SimpleNamespace:
+    """Minimal TenantContext stand-in: the platform-wide gate reads only
+    ``current_principal_id`` (fake shape mirrors
+    tests/routes/test_api_keys.py's context stub)."""
+    return SimpleNamespace(current_principal_id=current_principal_id)
+
+
 def _user(id, *, is_admin=False, weekly=None, monthly=None) -> User:
     return User(
         id=id,
@@ -188,7 +195,7 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=user, request=_request(cfg), user_id=99
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=99
     )
 
     assert session.get_calls == []
@@ -210,6 +217,8 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
 
 @pytest.mark.asyncio
 async def test_admin_reads_another_user(frozen_now, monkeypatch):
+    """A platform-wide admin (admin, no pinned Org) may read another
+    user's picture."""
     cfg = _redis_cfg()
     admin = _user(1, is_admin=True)
     target = _user(7, weekly=100_000, monthly=200_000)
@@ -218,7 +227,7 @@ async def test_admin_reads_another_user(frozen_now, monkeypatch):
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=admin, request=_request(cfg), user_id=7
+        session=session, user=admin, ctx=_ctx(None), request=_request(cfg), user_id=7
     )
 
     assert session.get_calls == [7]
@@ -240,10 +249,35 @@ async def test_admin_unknown_user_is_404(frozen_now):
         await rate_limits.get_rate_limits(
             session=session,
             user=admin,
+            ctx=_ctx(None),
             request=_request(_redis_cfg()),
             user_id=999,
         )
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_org_pinned_admin_foreign_user_id_degrades_to_self(
+    frozen_now, monkeypatch
+):
+    """An Org-pinned admin is tenant-scoped like anyone else: a foreign
+    ``user_id`` quietly degrades to the caller's own picture, and no
+    cross-user lookup ever runs."""
+    cfg = _redis_cfg()
+    admin = _user(1, is_admin=True, weekly=111)
+    foreign = _user(7, weekly=222)
+    session = FakeSession(users=[admin, foreign], keys=[])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=admin, ctx=_ctx(10), request=_request(cfg), user_id=7
+    )
+
+    assert session.get_calls == []
+    assert response.user.weekly_limit == 111
+    assert _shapes(response.user.windows) == [("token_rolling", "604800s", 111)]
+    assert response.api_keys == []
 
 
 @pytest.mark.asyncio
@@ -261,7 +295,7 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
     session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1", rpm_limit=30)])
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=user, request=_request(_local_cfg())
+        session=session, user=user, ctx=_ctx(10), request=_request(_local_cfg())
     )
 
     assert response.mode == "local"
@@ -289,7 +323,7 @@ async def test_reader_failure_blanks_all_counters(frozen_now, monkeypatch):
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=user, request=_request(cfg)
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
     )
 
     assert response.mode == "redis"
@@ -323,7 +357,7 @@ async def test_legacy_key_hidden_and_sources(frozen_now, monkeypatch):
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=user, request=_request(cfg)
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
     )
 
     by_id = {k.id: k for k in response.api_keys}
@@ -375,7 +409,7 @@ async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkey
     session = FakeSession(users=[user], keys=[_key(3, access_key="ak-shared")])
 
     response = await rate_limits.get_rate_limits(
-        session=session, user=user, request=_request(_redis_cfg())
+        session=session, user=user, ctx=_ctx(10), request=_request(_redis_cfg())
     )
 
     daily = next(w for w in response.api_keys[0].windows if w.period == "each_day")
@@ -400,6 +434,7 @@ async def test_disabled_mode_returns_empty_structures(frozen_now, monkeypatch):
     response = await rate_limits.get_rate_limits(
         session=session,
         user=user,
+        ctx=_ctx(10),
         request=_request(SimpleNamespace(gateway_rate_limit=_cfg(enabled=False))),
         user_id=999,
     )
