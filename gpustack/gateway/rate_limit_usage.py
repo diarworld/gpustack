@@ -1,6 +1,6 @@
 """Server-side reconstruction of the rate-limit plugin's Redis keys.
 
-The usage endpoint and the usage flusher must read the very counters the
+The usage endpoint must read the very counters the
 gateway's ``gpustack-rate-limit`` plugin writes. The plugin composes those
 keys from the published combinations, so this module re-derives them from
 the same inputs -- the ``gateway_rate_limit`` config, an API key, and its
@@ -29,8 +29,7 @@ which keys exist for a given request path:
 Live reads sit on top of the specs: :class:`RateLimitUsageReader` totals the
 plugin's counters per window -- :meth:`~RateLimitUsageReader.read_window` is
 the per-window entry point, :meth:`~RateLimitUsageReader.window_states` the
-pipelined batch, and :func:`read_windows` the fail-open wrapper the endpoint
-and the flusher call -- applying the reset semantics each window kind
+pipelined batch, and :func:`read_windows` the fail-open wrapper the endpoint calls -- applying the reset semantics each window kind
 actually has.
 """
 
@@ -74,7 +73,7 @@ MONTH_PERIOD = "each_month"
 
 # The plugin's full calendar vocabulary: the pair above plus each_year, which
 # the plugin declares but the reconciler never publishes. Public: read-side
-# consumers (the usage flusher) parse every suffix the plugin can write.
+# consumers (the usage rebuilder) parse every suffix the plugin can write.
 CALENDAR_PERIODS = (DAY_PERIOD, MONTH_PERIOD, "each_year")
 
 # The key layout's dim-fragment and identity vocabulary: the consumer
@@ -127,8 +126,8 @@ def default_plan_windows(
     match is the user capture, so every window buckets on ``gpustack-<id>``.
 
     The fallback plan no longer governs any live request -- the user limit
-    combos are non-fallback and always match first -- but the flusher still
-    attributes the Redis keys it left behind until their TTLs expire."""
+    combos are non-fallback and always match first -- but the rebuilder still
+    restores the Redis keys it left behind until their TTLs expire."""
     identity = f"{USER_IDENTITY_PREFIX}{user_id}"
     combo = DEFAULT_PLAN_COMBO
     windows: List[RateLimitWindowSpec] = []
@@ -181,7 +180,7 @@ def default_plan_windows(
 
 class _UserLimits:
     """The four user-level limit fields off a Principal row, tolerating a
-    missing row (the flusher's default-plan path) as all-None."""
+    missing row (the rebuilder's default-plan path) as all-None."""
 
     def __init__(self, user: Optional["Principal"]):
         self.rpm = getattr(user, "rpm_limit", None)
@@ -436,7 +435,7 @@ class RateLimitUsageReader:
     @property
     def client(self) -> redis_asyncio.Redis:
         """The underlying client, for SCAN-style sweeps by long-lived
-        consumers (the usage flusher); tests reach the dial plan through it."""
+        consumers (the usage rebuilder); tests reach the dial plan through it."""
         return self._client
 
     async def window_state(
@@ -512,7 +511,7 @@ class RateLimitUsageReader:
     ) -> List[RateLimitWindowState]:
         """Every window state in one pipeline round trip.
 
-        The endpoint reads a whole user's picture and the flusher sweeps
+        The endpoint reads a whole user's picture and the rebuilder sweeps
         every user's windows -- hundreds of windows a batch. One concurrent
         ``ZRANGEBYSCORE`` per window blew through the client's connection
         pool (redis-py raises ``MaxConnectionsError`` past its cap) and
@@ -606,7 +605,8 @@ async def read_windows(
     and stale counters. Only the exception's class name surfaces — its
     message can carry hostnames.
 
-    This is the batch entry point the usage endpoint and the flusher share.
+    This is the batch entry point the usage endpoint and the usage
+    rebuilder share.
     """
     try:
         states = await reader.window_states(specs, now=now, timezone_name=timezone_name)

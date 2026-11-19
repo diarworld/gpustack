@@ -151,40 +151,37 @@ UI traffic draw on the same allowance, so both read the same counter. Calendar
 windows have no `window_seconds` — their length follows the calendar, and
 their `reset_seconds` counts down to the boundary in the deployment timezone.
 
-### Usage Snapshots
+### Counter Recovery
 
-With `gateway_rate_limit.enabled` and `gateway_rate_limit.redis` configured,
-the server also persists the token windows to the database every
-`gateway_rate_limit.usage_flush_interval_seconds` (60 seconds by default, `0`
-disables it). The live endpoint reads Redis directly and does not depend on
-the flusher:
+The plugin's Redis counters are the only enforcement state: when the
+rate-limit Redis loses them — a fresh instance, a flush without persistence —
+calendar quotas restart from zero and users who already spent their day /
+week / month budget get it back for the rest of the window. To close that
+gap, the server replays once at startup the consumption it already recorded
+in `model_usage_details` into the very counters the plugin reads, and only
+into counters that do not exist yet — a live counter is never touched, so
+against a healthy Redis this is a cheap no-op.
 
-- Only long token windows are flushed — the sliding week and the day / month
-  budgets. Per-minute windows are not persisted — request counts and
-  per-minute tokens alike: they churn a row every cycle, and the gateway
-  metrics above and the `model_usages` history already record per-request
-  consumption.
-- Snapshots land in `gateway_rate_limit_usages`, one row per combination and
-  window. Calendar windows upsert the same row every cycle; the sliding week
-  moves with every read, so each cycle writes a new snapshot row — a weekly
-  consumption trend at the flush interval. That row-per-cycle sampling is the
-  remaining churn source: raise the interval (e.g. to `300`–`3600`) if you do
-  not need weekly snapshots that fine-grained.
-- `user_id` / `api_key_id` of `0` marks a row that could not be attributed.
-  Default-plan and user-budget rows aggregate a user's API-key and dashboard
-  traffic into one bucket, so they carry no key id; a snapshot of a
-  `key-<id>` combination whose key has since been deleted keeps the key id
-  and lands on `user_id` 0 — history survives key deletion.
-- `quota` is the limit as of the flush. After a limits change the gateway
-  keeps enforcing the previous value for up to one reconcile interval, so a
-  fresh snapshot can briefly trail what is actually enforced.
-- Rows older than 90 days are pruned on every cycle.
+Not exact by design:
+
+- Minute windows are not rebuilt — they age out in 60 seconds, long before a
+  rebuild can matter.
+- Rebuilt members are per-hour aggregates, so the sliding week decays in
+  hour steps rather than per request.
+- The plugin counts at the gateway while the server records at the proxy, so
+  aborted or untracked requests can leave a rebuilt total slightly off the
+  lost one.
+
+A marker key written after a successful pass (TTL past the longest calendar
+window) short-circuits the scan while the Redis keeps its data; losing the
+Redis loses the marker, which re-arms the rebuild. Enabling persistence
+(AOF / RDB) on the rate-limit Redis avoids the rebuild entirely.
 
 !!! note
 
-    The endpoint and the flusher read the same Redis the gateway writes its
-    counters to — `gateway_rate_limit.redis` — not the server's top-level
-    `redis_url`.
+    The endpoint and the rebuilder talk to the same Redis the gateway writes
+    its counters to — `gateway_rate_limit.redis` — not the server's
+    top-level `redis_url`.
 
 ## Metrics
 
