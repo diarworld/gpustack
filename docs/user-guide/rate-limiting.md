@@ -137,7 +137,7 @@ metric_relabel_configs:
   # ids out of the flattened name, into labels — these rules read the
   # ORIGINAL name, so they must come before the rename below.
   - source_labels: [__name__]
-    regex: gpustack_rate_limit_request_total_rule_.*_result_(.+)
+    regex: .*gpustack_rate_limit_request_total_rule_.*_result_(.+)
     target_label: rl_result
   - source_labels: [__name__]
     regex: .*_combo_(.+?)_kind_.*
