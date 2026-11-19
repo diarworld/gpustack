@@ -6,6 +6,7 @@ endpoint would read keys the plugin never writes.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -13,8 +14,12 @@ import pytest
 from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS, rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import (
+    RateLimitUsageReader,
+    calendar_elapsed_seconds,
     calendar_window_seconds,
     expected_windows,
+    parse_member_count,
+    reader_from_config,
     source_for,
 )
 from gpustack.security import gateway_consumer_identity
@@ -48,6 +53,38 @@ class _KeyStub:
 
 def _shapes(windows):
     return [(w.kind, w.period, w.window_seconds, w.limit, w.redis_key) for w in windows]
+
+
+class _FakeRedis:
+    """Stand-in for redis.asyncio.Redis exposing only ZRANGEBYSCORE.
+
+    Seeded as ``{key: [(score, member), ...]}``. Bound parsing mirrors
+    redis-py: a leading ``(`` marks the bound exclusive, bare numbers are
+    inclusive.
+    """
+
+    def __init__(self, members):
+        self._members = members
+
+    @staticmethod
+    def _bound(value):
+        if isinstance(value, str) and value.startswith("("):
+            return float(value[1:]), True
+        return float(value), False
+
+    async def zrangebyscore(self, key, lo, hi, withscores=False):
+        lo_value, lo_exclusive = self._bound(lo)
+        hi_value, hi_exclusive = self._bound(hi)
+        hits = [
+            (member, score)
+            for score, member in self._members.get(key, [])
+            if (score > lo_value if lo_exclusive else score >= lo_value)
+            and (score < hi_value if hi_exclusive else score <= hi_value)
+        ]
+        hits.sort(key=lambda pair: pair[1])
+        if not withscores:
+            return [member for member, _ in hits]
+        return hits
 
 
 def test_default_plan_keys():
@@ -193,6 +230,29 @@ def test_calendar_window_seconds_rejects_naive_datetime():
         calendar_window_seconds("each_day", datetime(2026, 11, 19, 12, 0, 0), "UTC")
 
 
+def test_calendar_elapsed_seconds():
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    assert calendar_elapsed_seconds("each_day", now, "UTC") == 43_200
+    # Nov 1 00:00Z to Nov 19 12:00Z is 18.5 days.
+    assert calendar_elapsed_seconds("each_month", now, "UTC") == 1_598_400
+    # Jan 1 00:00Z to Nov 19 12:00Z is 322.5 days in a non-leap year.
+    assert calendar_elapsed_seconds("each_year", now, "UTC") == 27_864_000
+
+
+def test_calendar_elapsed_seconds_complements_window_seconds():
+    """Elapsed plus remaining is the period's full length, so the reader can
+    bound a calendar window by the elapsed part alone."""
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    elapsed = calendar_elapsed_seconds("each_day", now, "UTC")
+    remaining = calendar_window_seconds("each_day", now, "UTC")
+    assert elapsed + remaining == 86_400
+
+
+def test_calendar_elapsed_seconds_rejects_naive_datetime():
+    with pytest.raises(ValueError):
+        calendar_elapsed_seconds("each_day", datetime(2026, 11, 19, 12, 0, 0), "UTC")
+
+
 def test_no_windows_when_nothing_configured():
     rlc = _cfg(
         default_rpm=None,
@@ -207,3 +267,121 @@ def test_unset_defaults_skip_their_windows():
     rlc = _cfg(default_tpm=None, default_daily_tokens=None, default_monthly_tokens=None)
     windows = expected_windows(rlc, 6, None, None, None)
     assert [(w.kind, w.period) for w in windows] == [("query", "60s")]
+
+
+@pytest.mark.asyncio
+async def test_window_state_sums_member_counts():
+    key = "k"
+    now = 1_000
+    client = _FakeRedis(
+        {
+            key: [
+                # The plugin prunes members scored at or before
+                # now - window_seconds before summing: both of these sit on
+                # or below the read's exclusive lower bound.
+                (939, "pruned-old|9"),
+                (940, "pruned-boundary|4"),
+                (970, b"legacy"),
+                (999, "last|5"),
+                (1_000, "edge|2"),
+                (1_001, "future|100"),
+            ]
+        }
+    )
+    state = await RateLimitUsageReader(client).window_state(
+        key, window_seconds=60, now=now
+    )
+    assert state.used == 8
+
+
+@pytest.mark.asyncio
+async def test_window_state_reset_from_oldest():
+    client = _FakeRedis({"k": [(945, "a|1"), (970, "b|2"), (999, "c|3")]})
+    state = await RateLimitUsageReader(client).window_state(
+        "k", window_seconds=60, now=1_000
+    )
+    assert state.used == 6
+    # The count drops when the oldest in-window member leaves.
+    assert state.reset_seconds == 5
+
+
+@pytest.mark.asyncio
+async def test_window_state_empty_window_is_zeroed():
+    state = await RateLimitUsageReader(_FakeRedis({})).window_state(
+        "k", window_seconds=60, now=1_000
+    )
+    assert state.used == 0
+    assert state.reset_seconds == 0
+
+
+@pytest.mark.parametrize(
+    ("member", "expected"),
+    [
+        ("uuid-1|5", 5),
+        (b"uuid-1|7", 7),
+        ("uuid-1", 1),
+        ("uuid-1|x", 1),
+        ("", 1),
+        ("a|b|12", 12),
+    ],
+)
+def test_parse_member_count(member, expected):
+    assert parse_member_count(member) == expected
+
+
+def test_reader_from_config_without_redis_is_none():
+    cfg = SimpleNamespace(gateway_rate_limit=_cfg(redis=None))
+    assert reader_from_config(cfg) is None
+
+
+def test_reader_from_config_dials_gateway_service():
+    redis_cfg = GatewayRateLimitRedis(
+        service_name="rate-limit-redis",
+        service_port=6380,
+        username="svc",
+        password="pw",
+        timeout=2500,
+        database=3,
+    )
+    cfg = SimpleNamespace(gateway_rate_limit=_cfg(redis=redis_cfg))
+    client = reader_from_config(cfg)._client
+    # redis.asyncio.Redis connects lazily; its pool carries the dial plan.
+    kwargs = client.connection_pool.connection_kwargs
+    assert kwargs["host"] == "rate-limit-redis"
+    assert kwargs["port"] == 6380
+    assert kwargs["username"] == "svc"
+    assert kwargs["password"] == "pw"
+    assert kwargs["db"] == 3
+    assert kwargs["socket_timeout"] == 2.5
+    assert kwargs["socket_connect_timeout"] == 2.5
+    assert kwargs["decode_responses"] is False
+
+
+@pytest.mark.asyncio
+async def test_specs_and_reader_round_trip():
+    """The reader consumes exactly the keys expected_windows derives: every
+    spec's totals land on its own key and nowhere else."""
+    windows = expected_windows(_cfg(), 6, None, 100_000, 200_000)
+    seed = {}
+    expected_used = {}
+    for i, spec in enumerate(windows):
+        in_window, outside = 2 * (i + 1), 3 * (i + 1)
+        # Below the spec's own exclusive lower bound, so it stays outside
+        # however wide the window is (the weekly one reaches far back).
+        lower = 1_000 - (spec.window_seconds or 200)
+        seed[spec.redis_key] = [
+            (lower - 1, f"stale-{i}|100"),
+            (990, f"a-{i}|{in_window}"),
+            (999, f"b-{i}|{outside}"),
+        ]
+        expected_used[spec.redis_key] = in_window + outside
+    reader = RateLimitUsageReader(_FakeRedis(seed))
+    for spec in windows:
+        # Calendar windows carry no fixed length; the endpoint passes the
+        # elapsed period, any value bounding the read below `now` works here.
+        state = await reader.window_state(
+            spec.redis_key,
+            window_seconds=spec.window_seconds or 200,
+            now=1_000,
+        )
+        assert state.used == expected_used[spec.redis_key], spec.redis_key
