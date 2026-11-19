@@ -13,21 +13,31 @@ from gpustack.utils.rollup_tz import resolve_rollup_tz
 
 router = APIRouter()
 
+# The read half of the config: mounted for any authenticated user on the
+# server, behind the worker token on the worker. Mutations stay on
+# ``router``.
+read_router = APIRouter()
+
 logger = logging.getLogger(__name__)
 
 # Security model for /config:
-#   - Server mount (routes/routes.py) wraps this router with
-#     Depends(get_admin_user) — only admin users may read or mutate.
-#   - Worker mount (worker/worker.py) wraps it with Depends(worker_auth) —
-#     only callers holding the worker / registration token may read or
-#     mutate that worker's runtime config.
+#   - GET is display-facing: the UI reads it at startup for the monitoring
+#     links (grafana_url, the observability flag, the dashboard uids), so
+#     the server mounts ``read_router`` for any authenticated user. No
+#     secrets ride in the response -- only the whitelisted fields below.
+#   - PUT mutates runtime behavior and stays admin-only: the full
+#     ``router`` is mounted with Depends(get_admin_user).
+#   - Worker mount (worker/worker.py) wraps both routers with
+#     Depends(worker_auth) -- only callers holding the worker /
+#     registration token may read or mutate that worker's runtime config.
 # Authentication is intentionally enforced at the mount sites, not on the
-# handlers, because the two deployments use different auth mechanisms
-# (user DB vs. shared token) and the worker has no access to the user DB.
-# Any new mount of this router MUST declare an appropriate auth dependency.
+# handlers, because the deployments use different auth mechanisms (user
+# DB vs. shared token) and the worker has no access to the user DB.
+# Any new mount of these routers MUST declare an appropriate auth
+# dependency.
 
 
-@router.get("/config")
+@read_router.get("/config")
 async def get_config(request: Request):
     app_state = request.app.state
     cfg: Config = getattr(app_state, "server_config", None) or getattr(

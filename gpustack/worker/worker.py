@@ -402,6 +402,11 @@ class Worker:
         )
         app.add_middleware(BaseHTTPMiddleware, dispatch=proxy.set_port_from_model_name)
         app.include_router(
+            route_config.read_router,
+            prefix=default_versioned_prefix,
+            dependencies=[Depends(worker_request_auth)],
+        )
+        app.include_router(
             route_config.router,
             prefix=default_versioned_prefix,
             dependencies=[Depends(worker_request_auth)],

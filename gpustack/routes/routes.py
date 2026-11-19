@@ -498,6 +498,15 @@ management_router.include_router(
     v1_admin_router, dependencies=[Depends(get_admin_user)], prefix=versioned_prefix
 )
 management_router.include_router(
+    # GET /config feeds the UI's systemConfig (monitoring links included)
+    # and is display-facing: any authenticated user. Mounted before the
+    # admin router so the open GET is the one that matches.
+    config.read_router,
+    dependencies=[Depends(get_current_user)],
+    prefix=versioned_prefix,
+    include_in_schema=False,
+)
+management_router.include_router(
     config.router,
     dependencies=[Depends(get_admin_user)],
     prefix=versioned_prefix,
