@@ -1,0 +1,546 @@
+"""Persists long-window rate-limit usage snapshots from Redis into the DB.
+
+The ``gpustack-rate-limit`` plugin keeps every window's live total in Redis
+ZSETs that age out by themselves; analytics needs the slower-moving picture on
+disk. This flusher periodically SCANs the plugin's counters, reads each
+discovered window through :func:`gpustack.gateway.rate_limit_usage.read_windows`
+-- the same batch helper and fail-open contract the usage endpoint uses -- and
+upserts one :class:`~gpustack.schemas.gateway_rate_limit_usages.
+GatewayRateLimitUsage` row per (combo, kind, period, window_start) holding the
+last observed total. The per-request consumption time series already lives in
+``model_usages``; this table exists for window-level analytics.
+
+Every cycle shares one aware ``now``: the Redis reads, the window-start math
+and the ``updated_at`` stamps must all describe a single instant. Redis reads
+fail open (the cycle is dropped, the DB untouched). Attribution is deliberately
+tolerant -- an off-layout key or an unknown combo is skipped with a debug log,
+never raised, so one malformed counter cannot wedge the loop.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+from sqlalchemy import delete
+from sqlmodel import select
+
+from gpustack.config.config import Config
+from gpustack.gateway.rate_limit_usage import (
+    DEFAULT_PLAN_COMBO,
+    RULE_NAME,
+    RateLimitUsageReader,
+    RateLimitWindowSpec,
+    calendar_elapsed_seconds,
+    expected_windows,
+    read_windows,
+    reader_from_config,
+)
+from gpustack.schemas.api_keys import ApiKey
+from gpustack.schemas.gateway_rate_limit_usages import GatewayRateLimitUsage
+from gpustack.schemas.principals import Principal
+from gpustack.security import gateway_consumer_identity
+from gpustack.server.db import async_session
+
+logger = logging.getLogger(__name__)
+
+# Only token windows are persisted. The query windows are per-minute request
+# counts: they would churn a row every cycle and say nothing the model_usages
+# time series does not already record. Retention bounds the rest.
+FLUSH_KINDS = ("token_rolling", "token_calendar")
+
+# Snapshots older than this are pruned in the same pass that upserts.
+RETENTION_DAYS = 90
+
+# SCAN hint per call; the loop runs until the cursor wraps to 0 regardless.
+SCAN_BATCH = 500
+
+# The calendar suffixes the plugin's PeriodKind declares (the reconciler never
+# publishes each_year, but its counters must still parse if they appear).
+_CALENDAR_SUFFIXES = ("each_day", "each_month", "each_year")
+
+_CONSUMER_PREFIX = "consumer="
+_IDENTITY_USER_PREFIX = "gpustack-"
+
+
+@dataclass
+class ParsedKey:
+    """The identity one Redis counter key carries, structurally parsed.
+
+    ``combo`` is the key's second segment (``default-plan`` / ``user-<id>`` /
+    ``key-<id>``), ``identity`` the value of its single ``consumer=`` dim
+    fragment, and the (kind, period, window_seconds) triple the suffix's
+    metric: rolling suffixes render as ``<seconds>s``, calendar ones as
+    ``each_<unit>`` with ``window_seconds`` unset (their length follows the
+    calendar, not a constant).
+    """
+
+    combo: str
+    kind: str
+    period: str
+    window_seconds: Optional[int]
+    identity: str
+
+
+def _rolling_seconds(period: str) -> Optional[int]:
+    """Seconds in a ``<n>s`` rolling period, or None when off-format."""
+    if not period.endswith("s"):
+        return None
+    digits = period[:-1]
+    if not digits.isascii() or not digits.isdigit():
+        return None
+    seconds = int(digits)
+    return seconds if seconds > 0 else None
+
+
+def _parse_suffix(suffix: str) -> Tuple[str, str, Optional[int]]:
+    """(kind, period, window_seconds) for one key suffix.
+
+    ``q:<n>s`` is a rolling query window, ``t:<n>s`` a rolling token one and
+    ``t:each_<unit>`` a calendar token quota. A (None, ...) result marks a
+    suffix the plugin never writes.
+    """
+    prefix, _, period = suffix.partition(":")
+    if prefix == "q":
+        window = _rolling_seconds(period)
+        return ("query", period, window) if window is not None else (None, "", None)
+    if prefix == "t":
+        if period in _CALENDAR_SUFFIXES:
+            return ("token_calendar", period, None)
+        window = _rolling_seconds(period)
+        return (
+            ("token_rolling", period, window)
+            if window is not None
+            else (None, "", None)
+        )
+    return (None, "", None)
+
+
+def parse_rate_limit_key(key: str) -> Optional[ParsedKey]:
+    """Parse one counter key into its combo, metric and consumer identity.
+
+    Tolerant by contract: anything off-layout -- a foreign rule name, a
+    suffix the plugin never writes, a missing or duplicated consumer dim --
+    parses as ``None`` so the caller can skip it with a debug log. The plugin
+    composes these keys from published combinations; a layout this code does
+    not recognize is a plugin this code must not guess about.
+
+    Args:
+        key: the Redis key, ``<rule>|<combo>|<dims joined by "|">|<suffix>``.
+
+    Returns:
+        ParsedKey: the parsed identity, or None when the key is off-layout.
+    """
+    segments = key.split("|")
+    if len(segments) < 4 or segments[0] != RULE_NAME:
+        return None
+    dims = segments[2:-1]
+    consumers = [
+        dim[len(_CONSUMER_PREFIX) :] for dim in dims if dim.startswith(_CONSUMER_PREFIX)
+    ]
+    if len(consumers) != 1 or not consumers[0]:
+        return None
+    kind, period, window_seconds = _parse_suffix(segments[-1])
+    if kind is None:
+        return None
+    return ParsedKey(
+        combo=segments[1],
+        kind=kind,
+        period=period,
+        window_seconds=window_seconds,
+        identity=consumers[0],
+    )
+
+
+def _int_tail(segment: str, prefix: str) -> Optional[int]:
+    """The digits after ``prefix`` in a segment, or None when absent."""
+    tail = segment[len(prefix) :]
+    if not tail.isascii() or not tail.isdigit():
+        return None
+    return int(tail)
+
+
+def _user_from_identity(identity: str) -> int:
+    """The ``gpustack-<id>`` user a fallback combo's identity buckets on.
+
+    0 (unattributable) when the segment does not parse: the row still lands,
+    keyed on user_id 0, rather than being silently dropped.
+    """
+    user_id = _int_tail(identity, _IDENTITY_USER_PREFIX)
+    if user_id is not None:
+        return user_id
+    logger.debug("Unattributable default-plan consumer: %s", identity)
+    return 0
+
+
+def _match_quota(specs: List[RateLimitWindowSpec], parsed: ParsedKey) -> Optional[int]:
+    """The enforced limit for the parsed (kind, period) among a combo's
+    expected windows; None when the window is unlimited or unrecognized."""
+    for spec in specs:
+        if spec.kind == parsed.kind and spec.period == parsed.period:
+            return spec.limit
+    return None
+
+
+@dataclass
+class Attribution:
+    """Where one flushed window's row lands and what its quota was."""
+
+    combo_name: str
+    kind: str
+    period: str
+    window_seconds: Optional[int]
+    user_id: int
+    api_key_id: int
+    quota: Optional[int]
+
+
+def _window_start(item: Attribution, now: datetime, timezone_name: str) -> datetime:
+    """The instant the snapshot's window began, from the cycle's shared now.
+
+    Rolling windows slide with every read, so their start is
+    ``now - window_seconds``: the row records which slice of history the
+    total covers, not a stable bucket. Calendar windows start at the period
+    boundary in the deployment timezone.
+    """
+    if item.window_seconds is not None:
+        return now - timedelta(seconds=item.window_seconds)
+    elapsed = calendar_elapsed_seconds(item.period, now, timezone_name)
+    return now - timedelta(seconds=elapsed)
+
+
+class RateLimitUsageFlusher:
+    """Persists long-window rate-limit usage snapshots from Redis.
+
+    One row per (combo, kind, period, window_start) holding the last
+    observed total -- the consumption time series already lives in
+    model_usages; this table exists for window-level analytics.
+    """
+
+    def __init__(self, cfg: Config):
+        self._config = cfg
+        rlc = cfg.gateway_rate_limit
+        self._interval = rlc.usage_flush_interval_seconds if rlc else 0
+        # Built on the first cycle and kept for the process lifetime: the
+        # client binds its pool lazily, and rebuilding it per cycle would
+        # churn connections (see reader_from_config).
+        self._reader: Optional[RateLimitUsageReader] = None
+
+    async def start(self):
+        rlc = self._config.gateway_rate_limit
+        if rlc is None or not rlc.enabled or rlc.redis is None:
+            logger.info(
+                "Rate-limit usage flusher idle: no Redis-backed "
+                "gateway_rate_limit config to flush from."
+            )
+            return
+        if self._interval <= 0:
+            logger.info(
+                "Rate-limit usage flusher idle: usage_flush_interval_seconds=0."
+            )
+            return
+        while True:
+            try:
+                await self._flush_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "Rate-limit usage flush failed: %s: %s", type(e).__name__, e
+                )
+            await asyncio.sleep(self._interval)
+
+    async def _flush_once(self):
+        rlc = self._config.gateway_rate_limit
+        # One aware instant shared by every read, window start and stamp in
+        # this cycle: the snapshots must describe a single moment.
+        now = datetime.now(timezone.utc)
+        if self._reader is None:
+            self._reader = reader_from_config(self._config)
+        if self._reader is None:
+            # start() only loops with a Redis backend; defensive no-op for
+            # direct _flush_once callers.
+            return
+        # The SCAN rides the reader's own connection pool: one client per
+        # process is the contract (reader_from_config), and the flusher's
+        # path-limited scope keeps the attribute access internal to this
+        # module rather than widening the toolkit's surface.
+        discovered = await self._discover(self._reader._client)
+        if not discovered:
+            return
+        async with async_session() as session:
+            kept = await self._attribute(session, rlc, discovered)
+            if kept:
+                specs = [
+                    RateLimitWindowSpec(
+                        kind=item.kind,
+                        period=item.period,
+                        window_seconds=item.window_seconds,
+                        # The reader derives totals from the ZSET members; the
+                        # limit rides along only to keep the spec complete.
+                        limit=item.quota or 0,
+                        redis_key=redis_key,
+                    )
+                    for redis_key, item in kept
+                ]
+                states, usage_error = await read_windows(
+                    self._reader, specs, now=now, timezone_name=rlc.timezone
+                )
+                if usage_error is not None:
+                    # Fail open: the whole cycle is dropped and the DB left
+                    # untouched rather than mixing fresh and stale counters.
+                    logger.warning("Rate-limit usage flush skipped: %s", usage_error)
+                    return
+                await self._upsert(
+                    session, [item for _, item in kept], states, now, rlc.timezone
+                )
+            await self._prune(session, now)
+            await session.commit()
+
+    async def _discover(self, client) -> List[Tuple[str, ParsedKey]]:
+        """Every persistable window found in one SCAN sweep.
+
+        Explicit cursor loop (not ``scan_iter``): the plugin's key space is
+        small and the exact call signature is what tests mirror.
+        """
+        found: List[Tuple[str, ParsedKey]] = []
+        cursor = 0
+        while True:
+            cursor, batch = await client.scan(
+                cursor, match=f"{RULE_NAME}|*", count=SCAN_BATCH
+            )
+            for raw in batch:
+                key = (
+                    raw.decode("utf-8", errors="replace")
+                    if isinstance(raw, bytes)
+                    else raw
+                )
+                parsed = parse_rate_limit_key(key)
+                if parsed is None:
+                    logger.debug("Skipping unparseable rate-limit key: %s", key)
+                    continue
+                if parsed.kind not in FLUSH_KINDS:
+                    continue
+                found.append((key, parsed))
+            if cursor == 0:
+                break
+        return found
+
+    async def _attribute(
+        self,
+        session,
+        rlc,
+        discovered: List[Tuple[str, ParsedKey]],
+    ) -> List[Tuple[str, Attribution]]:
+        """Resolve each discovered key's row identity and quota.
+
+        Two batched reads per cycle cover every key: the ``key-<id>`` combos'
+        ApiKey rows (live only -- soft-deleted keys enforce nothing) and the
+        referenced users' token budgets. The combo segment is the
+        authoritative attribution; the consumer dim is corroboration.
+        """
+        key_ids = {
+            key_id
+            for key_id in (_int_tail(p.combo, "key-") for _, p in discovered)
+            if key_id is not None
+        }
+        api_keys: Dict[int, ApiKey] = {}
+        if key_ids:
+            rows = (
+                await session.exec(
+                    select(ApiKey).where(
+                        ApiKey.id.in_(key_ids), ApiKey.deleted_at.is_(None)
+                    )
+                )
+            ).all()
+            api_keys = {k.id: k for k in rows}
+
+        user_ids = {
+            user_id
+            for user_id in (_int_tail(p.combo, "user-") for _, p in discovered)
+            if user_id is not None
+        }
+        user_ids.update(k.user_id for k in api_keys.values())
+        budgets: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+        if user_ids:
+            rows = (
+                await session.exec(select(Principal).where(Principal.id.in_(user_ids)))
+            ).all()
+            budgets = {
+                u.id: (u.weekly_token_limit, u.monthly_token_limit) for u in rows
+            }
+
+        attributed: List[Tuple[str, Attribution]] = []
+        for redis_key, parsed in discovered:
+            item = self._resolve(rlc, redis_key, parsed, api_keys, budgets)
+            if item is not None:
+                attributed.append((redis_key, item))
+        return attributed
+
+    def _resolve(
+        self,
+        rlc,
+        redis_key: str,
+        parsed: ParsedKey,
+        api_keys: Dict[int, ApiKey],
+        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+    ) -> Optional[Attribution]:
+        """One key's row identity and quota, or None when unattributable."""
+        if parsed.combo == DEFAULT_PLAN_COMBO:
+            return self._resolve_default_plan(rlc, parsed)
+        if parsed.combo.startswith("user-"):
+            return self._resolve_user_budget(rlc, parsed, budgets)
+        if parsed.combo.startswith("key-"):
+            return self._resolve_key_combo(redis_key, parsed, api_keys, budgets, rlc)
+        logger.debug("Unknown combo segment on %s", redis_key)
+        return None
+
+    def _resolve_default_plan(self, rlc, parsed: ParsedKey) -> Attribution:
+        """The deployment defaults' combo: the user id comes from the
+        captured ``gpustack-<id>`` dim, not from any database row."""
+        user_id = _user_from_identity(parsed.identity)
+        specs = [
+            spec
+            for spec in expected_windows(rlc, user_id, None, None, None)
+            if spec.redis_key.split("|")[1] == DEFAULT_PLAN_COMBO
+        ]
+        return Attribution(
+            combo_name=DEFAULT_PLAN_COMBO,
+            kind=parsed.kind,
+            period=parsed.period,
+            window_seconds=parsed.window_seconds,
+            user_id=user_id,
+            api_key_id=0,
+            quota=_match_quota(specs, parsed),
+        )
+
+    def _resolve_user_budget(
+        self,
+        rlc,
+        parsed: ParsedKey,
+        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+    ) -> Optional[Attribution]:
+        """The fallback combo carrying one user's shared token budgets."""
+        user_id = _int_tail(parsed.combo, "user-")
+        if user_id is None:
+            logger.debug("Unparseable user combo: %s", parsed.combo)
+            return None
+        weekly, monthly = budgets.get(user_id, (None, None))
+        specs = [
+            spec
+            for spec in expected_windows(rlc, user_id, None, weekly, monthly)
+            if spec.redis_key.split("|")[1] == parsed.combo
+        ]
+        return Attribution(
+            combo_name=parsed.combo,
+            kind=parsed.kind,
+            period=parsed.period,
+            window_seconds=parsed.window_seconds,
+            user_id=user_id,
+            api_key_id=0,
+            quota=_match_quota(specs, parsed),
+        )
+
+    def _resolve_key_combo(
+        self,
+        redis_key: str,
+        parsed: ParsedKey,
+        api_keys: Dict[int, ApiKey],
+        budgets: Dict[int, Tuple[Optional[int], Optional[int]]],
+        rlc,
+    ) -> Optional[Attribution]:
+        """The non-fallback combo of one explicitly-limited API key."""
+        api_key_id = _int_tail(parsed.combo, "key-")
+        if api_key_id is None:
+            logger.debug("Unparseable key combo: %s", parsed.combo)
+            return None
+        key = api_keys.get(api_key_id)
+        if key is None:
+            # The combo segment is the authoritative attribution and the
+            # snapshot must outlive the key row it names: keep the key id
+            # and attribute to user 0 rather than guessing an owner.
+            return Attribution(
+                combo_name=parsed.combo,
+                kind=parsed.kind,
+                period=parsed.period,
+                window_seconds=parsed.window_seconds,
+                user_id=0,
+                api_key_id=api_key_id,
+                quota=None,
+            )
+        user_id = key.user_id
+        weekly, monthly = budgets.get(user_id, (None, None))
+        identity = gateway_consumer_identity(key.access_key, user_id)
+        if identity != parsed.identity:
+            # Corroboration only: the combo segment still names the key, so
+            # the row keeps its attribution and the drift is logged.
+            logger.debug(
+                "Consumer dim drift on %s: %s vs %s",
+                redis_key,
+                parsed.identity,
+                identity,
+            )
+        return Attribution(
+            combo_name=parsed.combo,
+            kind=parsed.kind,
+            period=parsed.period,
+            window_seconds=parsed.window_seconds,
+            user_id=user_id,
+            api_key_id=api_key_id,
+            quota=_match_quota(
+                expected_windows(rlc, user_id, key, weekly, monthly), parsed
+            ),
+        )
+
+    async def _upsert(
+        self,
+        session,
+        items: List[Attribution],
+        states,
+        now: datetime,
+        timezone_name: str,
+    ):
+        """UPDATE or INSERT each snapshot; one commit lands them all."""
+        for item, state in zip(items, states):
+            window_start = _window_start(item, now, timezone_name)
+            existing = (
+                await session.exec(
+                    select(GatewayRateLimitUsage).where(
+                        GatewayRateLimitUsage.combo_name == item.combo_name,
+                        GatewayRateLimitUsage.kind == item.kind,
+                        GatewayRateLimitUsage.period == item.period,
+                        GatewayRateLimitUsage.window_start == window_start,
+                        GatewayRateLimitUsage.user_id == item.user_id,
+                        GatewayRateLimitUsage.api_key_id == item.api_key_id,
+                    )
+                )
+            ).first()
+            if existing is None:
+                session.add(
+                    GatewayRateLimitUsage(
+                        combo_name=item.combo_name,
+                        kind=item.kind,
+                        period=item.period,
+                        window_start=window_start,
+                        window_seconds=item.window_seconds,
+                        user_id=item.user_id,
+                        api_key_id=item.api_key_id,
+                        usage=state.used,
+                        quota=item.quota,
+                        updated_at=now,
+                    )
+                )
+                continue
+            existing.usage = state.used
+            existing.quota = item.quota
+            existing.updated_at = now
+
+    async def _prune(self, session, now: datetime):
+        """Drop snapshots older than the retention window."""
+        cutoff = now - timedelta(days=RETENTION_DAYS)
+        await session.exec(
+            delete(GatewayRateLimitUsage).where(
+                GatewayRateLimitUsage.updated_at < cutoff
+            )
+        )

@@ -80,6 +80,7 @@ from gpustack.server.catalog import read_builtin_catalog_text
 from gpustack.server.db import async_session
 from gpustack.server.gateway_auth_reconciler import GatewayAuthReconciler
 from gpustack.server.gateway_rate_limit_reconciler import GatewayRateLimitReconciler
+from gpustack.server.rate_limit_usage_flusher import RateLimitUsageFlusher
 from gpustack.server.lora_model_routes import (
     cleanup_orphan_lora_routes,
     create_lora_model_routes,
@@ -540,6 +541,12 @@ class Server:
         # unless ``gateway_rate_limit.enabled`` is set.
         gateway_rate_limit_reconciler = GatewayRateLimitReconciler(self._config)
         tasks.append(asyncio.create_task(gateway_rate_limit_reconciler.start()))
+
+        # Persists long-window rate-limit usage snapshots for analytics.
+        # No-ops unless gateway_rate_limit is enabled with a Redis backend
+        # and the flush interval is non-zero.
+        rate_limit_usage_flusher = RateLimitUsageFlusher(self._config)
+        tasks.append(asyncio.create_task(rate_limit_usage_flusher.start()))
 
         cache_service_controller = CacheServiceController(self._config)
         tasks.append(asyncio.create_task(cache_service_controller.start()))
