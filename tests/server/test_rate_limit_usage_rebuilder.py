@@ -3,8 +3,10 @@
 The rebuilder must reproduce the plugin's own accounting closely enough to
 restore lost quotas: the right keys (user-level buckets on
 ``gpustack-<id>``, key buckets on the full consumer identity), the right
-token totals per hour bucket, and a hard rule that live counters are never
-written to.
+token totals per hour bucket, a startup warm-up that replaces whatever
+survived, and a hard rule that steady-state cycles never touch live
+counters. Resets (``gateway_rate_limit_resets``) forgive earlier spend, so
+a rebuilt weekly / monthly counter resumes from the reset.
 """
 
 from datetime import datetime, timezone
@@ -67,6 +69,11 @@ def _key(id: int, *, access_key="ak", user_id=7, daily_token_limit=None) -> ApiK
     )
 
 
+def _reset(user_id: int, kind: str, at: datetime):
+    """A recorded reset, aware UTC as UTCDateTime returns it."""
+    return SimpleNamespace(user_id=user_id, kind=kind, reset_at=at)
+
+
 # (user_id, api_key_id, completed_at, prompt, completion) — the tuple the
 # details scan projects. Timestamps are naive UTC, as the table stores them.
 def _row(user_id, api_key_id, ts, prompt, completion):
@@ -87,7 +94,9 @@ class FakeResult:
 
 
 class FakeAsyncSession:
-    """Hands out queued result sets in exec order: users, keys, usage rows."""
+    """Hands out queued result sets in exec order: users, keys, resets,
+    usage rows. A second rebuild cycle re-reads users and keys, so the
+    queue serves cyclically from the start once exhausted."""
 
     def __init__(self, queue):
         self._queue = queue
@@ -100,9 +109,7 @@ class FakeAsyncSession:
         return False
 
     async def exec(self, statement):
-        if self.calls >= len(self._queue):
-            raise AssertionError("unexpected exec: every queue entry consumed")
-        item = self._queue[self.calls]
+        item = self._queue[self.calls % len(self._queue)]
         self.calls += 1
         return FakeResult(item)
 
@@ -120,11 +127,19 @@ class FakePipeline:
         self._commands.append(("zadd", key, mapping))
         return self
 
+    def delete(self, key):
+        self._commands.append(("delete", key))
+        return self
+
     async def execute(self, raise_on_error=True):
         results = []
         for command in self._commands:
             if command[0] == "exists":
                 results.append(1 if command[1] in self._client.existing else 0)
+            elif command[0] == "delete":
+                self._client.zsets.pop(command[1], None)
+                self._client.existing.discard(command[1])
+                results.append(1)
             else:
                 key, mapping = command[1], command[2]
                 self._client.zsets.setdefault(key, {}).update(mapping)
@@ -137,13 +152,9 @@ class FakeRedis:
     def __init__(self, existing=None):
         self.existing = set(existing or [])
         self.zsets = {}
-        self.sets = {}
 
     async def exists(self, key):
         return 1 if key in self.existing else 0
-
-    async def set(self, key, value, ex=None):
-        self.sets[key] = (value, ex)
 
     def pipeline(self, transaction=False):
         return FakePipeline(self)
@@ -164,10 +175,10 @@ def frozen_now(monkeypatch):
     return FIXED_NOW
 
 
-async def _run(monkeypatch, rlc, users, keys, rows, existing=None):
-    # One shared session across the async-with blocks: exec order is users,
-    # keys, usage rows.
-    shared = FakeAsyncSession([users, keys, rows])
+async def _run(monkeypatch, rlc, users, keys, rows, resets=(), existing=None):
+    # One shared session across the async-with blocks; exec order per cycle
+    # is users, keys, then (only when something is missing) resets and rows.
+    shared = FakeAsyncSession([users, keys, list(resets), rows])
 
     def factory():
         return shared
@@ -180,8 +191,8 @@ async def _run(monkeypatch, rlc, users, keys, rows, existing=None):
         lambda cfg: SimpleNamespace(client=client),
     )
     rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
-    await rebuild.start()
-    return client
+    await rebuild._rebuild(rlc, client)
+    return client, shared, rebuild
 
 
 @pytest.mark.asyncio
@@ -209,10 +220,7 @@ async def test_rebuild_restores_lost_counters_from_usage_details(
         _row(9, 43, datetime(2026, 11, 19, 9, 0), 999, 0),
     ]
 
-    client = await _run(monkeypatch, rlc, [user7, user9], [key42, key43], rows)
-
-    marker = f"gpustack-rate-limit|{rebuilder.REBUILD_MARKER_COMBO}"
-    assert marker in client.sets and client.sets[marker][1] is not None
+    client, _, _ = await _run(monkeypatch, rlc, [user7, user9], [key42, key43], rows)
 
     # The key's day quota: only key-42's rows, today only.
     day_key = key_windows(rlc, key42)[0].redis_key
@@ -256,17 +264,17 @@ async def test_rebuild_restores_lost_counters_from_usage_details(
 
 
 @pytest.mark.asyncio
-async def test_live_counters_are_never_touched(frozen_now, monkeypatch):
-    """An existing counter keeps its members untouched -- the rebuild only
-    fills keys the plugin has not re-created yet, so a healthy Redis turns
-    the pass into a no-op."""
+async def test_warmup_replaces_a_stale_counter(frozen_now, monkeypatch):
+    """The startup pass DELs a surviving counter before writing: a young
+    Redis that only saw the last hours of the month gets the database's
+    full picture, live members included, not a merge on top of them."""
     rlc = _cfg()
-    user7 = _user(7, weekly=100_000)
+    user7 = _user(7)
     key42 = _key(42, access_key="ak-abc", user_id=7)
     day_key = key_windows(rlc, key42)[0].redis_key
     rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
-    client = await _run(
+    client, _, _ = await _run(
         monkeypatch,
         rlc,
         [user7],
@@ -274,39 +282,102 @@ async def test_live_counters_are_never_touched(frozen_now, monkeypatch):
         rows,
         existing={day_key},
     )
-
-    assert day_key not in client.zsets
-    # The user-level windows were still missing and got rebuilt.
-    week_windows = {w.redis_key: w for w in user_limit_windows(rlc, 7, user7)}
-    week_key = next(k for k, w in week_windows.items() if w.period == "604800s")
-    assert sum(tokens for tokens, _ in _tokens(client.zsets[week_key]).values()) == 150
+    # The stale live member the gateway wrote is gone with the counter.
+    assert _tokens(client.zsets[day_key]) == {
+        f"rebuild-7-42-{hour_ts(datetime(2026, 11, 19, 9, 0))}|150": (
+            150,
+            hour_ts(datetime(2026, 11, 19, 9, 0)) + 1,
+        )
+    }
 
 
 @pytest.mark.asyncio
-async def test_marker_short_circuits_healthy_redis(frozen_now, monkeypatch):
-    """The marker key skips the details scan entirely: a routine restart
-    against a Redis that still holds its counters costs one EXISTS."""
+async def test_steady_state_cycle_never_touches_live_counters(frozen_now, monkeypatch):
+    """After the startup pass, a healthy Redis costs one pipelined EXISTS
+    per cycle: no database scan, no writes. Only a missing counter draws
+    a rebuild, and live counters stay out of it."""
     rlc = _cfg()
-    marker = f"gpustack-rate-limit|{rebuilder.REBUILD_MARKER_COMBO}"
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
-    db_touched = []
+    client, shared, rebuild = await _run(monkeypatch, rlc, [user7], [key42], rows)
+    snapshot = {key: dict(zset) for key, zset in client.zsets.items()}
+    client.existing.update(snapshot)
+    calls_after_warmup = shared.calls
 
-    def factory():
-        db_touched.append(1)
-        return FakeAsyncSession([])
+    await rebuild._rebuild(rlc, client)
 
-    monkeypatch.setattr(rebuilder, "async_session", factory)
-    client = FakeRedis(existing={marker})
-    monkeypatch.setattr(
-        rebuilder,
-        "reader_from_config",
-        lambda cfg: SimpleNamespace(client=client),
+    # Unchanged counters, and the pass stopped at the users / keys reads --
+    # the details scan never ran (2 calls per cycle for the specs).
+    assert client.zsets == snapshot
+    assert shared.calls == calls_after_warmup + 2
+
+
+@pytest.mark.asyncio
+async def test_missing_counter_is_rebuilt_in_steady_state(frozen_now, monkeypatch):
+    """A counter lost mid-month (Redis failover) comes back on the next
+    cycle from the database, while the counters that survived stay out of
+    the batch."""
+    rlc = _cfg()
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
+
+    client, shared, rebuild = await _run(monkeypatch, rlc, [user7], [key42], rows)
+    snapshot = {key: dict(zset) for key, zset in client.zsets.items()}
+    # Everything survives the failover except the key's day counter.
+    client.existing.update(snapshot)
+    day_key = key_windows(rlc, key42)[0].redis_key
+    client.existing.discard(day_key)
+    client.zsets.pop(day_key, None)
+
+    await rebuild._rebuild(rlc, client)
+
+    assert client.zsets[day_key] == snapshot[day_key]
+    for key, zset in snapshot.items():
+        if key != day_key:
+            assert client.zsets[key] == zset
+
+
+@pytest.mark.asyncio
+async def test_reset_cutoffs_keep_forgiven_spend_out(frozen_now, monkeypatch):
+    """A reset forgives the spend before it: the weekly counter is rebuilt
+    from post-reset rows only, while the daily quota (no reset kind) keeps
+    every row inside its window."""
+    rlc = _cfg()
+    user7 = _user(7, weekly=100_000, monthly=5_000_000)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [
+        # Forgiven by the weekly reset on Nov 18.
+        _row(7, 42, datetime(2026, 11, 17, 10, 0), 700, 0),
+        # Recorded after both resets.
+        _row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50),
+    ]
+    resets = [
+        _reset(7, "weekly", datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)),
+        _reset(7, "monthly", datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)),
+    ]
+
+    client, _, _ = await _run(monkeypatch, rlc, [user7], [key42], rows, resets=resets)
+
+    week_key = next(
+        w.redis_key for w in user_limit_windows(rlc, 7, user7) if w.period == "604800s"
     )
-    rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
-    await rebuild.start()
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[week_key]).values()) == 150
 
-    assert db_touched == []
-    assert client.zsets == {} and client.sets == {}
+    # The monthly reset predates both rows, so the month keeps everything.
+    month_key = next(
+        w.redis_key
+        for w in user_limit_windows(rlc, 7, user7)
+        if w.period == "each_month"
+    )
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[month_key]).values()) == 850
+
+    # The daily quota has no reset kind, but the day window only spans the
+    # last 24 hours: the Nov 17 row is outside it on its own, reset or not.
+    day_key = key_windows(rlc, key42)[0].redis_key
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[day_key]).values()) == 150
 
 
 @pytest.mark.asyncio
@@ -325,7 +396,7 @@ async def test_day_boundary_follows_the_deployment_timezone(frozen_now, monkeypa
         _row(7, 42, datetime(2026, 11, 18, 23, 30), 40, 10),
     ]
 
-    client = await _run(monkeypatch, rlc, [user7], [key42], rows)
+    client, _, _ = await _run(monkeypatch, rlc, [user7], [key42], rows)
 
     day_key = key_windows(rlc, key42)[0].redis_key
     day_members = _tokens(client.zsets[day_key])
