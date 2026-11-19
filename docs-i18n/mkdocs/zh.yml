@@ -51,6 +51,7 @@ nav_translations:
   API Key Management: API 密钥管理
   User Management: 用户管理
   Usage: 用量
+  Quotas: 配额
   Single Sign-On (SSO) Authentication: 单点登录（SSO）认证
   Observability: 可观测性
   Benchmarking: 性能测试

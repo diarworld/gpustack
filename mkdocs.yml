@@ -212,6 +212,7 @@ nav:
           - API Key Management: user-guide/api-key-management.md
           - User Management: user-guide/user-management.md
           - Usage: user-guide/usage.md
+          - Quotas: user-guide/quotas.md
           - Rate Limiting: user-guide/rate-limiting.md
           - Single Sign-On (SSO) Authentication: user-guide/sso.md
           - Observability: user-guide/observability.md

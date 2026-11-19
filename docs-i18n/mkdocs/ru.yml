@@ -50,6 +50,7 @@ nav_translations:
   API Key Management: Управление ключами API
   User Management: Управление пользователями
   Usage: Использование
+  Quotas: Квоты
   Single Sign-On (SSO) Authentication: Аутентификация с помощью единого входа (SSO)
   Observability: Наблюдаемость
   Benchmarking: Бенчмаркинг

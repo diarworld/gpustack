@@ -81,7 +81,8 @@ The Summary tab stacks four sections — **Tokens**, **Compute**, **Storage**, a
 first three each show a headline stat line, a breakdown donut (by type), and a trend chart over the
 selected range, giving you a quick read across all three resource kinds without switching tabs.
 **Rate limits** shows the user's rate limits and their live usage from the gateway counters; it is
-always self-scoped. See [Rate Limiting](rate-limiting.md#current-limits-and-usage) for details.
+always self-scoped. See [Quotas](quotas.md) for a walkthrough of the cards and the budget reset, and
+[Rate Limiting](rate-limiting.md#current-limits-and-usage) for the internals.
 
 ## Tokens
 
