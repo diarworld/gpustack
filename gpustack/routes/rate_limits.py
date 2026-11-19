@@ -1,0 +1,243 @@
+"""Live rate-limit windows for the Usage page (``GET /usage/rate-limits``).
+
+Pairs the limits the ``gateway_rate_limit`` config, the target user's token
+budgets and their API keys publish (via
+:func:`gpustack.gateway.rate_limit_usage.expected_windows`) with the live
+counters the gateway's ``gpustack-rate-limit`` plugin keeps in Redis, read
+through :class:`gpustack.gateway.rate_limit_usage.RateLimitUsageReader`.
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
+
+from fastapi import APIRouter, Request
+from sqlmodel import select
+
+from gpustack.api.exceptions import NotFoundException
+from gpustack.config.config import Config
+from gpustack.gateway.rate_limit_usage import (
+    RateLimitUsageReader,
+    RateLimitWindowState,
+    RateLimitWindowSpec,
+    expected_windows,
+    reader_from_config,
+    source_for,
+)
+from gpustack.schemas.api_keys import ApiKey
+from gpustack.schemas.rate_limits import (
+    ApiKeyRateLimits,
+    RateLimitWindowUsage,
+    RateLimitsResponse,
+    UserRateLimits,
+)
+from gpustack.schemas.users import User
+from gpustack.security import is_legacy_token_access_key
+from gpustack.server.deps import CurrentUserDep, SessionDep
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Module-level indirection so tests can substitute the reader construction;
+# production callers get the config-wired factory.
+_reader_factory = reader_from_config
+
+
+def _mode(rlc) -> str:
+    """Which counter backend backs the windows: redis, local or disabled."""
+    if rlc is None or not rlc.enabled:
+        return "disabled"
+    return "redis" if rlc.redis is not None else "local"
+
+
+async def _resolve_target(session, user: User, user_id: Optional[int]) -> User:
+    """The user whose limits to show.
+
+    Self-scoped by construction: a foreign ``user_id`` is honored only for
+    a platform admin (the same ``user.is_admin`` notion the usage routes
+    use). Anyone else silently gets their own data, so the endpoint never
+    needs a privilege error path — the UI always renders the caller.
+    """
+    if user_id in (None, user.id) or not user.is_admin:
+        return user
+    target = await User.one_by_id(session, user_id)
+    if target is None:
+        raise NotFoundException(message="User not found")
+    return target
+
+
+def _window_usage(
+    spec: RateLimitWindowSpec, state: Optional[RateLimitWindowState]
+) -> RateLimitWindowUsage:
+    """Map one spec and its read onto the wire model.
+
+    A ``None`` state (local mode, or a discarded read) omits ``used`` /
+    ``reset_seconds``; the response is served with
+    ``response_model_exclude_none=True``, so they drop off the wire and the
+    UI renders "—".
+    """
+    return RateLimitWindowUsage(
+        kind=spec.kind,
+        period=spec.period,
+        window_seconds=spec.window_seconds,
+        limit=spec.limit,
+        used=state.used if state is not None else None,
+        reset_seconds=state.reset_seconds if state is not None else None,
+    )
+
+
+async def _read_states(
+    reader: RateLimitUsageReader,
+    specs: List[RateLimitWindowSpec],
+    *,
+    now: datetime,
+    timezone_name: str,
+) -> Tuple[List[Optional[RateLimitWindowState]], Optional[str]]:
+    """Read every window at once, failing open.
+
+    All reads share one ``now`` so the windows and their resets describe a
+    single instant. Any failure (Redis down, a bad ``timezone`` raising
+    ``ZoneInfoNotFoundError`` in the calendar math) discards the whole
+    batch: the page degrades to "—" everywhere instead of mixing fresh and
+    stale counters. Only the exception's class name surfaces — its message
+    can carry hostnames.
+    """
+    results = await asyncio.gather(
+        *(
+            reader.read_window(spec, now=now, timezone_name=timezone_name)
+            for spec in specs
+        ),
+        return_exceptions=True,
+    )
+    first_error = next((r for r in results if isinstance(r, BaseException)), None)
+    if first_error is None:
+        return list(results), None
+    usage_error = type(first_error).__name__
+    logger.warning("rate-limit usage read failed: %s", usage_error)
+    return [None] * len(specs), usage_error
+
+
+@router.get(
+    "/rate-limits",
+    response_model=RateLimitsResponse,
+    response_model_exclude_none=True,
+)
+async def get_rate_limits(
+    session: SessionDep,
+    user: CurrentUserDep,
+    request: Request,
+    user_id: Optional[int] = None,
+):
+    """The target user's rate-limit picture with live window counters.
+
+    Args:
+        session: async DB session.
+        user: the authenticated caller.
+        request: the FastAPI request; the server config lives on app.state.
+        user_id: whose limits to show; defaults to the caller. Ignored for
+            non-admin callers (they always get their own data).
+
+    Returns:
+        RateLimitsResponse: limits with live counters in redis mode, windows
+        without counters in local mode, and empty structures when rate
+        limiting is disabled.
+    """
+    cfg: Config = request.app.state.server_config
+    rlc = cfg.gateway_rate_limit
+    mode = _mode(rlc)
+    # One aware instant shared by every read in this request: the counters
+    # and their resets must describe the same moment.
+    now = datetime.now(timezone.utc)
+
+    if mode == "disabled":
+        # The UI hides the section entirely: no Redis dial, no budget read,
+        # not even the key listing — nothing here is meaningful when the
+        # plugin enforces nothing.
+        return RateLimitsResponse(
+            mode=mode, generated_at=now, user=UserRateLimits(), api_keys=[]
+        )
+
+    target = await _resolve_target(session, user, user_id)
+    weekly = target.weekly_token_limit
+    monthly = target.monthly_token_limit
+
+    # With key=None the spec builder returns the deployment defaults first
+    # and this user's budget combo second. The user block surfaces only the
+    # budget combo — the defaults are deployment-wide, not attributable to
+    # one user — identified by the combo segment of the Redis key.
+    user_specs = [
+        spec
+        for spec in expected_windows(
+            rlc, target.id, key=None, weekly=weekly, monthly=monthly
+        )
+        if spec.redis_key.split("|")[1] == f"user-{target.id}"
+    ]
+
+    # Same treatment as the reconciler's key pass: every live key of the
+    # target, skipping deployment-token rows. Soft-deleted keys no longer
+    # authenticate, so they enforce nothing and stay out of the per-key
+    # view. Legacy rows are skipped because the reconciler never publishes
+    # a ``key-<id>`` combo for them — the fallback group governs their
+    # requests — so they carry no per-key windows to show.
+    keys = (
+        await session.exec(
+            select(ApiKey)
+            .where(ApiKey.user_id == target.id, ApiKey.deleted_at.is_(None))
+            .order_by(ApiKey.id)
+        )
+    ).all()
+    live_keys = [key for key in keys if not is_legacy_token_access_key(key.access_key)]
+    key_specs = {
+        key.id: expected_windows(
+            rlc, target.id, key=key, weekly=weekly, monthly=monthly
+        )
+        for key in live_keys
+    }
+
+    all_specs = list(user_specs)
+    for specs in key_specs.values():
+        all_specs.extend(specs)
+
+    states: List[Optional[RateLimitWindowState]]
+    usage_error = None
+    if mode == "redis":
+        reader = _reader_factory(cfg)
+        # "redis" mode implies a reader by construction.
+        assert reader is not None
+        states, usage_error = await _read_states(
+            reader, all_specs, now=now, timezone_name=rlc.timezone
+        )
+    else:
+        # Local mode keeps no counters: windows render with limits only.
+        states = [None] * len(all_specs)
+
+    state_by_spec = {id(spec): state for spec, state in zip(all_specs, states)}
+    return RateLimitsResponse(
+        mode=mode,
+        generated_at=now,
+        usage_error=usage_error,
+        user=UserRateLimits(
+            weekly_limit=weekly,
+            monthly_limit=monthly,
+            windows=[
+                _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
+            ],
+        ),
+        api_keys=[
+            ApiKeyRateLimits(
+                id=key.id,
+                name=key.name,
+                rpm_limit=key.rpm_limit,
+                tpm_limit=key.tpm_limit,
+                daily_token_limit=key.daily_token_limit,
+                source=source_for(key, weekly, monthly),
+                windows=[
+                    _window_usage(spec, state_by_spec[id(spec)])
+                    for spec in key_specs[key.id]
+                ],
+            )
+            for key in live_keys
+        ],
+    )

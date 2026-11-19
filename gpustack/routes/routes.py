@@ -32,6 +32,7 @@ from gpustack.routes import (
     pd_modes,
     probes,
     proxy,
+    rate_limits,
     source_probe,
     update,
     user_groups,
@@ -181,6 +182,7 @@ v1_base_router.include_router(users.directory_router, tags=["Users"])
 v1_base_router.include_router(api_keys.router, prefix="/api-keys", tags=["API Keys"])
 v1_base_router.include_router(usage.router, prefix="/usage", tags=["Usage"])
 v1_base_router.include_router(resource_usage.router, prefix="/usage", tags=["Usage"])
+v1_base_router.include_router(rate_limits.router, prefix="/usage", tags=["Usage"])
 v1_base_router.include_router(
     me_orgs.router,
     prefix="/users/me",
