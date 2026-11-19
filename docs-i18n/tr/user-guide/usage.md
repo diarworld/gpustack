@@ -69,7 +69,7 @@ Her sekme (kendi filtreleri olan Kaynak Etkinlikleri hariç) aynı kontrolleri p
 
 ![Kullanım Özeti](../assets/usage/usage-summary.png)
 
-Özet sekmesi **Token'lar**, **İşlem** ve **Depolama** olmak üzere üç bölüm içerir. Her bölümde temel istatistikler, türe göre dağılımı gösteren bir halka grafik ve seçilen aralık için eğilim grafiği bulunur. Böylece sekme değiştirmeden üç kaynak türünü de görebilirsiniz.
+Özet sekmesi **Token'lar**, **İşlem**, **Depolama** ve **Hız sınırları** olmak üzere dört bölüm içerir. İlk üçü temel istatistikleri, türe göre dağılımı gösteren bir halka grafik ve seçilen aralık için eğilim grafiğini gösterir. Böylece sekme değiştirmeden üç kaynak türünü de görebilirsiniz. **Hız sınırları**, kullanıcının hız limitlerini ve ağ geçidi sayaçlarındaki canlı kullanımını gösterir; her zaman kendisiyle sınırlıdır. Ayrıntılar için [Hız Sınırlama](rate-limiting.md#current-limits-and-usage) bölümüne bakın.
 
 ## Token'lar { #tokens }
 

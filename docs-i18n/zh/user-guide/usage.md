@@ -69,7 +69,7 @@ GPUStack 有两种角色：**Admin** 和 **User**（参见[用户管理](user-ma
 
 ![用量概览](../assets/usage/usage-summary.png)
 
-Summary 选项卡依次展示 **Tokens**、**Compute** 和 **Storage** 三个部分。每个部分都包含关键统计行、按类型细分的环形图，以及所选时间范围内的趋势图，无需切换选项卡即可快速了解三类资源。
+Summary 选项卡依次展示 **Tokens**、**Compute**、**Storage** 和 **Rate limits** 四个部分。前三个部分都包含关键统计行、按类型细分的环形图，以及所选时间范围内的趋势图，无需切换选项卡即可快速了解三类资源。**Rate limits** 显示用户的速率限制及其来自网关计数器的实时使用情况；始终仅限本人。详见[速率限制](rate-limiting.md#current-limits-and-usage)。
 
 ## Token { #tokens }
 
