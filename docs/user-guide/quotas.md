@@ -44,6 +44,16 @@ resets at midnight in the deployment timezone.
 - **Per-key limits** — RPM, TPM and a daily token limit on an individual key.
   Unset fields inherit the deployment defaults.
 
+This deployment ships the following defaults:
+
+| Window | Default                                 |
+| ------ | --------------------------------------- |
+| RPM    | 3 requests / minute                     |
+| TPM    | 768,000 tokens / minute                 |
+| Day    | 10,000,000 tokens per API key           |
+| Month  | 100,000,000 tokens per user             |
+| Week   | no default — only accounts with an explicit weekly budget are capped |
+
 The internals — gateway configuration, defaults, failure behaviour and metrics
 — are described in [Rate Limiting](rate-limiting.md).
 

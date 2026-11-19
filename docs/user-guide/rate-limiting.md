@@ -41,10 +41,10 @@ gateway_rate_limit:
     service_name: redis.gpustack-system.svc.cluster.local
     service_port: 6379
   timezone: UTC
-  default_rpm: 60
-  default_tpm: 100000
-  default_daily_tokens: 500000
-  default_monthly_tokens: 5000000
+  default_rpm: 3
+  default_tpm: 768000
+  default_daily_tokens: 10000000
+  default_monthly_tokens: 100000000
 ```
 
 All the `default_*` fields are optional; an unset field means no limit of that
@@ -66,10 +66,9 @@ Explicit limits override the deployment defaults:
   user account. These are shared across all of the user's API keys and their
   UI sessions.
 
-There is no deployment-wide default for the weekly and monthly budgets: a
-default that silently caps every account is not a safe thing to imply. Users
-without explicit budgets and keys without explicit limits are governed by the
-deployment defaults alone.
+The weekly budget has no deployment-wide default: only accounts with an
+explicit weekly budget are capped on it. Users without explicit budgets and
+keys without explicit limits are governed by the deployment defaults alone.
 
 Changes take effect within one reconcile interval (30 seconds by default, see
 `GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS`).
@@ -116,8 +115,8 @@ or whenever Redis is unreachable, a window simply has no `used`. The read
 fails open — the limits are always returned. The Usage page's Summary tab
 renders this response as its **Rate limits** section.
 
-For a deployment with defaults of 10 RPM, 60000 TPM, 2000000 daily and
-20000000 monthly tokens, and a user with a 100000 weekly budget:
+For a deployment with defaults of 3 RPM, 768000 TPM, 10000000 daily and
+100000000 monthly tokens, and a user with a 100000 weekly budget:
 
 ```json
 {
@@ -135,10 +134,10 @@ For a deployment with defaults of 10 RPM, 60000 TPM, 2000000 daily and
       "name": "ci-runner",
       "source": "user+default",
       "windows": [
-        {"kind": "query", "period": "60s", "window_seconds": 60, "limit": 10, "used": 3, "reset_seconds": 41},
-        {"kind": "token_rolling", "period": "60s", "window_seconds": 60, "limit": 60000, "used": 4820, "reset_seconds": 27},
-        {"kind": "token_calendar", "period": "each_day", "limit": 2000000, "used": 18450, "reset_seconds": 48600},
-        {"kind": "token_calendar", "period": "each_month", "limit": 20000000, "used": 210000, "reset_seconds": 999000},
+        {"kind": "query", "period": "60s", "window_seconds": 60, "limit": 3, "used": 2, "reset_seconds": 41},
+        {"kind": "token_rolling", "period": "60s", "window_seconds": 60, "limit": 768000, "used": 4820, "reset_seconds": 27},
+        {"kind": "token_calendar", "period": "each_day", "limit": 10000000, "used": 18450, "reset_seconds": 48600},
+        {"kind": "token_calendar", "period": "each_month", "limit": 100000000, "used": 210000, "reset_seconds": 999000},
         {"kind": "token_rolling", "period": "604800s", "window_seconds": 604800, "limit": 100000, "used": 37215, "reset_seconds": 172800}
       ]
     }

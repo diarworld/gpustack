@@ -33,6 +33,16 @@ Kartların altındaki tablo, API anahtarlarınızın her birini günlük token h
 - **Kullanıcı bütçeleri** — yöneticinin hesabınıza ayarladığı haftalık ve aylık token bütçeleri; tüm anahtarlarınız ve oturumlarınız tarafından paylaşılır.
 - **Anahtar limitleri** — tek bir anahtar üzerinde RPM, TPM ve günlük token limiti. Ayarlanmamış alanlar dağıtım varsayılanlarını devralır.
 
+Bu dağıtım şu varsayılanları kullanır:
+
+| Pencere   | Varsayılan                                                              |
+| --------- | ----------------------------------------------------------------------- |
+| RPM       | dakikada 3 istek                                                        |
+| TPM       | dakikada 768.000 token                                                  |
+| Gün       | API anahtarı başına günlük 10.000.000 token                             |
+| Ay        | kullanıcı başına aylık 100.000.000 token                                |
+| Hafta     | varsayılan yok — yalnızca açık haftalık bütçesi olan hesaplar sınırlanır |
+
  Dahili detaylar — ağ geçidi yapılandırması, varsayılanlar, hata davranışı ve metrikler — [Rate Limiting](rate-limiting.md) bölümünde açıklanmıştır.
 
 ## Bütçeyi Sıfırlama { #resetting-a-budget }
