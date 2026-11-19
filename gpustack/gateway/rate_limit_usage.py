@@ -25,6 +25,12 @@ which keys exist for a given request path:
 * everyone else (no key, or a key without explicit limits) is bound by the
   fallback group: the default plan plus, when set, the owner's budget combo,
   both bucketed on the captured ``gpustack-<user_id>`` segment.
+
+Live reads sit on top of the specs: :class:`RateLimitUsageReader` totals the
+plugin's counters per window, and its
+:meth:`~RateLimitUsageReader.read_window` is the entry point the endpoint
+and the flusher should call -- it applies the reset semantics each window
+kind actually has.
 """
 
 from dataclasses import dataclass
@@ -319,7 +325,14 @@ def source_for(
 ) -> str:
     """Which published combinations govern the user's requests: the key's
     own combo (``key``), the fallback group with a user budget
-    (``user+default``), or the default plan alone (``default``)."""
+    (``user+default``), or the default plan alone (``default``).
+
+    Legacy deployment-token keys are an intentional divergence from
+    :func:`expected_windows`: the reconciler never publishes their
+    ``key-<id>`` combo, so the fallback group governs those requests, yet
+    this still reports ``key`` -- the field describes the key row's own
+    explicit limits, which is what the endpoint displays.
+    """
     if key is not None and _has_explicit_limits(key):
         return "key"
     if weekly or monthly:
@@ -423,6 +436,11 @@ class RateLimitUsageReader:
     ) -> RateLimitWindowState:
         """Total recorded in one window and when that total will drop.
 
+        Low-level primitive over one Redis key: the reset it reports is
+        always member aging, which is only true for rolling windows. Prefer
+        :meth:`read_window`, which applies the reset semantics each window
+        kind actually has.
+
         Mirrors the plugin's prune-then-sum boundary: it discards members
         scored at or before ``now - window_seconds`` before summing, so the
         read's lower bound is exclusive while ``now`` stays inclusive.
@@ -443,6 +461,37 @@ class RateLimitUsageReader:
         reset = max(0, ceil(oldest + window_seconds - now))
         return RateLimitWindowState(used=used, reset_seconds=reset)
 
+    async def read_window(
+        self, spec: RateLimitWindowSpec, *, now: datetime, timezone_name: str
+    ) -> RateLimitWindowState:
+        """Window state with the reset semantics each kind actually has:
+        rolling = member aging, calendar = period boundary. The only entry
+        point endpoint/flusher code should call.
+
+        The one ``now`` drives both the read instant and the calendar
+        boundary math, so the two cannot drift apart; ``timezone_name`` is
+        the deployment timezone anchoring calendar periods.
+
+        ``now`` must be timezone-aware.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        # Calendar specs carry no fixed length: bound the read to the live
+        # portion of the running period.
+        window_seconds = spec.window_seconds or calendar_elapsed_seconds(
+            spec.period, now, timezone_name
+        )
+        state = await self.window_state(
+            spec.redis_key, window_seconds=window_seconds, now=int(now.timestamp())
+        )
+        if spec.window_seconds is None:
+            # Member aging is meaningless for a calendar quota; the count
+            # drops at the period boundary.
+            state.reset_seconds = calendar_window_seconds(
+                spec.period, now, timezone_name
+            )
+        return state
+
 
 def reader_from_config(cfg: Config) -> Optional[RateLimitUsageReader]:
     """Reader over the rate-limit Redis service; None when unset (local
@@ -452,6 +501,11 @@ def reader_from_config(cfg: Config) -> Optional[RateLimitUsageReader]:
     gateway pods write counters to -- not the server's top-level
     ``redis_url``. ``redis.asyncio.Redis`` connects lazily, so building the
     reader never dials.
+
+    Cache one reader per process (e.g. on FastAPI's ``app.state`` at
+    startup): redis-py binds connections lazily, so per-request construction
+    churns connection pools, while a module-level singleton breaks under
+    pytest-asyncio's per-test event loops.
     """
     rlc = cfg.gateway_rate_limit
     if rlc is None or rlc.redis is None:

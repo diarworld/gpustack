@@ -12,9 +12,11 @@ from typing import Optional
 import pytest
 
 from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
+from gpustack.gateway import rate_limit_usage
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS, rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import (
     RateLimitUsageReader,
+    RateLimitWindowSpec,
     calendar_elapsed_seconds,
     calendar_window_seconds,
     expected_windows,
@@ -53,6 +55,14 @@ class _KeyStub:
 
 def _shapes(windows):
     return [(w.kind, w.period, w.window_seconds, w.limit, w.redis_key) for w in windows]
+
+
+def _spec(**overrides) -> RateLimitWindowSpec:
+    fields = dict(
+        kind="query", period="60s", window_seconds=60, limit=10, redis_key="k"
+    )
+    fields.update(overrides)
+    return RateLimitWindowSpec(**fields)
 
 
 class _FakeRedis:
@@ -281,7 +291,9 @@ async def test_window_state_sums_member_counts():
                 # or below the read's exclusive lower bound.
                 (939, "pruned-old|9"),
                 (940, "pruned-boundary|4"),
-                (970, b"legacy"),
+                # redis-py hands scores back as floats; the arithmetic must
+                # not care.
+                (970.0, b"legacy"),
                 (999, "last|5"),
                 (1_000, "edge|2"),
                 (1_001, "future|100"),
@@ -385,3 +397,58 @@ async def test_specs_and_reader_round_trip():
             now=1_000,
         )
         assert state.used == expected_used[spec.redis_key], spec.redis_key
+
+
+@pytest.mark.asyncio
+async def test_read_window_rolling_matches_window_state(monkeypatch):
+    def _forbid_calendar(*args, **kwargs):
+        raise AssertionError("rolling windows must not consult calendar math")
+
+    monkeypatch.setattr(rate_limit_usage, "calendar_elapsed_seconds", _forbid_calendar)
+    monkeypatch.setattr(rate_limit_usage, "calendar_window_seconds", _forbid_calendar)
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    now_ts = int(now.timestamp())
+    client = _FakeRedis({"k": [(now_ts - 30, "a|2"), (now_ts - 5, "b|3")]})
+    state = await RateLimitUsageReader(client).read_window(
+        _spec(), now=now, timezone_name="UTC"
+    )
+    assert state.used == 5
+    # Rolling reset is member aging: the oldest in-window member leaves 30s
+    # from now, nothing calendar-derived.
+    assert state.reset_seconds == 30
+
+
+@pytest.mark.asyncio
+async def test_read_window_calendar_overrides_reset():
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    now_ts = int(now.timestamp())
+    client = _FakeRedis(
+        {
+            "k": [
+                # Older than the elapsed day yet inside the full 24h before
+                # it: only the elapsed-period bound keeps it out of the read.
+                (now_ts - 50_000, "before-day-start|7"),
+                (now_ts - 1_000, "a|2"),
+                (now_ts - 5, "b|3"),
+            ]
+        }
+    )
+    state = await RateLimitUsageReader(client).read_window(
+        _spec(kind="token_calendar", period="each_day", window_seconds=None),
+        now=now,
+        timezone_name="UTC",
+    )
+    # The read bound is the elapsed period (12h at noon), not the full day.
+    assert state.used == 5
+    # Member aging would report 42_200 (elapsed minus the oldest member's
+    # age); a calendar quota drops at the boundary instead.
+    assert state.reset_seconds == 43_200
+
+
+@pytest.mark.asyncio
+async def test_read_window_rejects_naive_now():
+    reader = RateLimitUsageReader(_FakeRedis({}))
+    with pytest.raises(ValueError):
+        await reader.read_window(
+            _spec(), now=datetime(2026, 11, 19, 12, 0, 0), timezone_name="UTC"
+        )
