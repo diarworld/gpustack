@@ -27,12 +27,14 @@ which keys exist for a given request path:
   both bucketed on the captured ``gpustack-<user_id>`` segment.
 
 Live reads sit on top of the specs: :class:`RateLimitUsageReader` totals the
-plugin's counters per window, and its
-:meth:`~RateLimitUsageReader.read_window` is the entry point the endpoint
-and the flusher should call -- it applies the reset semantics each window
+plugin's counters per window -- :meth:`~RateLimitUsageReader.read_window` is
+the per-window entry point, and :func:`read_windows` the batch helper the
+endpoint and the flusher call -- applying the reset semantics each window
 kind actually has.
 """
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
@@ -47,6 +49,8 @@ from gpustack.security import gateway_consumer_identity, is_legacy_token_access_
 
 if TYPE_CHECKING:
     from gpustack.schemas.api_keys import ApiKey
+
+logger = logging.getLogger(__name__)
 
 RULE_NAME = rate_limit_plugin_name
 
@@ -168,6 +172,15 @@ def _default_plan_windows(
     return windows
 
 
+def user_budget_combo(user_id: int) -> str:
+    """The fallback combo carrying one user's shared token budgets:
+    ``user-<id>``. Published by the reconciler's ``user_budget_combination``
+    and carried verbatim as the second segment of every budget window's
+    Redis key — the segment read-side code filters on to tell a user's
+    budget windows apart from the deployment defaults."""
+    return f"user-{user_id}"
+
+
 def _user_budget_windows(
     user_id: int, weekly: Optional[int], monthly: Optional[int]
 ) -> List[RateLimitWindowSpec]:
@@ -176,7 +189,7 @@ def _user_budget_windows(
     consumer shapes onto the same ``gpustack-<id>`` bucket the default plan
     uses, which is why both fallback combos' keys share the identity."""
     identity = f"gpustack-{user_id}"
-    combo = f"user-{user_id}"
+    combo = user_budget_combo(user_id)
     windows: List[RateLimitWindowSpec] = []
     if weekly:
         windows.append(
@@ -491,6 +504,45 @@ class RateLimitUsageReader:
                 spec.period, now, timezone_name
             )
         return state
+
+
+async def read_windows(
+    reader: RateLimitUsageReader,
+    specs: List[RateLimitWindowSpec],
+    *,
+    now: datetime,
+    timezone_name: str,
+) -> Tuple[Optional[List[RateLimitWindowState]], Optional[str]]:
+    """Read every window at once, failing open.
+
+    All reads share one ``now`` so the windows and their resets describe a
+    single instant. Any failure (Redis down, a bad ``timezone`` raising
+    ``ZoneInfoNotFoundError`` in the calendar math) discards the whole
+    batch: the consumer degrades to "—" everywhere instead of mixing fresh
+    and stale counters. Only the exception's class name surfaces — its
+    message can carry hostnames.
+
+    This is the batch entry point the usage endpoint and the flusher share;
+    :meth:`RateLimitUsageReader.read_window` underneath applies the reset
+    semantics each window kind actually has.
+
+    Returns:
+        (states, error): one state per spec, aligned with ``specs``, or all
+        ``None`` with ``error`` set to the first failure's class name.
+    """
+    results = await asyncio.gather(
+        *(
+            reader.read_window(spec, now=now, timezone_name=timezone_name)
+            for spec in specs
+        ),
+        return_exceptions=True,
+    )
+    first_error = next((r for r in results if isinstance(r, BaseException)), None)
+    if first_error is None:
+        return list(results), None
+    usage_error = type(first_error).__name__
+    logger.warning("rate-limit window reads failed: %s", usage_error)
+    return [None] * len(specs), usage_error
 
 
 def reader_from_config(cfg: Config) -> Optional[RateLimitUsageReader]:

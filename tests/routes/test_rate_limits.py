@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from redis.exceptions import RedisError
+from zoneinfo import ZoneInfoNotFoundError
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
@@ -113,8 +115,10 @@ class FakeSession:
 
 
 class FakeReader:
-    """Records the specs it is asked to read; returns a fixed state per key
-    or raises, to drive the failure path."""
+    """Records the specs it is asked to read; returns the seeded state for
+    keys that have one (a default otherwise). With ``error`` set, every
+    key WITHOUT a seeded state raises — which is what makes a mixed batch:
+    some reads succeed, some fail."""
 
     def __init__(self, states=None, error=None):
         self.specs = []
@@ -123,11 +127,11 @@ class FakeReader:
 
     async def read_window(self, spec, *, now, timezone_name):
         self.specs.append(spec)
+        if spec.redis_key in self._states:
+            return self._states[spec.redis_key]
         if self._error is not None:
             raise self._error
-        return self._states.get(
-            spec.redis_key, RateLimitWindowState(used=3, reset_seconds=10)
-        )
+        return RateLimitWindowState(used=3, reset_seconds=10)
 
 
 class FakeRedis:
@@ -445,3 +449,85 @@ async def test_disabled_mode_returns_empty_structures(frozen_now, monkeypatch):
     assert response.api_keys == []
     assert session.statements == []
     assert session.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reader_is_cached_on_app_state_across_requests(
+    frozen_now, monkeypatch
+):
+    """The reader is built once per process — the config it dials is
+    process-static — and reused: two requests sharing an app.state hit the
+    factory exactly once."""
+    cfg = _redis_cfg()
+    user = _user(7)
+    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    request = _request(cfg)
+    calls = []
+
+    def factory(cfg):
+        calls.append(cfg)
+        return FakeReader()
+
+    monkeypatch.setattr(rate_limits, "_reader_factory", factory)
+
+    await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=request
+    )
+    await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=request
+    )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_reader_failure_discards_the_successful_reads_too(
+    frozen_now, monkeypatch
+):
+    """A batch with both succeeded and failed reads is discarded whole:
+    even the window whose read DID succeed is blanked, so the page never
+    mixes fresh counters with stale ones."""
+    cfg = _redis_cfg()
+    user = _user(7)
+    session = FakeSession(users=[user], keys=[_key(3, access_key="ak-shared")])
+    daily_key = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_day"
+    reader = FakeReader(
+        states={daily_key: RateLimitWindowState(used=5, reset_seconds=43_200)},
+        error=TimeoutError("read timed out"),
+    )
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+    )
+
+    assert response.usage_error == "TimeoutError"
+    assert reader.specs  # the failing reads were attempted too
+    for window in _all_windows(response):
+        assert window.used is None
+        assert window.reset_seconds is None
+
+
+@pytest.mark.parametrize("error_type", [RedisError, TimeoutError, ZoneInfoNotFoundError])
+@pytest.mark.asyncio
+async def test_reader_failure_surfaces_only_the_class_name(
+    frozen_now, monkeypatch, error_type
+):
+    """Whatever the failure — connection error, timeout, or a bad
+    deployment timezone blowing up the calendar math — only the exception's
+    class name reaches the payload, never its message."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000)
+    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    reader = FakeReader(error=error_type("dial tcp: internal-host:6379"))
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+    )
+
+    assert response.usage_error == error_type.__name__
+    assert "internal-host" not in response.usage_error
+    for window in _all_windows(response):
+        assert window.used is None
+        assert window.reset_seconds is None

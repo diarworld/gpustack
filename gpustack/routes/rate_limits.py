@@ -4,27 +4,26 @@ Pairs the limits the ``gateway_rate_limit`` config, the target user's token
 budgets and their API keys publish (via
 :func:`gpustack.gateway.rate_limit_usage.expected_windows`) with the live
 counters the gateway's ``gpustack-rate-limit`` plugin keeps in Redis, read
-through :class:`gpustack.gateway.rate_limit_usage.RateLimitUsageReader`.
+through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
 """
 
-import asyncio
-import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from fastapi import APIRouter, Request
 from sqlmodel import select
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.api.tenant import TenantContext, is_platform_wide
-from gpustack.config.config import Config
+from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit_usage import (
-    RateLimitUsageReader,
     RateLimitWindowState,
     RateLimitWindowSpec,
     expected_windows,
+    read_windows,
     reader_from_config,
     source_for,
+    user_budget_combo,
 )
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.rate_limits import (
@@ -35,13 +34,7 @@ from gpustack.schemas.rate_limits import (
 )
 from gpustack.schemas.users import User
 from gpustack.security import is_legacy_token_access_key
-from gpustack.server.deps import (
-    CurrentUserDep,
-    SessionDep,
-    TenantContextDep,
-)
-
-logger = logging.getLogger(__name__)
+from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
 
 router = APIRouter()
 
@@ -50,7 +43,7 @@ router = APIRouter()
 _reader_factory = reader_from_config
 
 
-def _mode(rlc) -> str:
+def _mode(rlc: Optional[GatewayRateLimitConfig]) -> str:
     """Which counter backend backs the windows: redis, local or disabled."""
     if rlc is None or not rlc.enabled:
         return "disabled"
@@ -96,37 +89,6 @@ def _window_usage(
         used=state.used if state is not None else None,
         reset_seconds=state.reset_seconds if state is not None else None,
     )
-
-
-async def _read_states(
-    reader: RateLimitUsageReader,
-    specs: List[RateLimitWindowSpec],
-    *,
-    now: datetime,
-    timezone_name: str,
-) -> Tuple[List[Optional[RateLimitWindowState]], Optional[str]]:
-    """Read every window at once, failing open.
-
-    All reads share one ``now`` so the windows and their resets describe a
-    single instant. Any failure (Redis down, a bad ``timezone`` raising
-    ``ZoneInfoNotFoundError`` in the calendar math) discards the whole
-    batch: the page degrades to "—" everywhere instead of mixing fresh and
-    stale counters. Only the exception's class name surfaces — its message
-    can carry hostnames.
-    """
-    results = await asyncio.gather(
-        *(
-            reader.read_window(spec, now=now, timezone_name=timezone_name)
-            for spec in specs
-        ),
-        return_exceptions=True,
-    )
-    first_error = next((r for r in results if isinstance(r, BaseException)), None)
-    if first_error is None:
-        return list(results), None
-    usage_error = type(first_error).__name__
-    logger.warning("rate-limit usage read failed: %s", usage_error)
-    return [None] * len(specs), usage_error
 
 
 @router.get(
@@ -189,7 +151,7 @@ async def get_rate_limits(
         for spec in expected_windows(
             rlc, target.id, key=None, weekly=weekly, monthly=monthly
         )
-        if spec.redis_key.split("|")[1] == f"user-{target.id}"
+        if spec.redis_key.split("|")[1] == user_budget_combo(target.id)
     ]
 
     # Same treatment as the reconciler's key pass: every live key of the
@@ -220,16 +182,22 @@ async def get_rate_limits(
     states: List[Optional[RateLimitWindowState]]
     usage_error = None
     if mode == "redis":
-        reader = _reader_factory(cfg)
-        # "redis" mode implies a reader by construction.
-        assert reader is not None
-        states, usage_error = await _read_states(
+        reader = getattr(request.app.state, "rate_limit_usage_reader", None)
+        if reader is None:
+            reader = _reader_factory(cfg)
+            # "redis" mode implies a reader by construction; cache it for the
+            # process (see reader_from_config: one pool, reused connections).
+            request.app.state.rate_limit_usage_reader = reader
+        states, usage_error = await read_windows(
             reader, all_specs, now=now, timezone_name=rlc.timezone
         )
     else:
         # Local mode keeps no counters: windows render with limits only.
         states = [None] * len(all_specs)
 
+    # Keyed by id(): the specs are plain dataclasses, so two windows of the
+    # same shape compare equal and a value-keyed dict would collapse
+    # distinct windows onto one read; identity keys cannot collide.
     state_by_spec = {id(spec): state for spec, state in zip(all_specs, states)}
     return RateLimitsResponse(
         mode=mode,

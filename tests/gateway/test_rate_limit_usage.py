@@ -21,8 +21,10 @@ from gpustack.gateway.rate_limit_usage import (
     calendar_window_seconds,
     expected_windows,
     parse_member_count,
+    read_windows,
     reader_from_config,
     source_for,
+    user_budget_combo,
 )
 from gpustack.security import gateway_consumer_identity
 
@@ -452,3 +454,63 @@ async def test_read_window_rejects_naive_now():
         await reader.read_window(
             _spec(), now=datetime(2026, 11, 19, 12, 0, 0), timezone_name="UTC"
         )
+
+
+def test_user_budget_combo_is_the_key_segment():
+    """The read side filters budget windows on this segment: it must stay
+    identical to what ``_user_budget_windows`` renders into the key."""
+    assert user_budget_combo(6) == "user-6"
+    windows = expected_windows(_cfg(), 6, None, 100_000, 200_000)
+    budget = [w for w in windows if w.redis_key.split("|")[1] == user_budget_combo(6)]
+    assert [(w.kind, w.period, w.limit) for w in budget] == [
+        ("token_rolling", "604800s", 100_000),
+        ("token_calendar", "each_month", 200_000),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_windows_returns_every_state():
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    now_ts = int(now.timestamp())
+    specs = [
+        _spec(redis_key="a"),
+        _spec(redis_key="b", kind="token_rolling"),
+    ]
+    reader = RateLimitUsageReader(
+        _FakeRedis(
+            {
+                "a": [(now_ts - 1, "m|2")],
+                "b": [(now_ts - 10, "n|4")],
+            }
+        )
+    )
+    states, error = await read_windows(reader, specs, now=now, timezone_name="UTC")
+    assert error is None
+    # Rolling reset is member aging: a member 1s (10s) old leaves in 59s (50s).
+    assert [(s.used, s.reset_seconds) for s in states] == [(2, 59), (4, 50)]
+
+
+@pytest.mark.asyncio
+async def test_read_windows_discards_everything_on_any_failure():
+    """A bad deployment timezone fails the calendar windows' boundary math;
+    the batch is discarded whole — the rolling read that succeeded is
+    thrown away with it."""
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    now_ts = int(now.timestamp())
+    specs = [
+        _spec(redis_key="a"),
+        _spec(
+            redis_key="b",
+            kind="token_calendar",
+            period="each_day",
+            window_seconds=None,
+        ),
+    ]
+    reader = RateLimitUsageReader(
+        _FakeRedis({"a": [(now_ts - 1, "m|2")], "b": [(now_ts - 1, "n|2")]})
+    )
+    states, error = await read_windows(
+        reader, specs, now=now, timezone_name="Mars/Olympus"
+    )
+    assert error == "ZoneInfoNotFoundError"
+    assert states == [None, None]
