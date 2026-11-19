@@ -452,9 +452,7 @@ async def test_disabled_mode_returns_empty_structures(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reader_is_cached_on_app_state_across_requests(
-    frozen_now, monkeypatch
-):
+async def test_reader_is_cached_on_app_state_across_requests(frozen_now, monkeypatch):
     """The reader is built once per process — the config it dials is
     process-static — and reused: two requests sharing an app.state hit the
     factory exactly once."""
@@ -508,7 +506,9 @@ async def test_mixed_reader_failure_discards_the_successful_reads_too(
         assert window.reset_seconds is None
 
 
-@pytest.mark.parametrize("error_type", [RedisError, TimeoutError, ZoneInfoNotFoundError])
+@pytest.mark.parametrize(
+    "error_type", [RedisError, TimeoutError, ZoneInfoNotFoundError]
+)
 @pytest.mark.asyncio
 async def test_reader_failure_surfaces_only_the_class_name(
     frozen_now, monkeypatch, error_type
