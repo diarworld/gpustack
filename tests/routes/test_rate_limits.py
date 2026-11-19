@@ -207,8 +207,10 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     assert response.generated_at == FIXED_NOW
     assert response.user.weekly_limit == 100_000
     assert response.user.monthly_limit == 200_000
-    # The user block carries only the user-budget combo, not the defaults.
+    # The user block composes the effective view: the default day cap, and
+    # the owner's budgets where they override the defaults.
     assert _shapes(response.user.windows) == [
+        ("token_calendar", "each_day", 2_000_000),
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
@@ -237,6 +239,7 @@ async def test_admin_reads_another_user(frozen_now, monkeypatch):
     assert session.get_calls == [7]
     assert response.user.weekly_limit == 100_000
     assert _shapes(response.user.windows) == [
+        ("token_calendar", "each_day", 2_000_000),
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
@@ -280,7 +283,11 @@ async def test_org_pinned_admin_foreign_user_id_degrades_to_self(
 
     assert session.get_calls == []
     assert response.user.weekly_limit == 111
-    assert _shapes(response.user.windows) == [("token_rolling", "604800s", 111)]
+    assert _shapes(response.user.windows) == [
+        ("token_calendar", "each_day", 2_000_000),
+        ("token_rolling", "604800s", 111),
+        ("token_calendar", "each_month", 20_000_000),
+    ]
     assert response.api_keys == []
 
 
@@ -304,8 +311,13 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
 
     assert response.mode == "local"
     assert response.usage_error is None
-    # Only the user-budget combo shows; the defaults are not user-attributable.
-    assert [w.period for w in response.user.windows] == ["604800s", "each_month"]
+    # Effective user windows still list their limits; the budget covers the
+    # month, the default plan the day.
+    assert [w.period for w in response.user.windows] == [
+        "each_day",
+        "604800s",
+        "each_month",
+    ]
     for window in _all_windows(response):
         assert window.used is None
         assert window.reset_seconds is None
@@ -421,6 +433,15 @@ async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkey
     assert daily.used == 5
     # ...and the reset is the calendar boundary, not member aging.
     assert daily.reset_seconds == 43_200
+    # A user without budgets rides the default plan alone: the user block's
+    # day window reads the same per-user bucket.
+    assert _shapes(response.user.windows) == [
+        ("token_calendar", "each_day", 2_000_000),
+        ("token_calendar", "each_month", 20_000_000),
+    ]
+    user_daily = next(w for w in response.user.windows if w.period == "each_day")
+    assert user_daily.used == 5
+    assert user_daily.reset_seconds == 43_200
 
 
 @pytest.mark.asyncio

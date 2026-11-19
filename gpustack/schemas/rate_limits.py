@@ -42,7 +42,15 @@ class RateLimitWindowUsage(BaseModel):
 
 
 class UserRateLimits(BaseModel):
-    """The caller's user-level token budgets and their live windows."""
+    """The caller's user-level limits and their live windows.
+
+    ``windows`` is the effective per-period view: a token budget overrides
+    the deployment default on the period it covers (its quota is the tighter
+    cap), and the default plan fills the periods the user has no budget for.
+    Every window buckets on the user, so its counter is that user's own
+    traffic. Per-minute caps are not folded in here — the per-key table
+    carries them.
+    """
 
     # From the ``users`` table; ``None`` = the user has no budget of that
     # kind, so the deployment default governs that axis.

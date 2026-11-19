@@ -8,7 +8,7 @@ through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
 """
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Request
 from sqlmodel import select
@@ -17,6 +17,10 @@ from gpustack.api.exceptions import NotFoundException
 from gpustack.api.tenant import TenantContext, is_platform_wide
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit_usage import (
+    DEFAULT_PLAN_COMBO,
+    DAY_PERIOD,
+    MONTH_PERIOD,
+    ROLLING_WEEKLY_PERIOD,
     RateLimitWindowState,
     RateLimitWindowSpec,
     expected_windows,
@@ -143,16 +147,35 @@ async def get_rate_limits(
     monthly = target.monthly_token_limit
 
     # With key=None the spec builder returns the deployment defaults first
-    # and this user's budget combo second. The user block surfaces only the
-    # budget combo — the defaults are deployment-wide, not attributable to
-    # one user — identified by the combo segment of the Redis key.
-    user_specs = [
-        spec
-        for spec in expected_windows(
-            rlc, target.id, key=None, weekly=weekly, monthly=monthly
-        )
-        if spec.redis_key.split("|")[1] == user_budget_combo(target.id)
-    ]
+    # and this user's budget combo second. Both combos bucket their counters
+    # on the user (the plugin captures ``gpustack-<id>`` out of every
+    # consumer shape), so every counter here is this user's own traffic. The
+    # user block composes the effective per-period view: a budget window
+    # overrides the default plan on the period it covers (both counters tick,
+    # the budget is always the tighter cap), and the default plan fills the
+    # periods the user has no budget for. Per-minute caps stay out — the
+    # per-key table renders those.
+    all_user_windows = expected_windows(
+        rlc, target.id, key=None, weekly=weekly, monthly=monthly
+    )
+    budget_combo = user_budget_combo(target.id)
+    default_by_period: Dict[str, RateLimitWindowSpec] = {}
+    budget_by_period: Dict[str, RateLimitWindowSpec] = {}
+    for spec in all_user_windows:
+        combo = spec.redis_key.split("|")[1]
+        if combo == budget_combo:
+            budget_by_period[spec.period] = spec
+        elif combo == DEFAULT_PLAN_COMBO:
+            default_by_period[spec.period] = spec
+    user_specs: List[RateLimitWindowSpec] = []
+    if DAY_PERIOD in default_by_period:
+        user_specs.append(default_by_period[DAY_PERIOD])
+    if ROLLING_WEEKLY_PERIOD in budget_by_period:
+        user_specs.append(budget_by_period[ROLLING_WEEKLY_PERIOD])
+    if MONTH_PERIOD in budget_by_period:
+        user_specs.append(budget_by_period[MONTH_PERIOD])
+    elif MONTH_PERIOD in default_by_period:
+        user_specs.append(default_by_period[MONTH_PERIOD])
 
     # Same treatment as the reconciler's key pass: every live key of the
     # target, skipping deployment-token rows. Soft-deleted keys no longer
