@@ -28,7 +28,8 @@ async def grafana_proxy(
 ):
     """
     Grafana proxy endpoint.
-    Only admin users can access.
+    Any authenticated user can access: the embedded Grafana serves its
+    dashboards to anonymous viewers, so this proxy is the auth boundary.
     """
     cfg = get_global_config()
     target_base = grafana_target_base(cfg.get_grafana_url() or "")

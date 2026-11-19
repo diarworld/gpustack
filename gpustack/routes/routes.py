@@ -164,7 +164,13 @@ management_router = APIRouter(
 management_router.include_router(
     grafana.router,
     prefix="/grafana",
-    dependencies=[Depends(get_admin_user)],
+    # Any authenticated user: the embedded Grafana renders its dashboards
+    # for anonymous viewers, so this proxy is the only auth boundary in
+    # front of them, and the monitoring links are meant for every user.
+    # The sibling /prometheus proxy stays admin-only: the browser never
+    # calls it (Grafana's datasource proxies server-side) and it exposes
+    # raw metric querying.
+    dependencies=[Depends(get_current_user)],
     include_in_schema=False,
 )
 management_router.include_router(
