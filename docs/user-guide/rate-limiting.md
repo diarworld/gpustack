@@ -159,15 +159,17 @@ the server also persists the token windows to the database every
 disables it). The live endpoint reads Redis directly and does not depend on
 the flusher:
 
-- Only token windows are flushed — the per-minute TPM, the sliding week and
-  the day / month budgets. Per-minute request counters are not persisted: the
-  gateway metrics above and the `model_usages` history already record
-  per-request consumption.
+- Only long token windows are flushed — the sliding week and the day / month
+  budgets. Per-minute windows are not persisted — request counts and
+  per-minute tokens alike: they churn a row every cycle, and the gateway
+  metrics above and the `model_usages` history already record per-request
+  consumption.
 - Snapshots land in `gateway_rate_limit_usages`, one row per combination and
-  window. Calendar windows upsert the same row every cycle; a rolling window
-  slides with every read, so each cycle writes a new snapshot row — a
-  consumption trend at the flush interval. Raise the interval (e.g. to
-  `300`–`3600`) if you do not need per-minute rolling snapshots.
+  window. Calendar windows upsert the same row every cycle; the sliding week
+  moves with every read, so each cycle writes a new snapshot row — a weekly
+  consumption trend at the flush interval. That row-per-cycle sampling is the
+  remaining churn source: raise the interval (e.g. to `300`–`3600`) if you do
+  not need weekly snapshots that fine-grained.
 - `user_id` / `api_key_id` of `0` marks a row that could not be attributed.
   Default-plan and user-budget rows aggregate a user's API-key and dashboard
   traffic into one bucket, so they carry no key id; a snapshot of a

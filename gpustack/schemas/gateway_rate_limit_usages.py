@@ -45,10 +45,12 @@ class GatewayRateLimitUsage(SQLModel, BaseModelMixin, table=True):
 
     # FK-less on purpose, like model_usages: a snapshot must outlive the user
     # or key it was attributed to.
-    # 0 = the row is not attributable to a specific user / API key (the
-    # `default-plan` combo aggregates traffic across consumers). 0 rather than
-    # NULL: both columns are part of the unique upsert key, and MySQL unique
-    # indexes treat NULLs as distinct, so NULLs would break the upsert.
+    # Rows are attributed from the combo's consumer identity when it parses
+    # (default-plan -> `gpustack-<user_id>`; key combos -> the key's owner);
+    # 0 = that attribution failed — an identity that does not parse, or a
+    # key-combo row whose key row is gone. 0 rather than NULL: both columns
+    # are part of the unique upsert key, and MySQL unique indexes treat NULLs
+    # as distinct, so NULLs would break the upsert.
     user_id: int = Field(
         default=0, sa_column=Column(Integer, nullable=False, default=0)
     )

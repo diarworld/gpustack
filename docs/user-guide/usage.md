@@ -34,6 +34,9 @@ GPUStack has two roles — **Admin** and **User** (see [User Management](user-ma
   control.
 - **User** — can view only their own usage; per-user breakdowns are not available.
 
+Platform-wide admins (admins acting without an Org pinned) see the platform view; an
+Org-pinned admin sees their Org's usage only.
+
 ## Common controls
 
 Every tab (except Resource Events, which has its own filters) shares the same controls:
@@ -74,9 +77,11 @@ Every tab (except Resource Events, which has its own filters) shares the same co
 
 ![Usage Summary](../assets/usage/usage-summary.png)
 
-The Summary tab stacks three sections — **Tokens**, **Compute**, and **Storage**. Each shows a
-headline stat line, a breakdown donut (by type), and a trend chart over the selected
-range, giving you a quick read across all three resource kinds without switching tabs.
+The Summary tab stacks four sections — **Tokens**, **Compute**, **Storage**, and **Rate limits**. The
+first three each show a headline stat line, a breakdown donut (by type), and a trend chart over the
+selected range, giving you a quick read across all three resource kinds without switching tabs.
+**Rate limits** shows the user's rate limits and their live usage from the gateway counters; it is
+always self-scoped. See [Rate Limiting](rate-limiting.md#current-limits-and-usage) for details.
 
 ## Tokens
 
