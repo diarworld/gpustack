@@ -155,6 +155,11 @@ class GatewayRateLimitConfig(BaseModel):
     # monthly numbers impossible to reason about.
     timezone: str = "UTC"
 
+    # Snapshot cadence for the long-window usage flusher (day / week / month
+    # buckets persisted to the database for analytics). 0 disables the flusher;
+    # the live endpoint reads Redis directly and does not depend on it.
+    usage_flush_interval_seconds: int = 60
+
     rejected_code: int = Field(default=429, ge=100, le=599)
     # Rendered as an OpenAI-style error envelope; a JSON object literal is
     # sent verbatim (see the plugin's rejection-response documentation).

@@ -81,6 +81,7 @@ dependencies = [
     # ModelScope declares setuptools as a runtime dependency.
     "setuptools>=84.1.0",
     "urllib3>=2.8.0",
+    "redis>=5.2",
 ]
 
 [dependency-groups]
