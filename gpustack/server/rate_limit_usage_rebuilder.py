@@ -168,7 +168,7 @@ class RateLimitUsageRebuilder:
         plain, forgiven, cutoffs = await self._load_usage_buckets(
             min(starts.values()), now
         )
-        await self._write(
+        written = await self._write(
             client, specs, starts, plain, forgiven, cutoffs, targets, replace
         )
         if replace:
@@ -177,7 +177,7 @@ class RateLimitUsageRebuilder:
             # not degrade into a missing-key probe over a stale picture.
             self._warmed = True
         logger.info(
-            f"Rate-limit usage rebuild: restored {len(targets)} counters "
+            f"Rate-limit usage rebuild: restored {written} counters "
             f"from usage details."
         )
 
@@ -318,14 +318,18 @@ class RateLimitUsageRebuilder:
 
     async def _write(
         self, client, specs, starts, plain, forgiven, cutoffs, targets, replace: bool
-    ):
+    ) -> int:
         """ZADD the per-hour members of every target counter.
 
         ``replace`` (the startup warm-up) DELs the counter first: the
         database picture replaces whatever survived. Otherwise the EXISTS
         gate kept live counters out of the batch, so live traffic racing
         the rebuild can only add. ZADD merges into a member set either
-        way, never overwriting a live member.
+        way, never overwriting a live member. Returns how many counters
+        actually received members -- a target with nothing in its window
+        is skipped (steady state) or just DEL'd (warm-up), and counting
+        those as restored would turn every quiet cycle into a false
+        alarm.
         """
         commands: List[Tuple[str, Dict[str, int]]] = []
         for redis_key in targets:
@@ -367,6 +371,7 @@ class RateLimitUsageRebuilder:
                 continue
             commands.append((redis_key, members))
 
+        written = 0
         for i in range(0, len(commands), ZADD_BATCH):
             pipe = client.pipeline(transaction=False)
             for redis_key, members in commands[i : i + ZADD_BATCH]:
@@ -377,4 +382,6 @@ class RateLimitUsageRebuilder:
                     pipe.delete(redis_key)
                 if members:
                     pipe.zadd(redis_key, members)
+                    written += 1
             await pipe.execute(raise_on_error=True)
+        return written
