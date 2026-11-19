@@ -157,7 +157,6 @@ class RateLimitUsageRebuilder:
                 for key, (spec, _, _) in specs.items()
                 if spec.period in _PERIOD_KINDS
             ]
-            self._warmed = True
         else:
             targets = await self._missing_keys(client, list(specs))
             if not targets:
@@ -172,6 +171,11 @@ class RateLimitUsageRebuilder:
         await self._write(
             client, specs, starts, plain, forgiven, cutoffs, targets, replace
         )
+        if replace:
+            # Marked only after the pass landed: a warm-up that fails
+            # (database hiccup) must retry as a warm-up on the next cycle,
+            # not degrade into a missing-key probe over a stale picture.
+            self._warmed = True
         logger.info(
             f"Rate-limit usage rebuild: restored {len(targets)} counters "
             f"from usage details."

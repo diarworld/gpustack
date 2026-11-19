@@ -381,6 +381,54 @@ async def test_reset_cutoffs_keep_forgiven_spend_out(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
+    """A warm-up that dies mid-pass (database hiccup) must not be
+    remembered as done: the next cycle replaces the counters again. A
+    consumed-but-failed startup pass would otherwise leave a surviving
+    counter with lost history uncorrected forever."""
+    rlc = _cfg()
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
+
+    rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
+    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
+    client = FakeRedis()
+    monkeypatch.setattr(
+        rebuilder,
+        "reader_from_config",
+        lambda cfg: SimpleNamespace(client=client),
+    )
+
+    failing = {"calls": 0}
+    original_load = rebuilder.RateLimitUsageRebuilder._load_usage_buckets
+
+    async def flaky_load(self, *args):
+        failing["calls"] += 1
+        if failing["calls"] == 1:
+            raise RuntimeError("database hiccup")
+        return await original_load(self, *args)
+
+    monkeypatch.setattr(
+        rebuilder.RateLimitUsageRebuilder, "_load_usage_buckets", flaky_load
+    )
+    with pytest.raises(RuntimeError):
+        await rebuild._rebuild(rlc, client)
+    assert rebuild._warmed is False
+
+    # The retry is still a warm-up: it DELs the stale counter instead of
+    # merging into it.
+    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
+    day_key = key_windows(rlc, key42)[0].redis_key
+    client.existing.add(day_key)
+    await rebuild._rebuild(rlc, client)
+    assert rebuild._warmed is True
+    assert _tokens(client.zsets[day_key])
+
+
+@pytest.mark.asyncio
 async def test_day_boundary_follows_the_deployment_timezone(frozen_now, monkeypatch):
     """Calendar windows anchor to the configured timezone: a row before the
     local midnight is outside the day window even though its UTC stamp sits
