@@ -87,6 +87,103 @@ through and a warning is logged, rather than blocking traffic because of the
 limiter's own infrastructure. Monitor the rejection counters in the Metrics
 section below for evidence that limits are being enforced.
 
+## Current Limits and Usage
+
+The server exposes what the gateway is enforcing right now at
+`GET /v2/usage/rate-limits`. Any authenticated user gets their own picture by
+default; a platform-wide admin (an admin acting without an Org pinned — the
+same gate the usage routes apply to cross-tenant views) may pass `user_id` to
+view any user, while everyone else silently gets their own view.
+
+The response carries:
+
+- `mode` — `redis` (live counters, read from Redis at request time), `local`
+  (rate limiting is on without Redis, so limits come back without counters)
+  or `disabled` (the feature is off; the Usage page hides the section).
+- `user` — the user's weekly and monthly token budgets (whichever are set),
+  each with its live window.
+- `api_keys` — one entry per live API key: its explicit `rpm_limit`,
+  `tpm_limit` and `daily_token_limit` (unset fields are omitted — they
+  inherit the deployment defaults), which limit `source` governs it (`key`,
+  `user+default` or `default`), and every window its requests draw on — RPM,
+  TPM, day, week and month — each with `used`, `limit` and `reset_seconds`.
+- `generated_at` — the instant every window was read at.
+- `usage_error` — set only when the Redis read failed, and carrying just the
+  exception class name, never its message (which can contain hostnames).
+
+Fields with no value are omitted rather than sent as `null`: in `local` mode,
+or whenever Redis is unreachable, a window simply has no `used`. The read
+fails open — the limits are always returned. The Usage page's Summary tab
+renders this response as its **Rate limits** section.
+
+For a deployment with defaults of 10 RPM, 60000 TPM, 2000000 daily and
+20000000 monthly tokens, and a user with a 100000 weekly budget:
+
+```json
+{
+  "mode": "redis",
+  "generated_at": "2026-11-19T10:30:00Z",
+  "user": {
+    "weekly_limit": 100000,
+    "windows": [
+      {"kind": "token_rolling", "period": "604800s", "window_seconds": 604800, "limit": 100000, "used": 37215, "reset_seconds": 172800}
+    ]
+  },
+  "api_keys": [
+    {
+      "id": 6,
+      "name": "ci-runner",
+      "source": "user+default",
+      "windows": [
+        {"kind": "query", "period": "60s", "window_seconds": 60, "limit": 10, "used": 3, "reset_seconds": 41},
+        {"kind": "token_rolling", "period": "60s", "window_seconds": 60, "limit": 60000, "used": 4820, "reset_seconds": 27},
+        {"kind": "token_calendar", "period": "each_day", "limit": 2000000, "used": 18450, "reset_seconds": 48600},
+        {"kind": "token_calendar", "period": "each_month", "limit": 20000000, "used": 210000, "reset_seconds": 999000},
+        {"kind": "token_rolling", "period": "604800s", "window_seconds": 604800, "limit": 100000, "used": 37215, "reset_seconds": 172800}
+      ]
+    }
+  ]
+}
+```
+
+The weekly window appears under both the user and the key: API-key traffic and
+UI traffic draw on the same allowance, so both read the same counter. Calendar
+windows have no `window_seconds` — their length follows the calendar, and
+their `reset_seconds` counts down to the boundary in the deployment timezone.
+
+### Usage Snapshots
+
+With `gateway_rate_limit.enabled` and `gateway_rate_limit.redis` configured,
+the server also persists the token windows to the database every
+`gateway_rate_limit.usage_flush_interval_seconds` (60 seconds by default, `0`
+disables it). The live endpoint reads Redis directly and does not depend on
+the flusher:
+
+- Only token windows are flushed — the per-minute TPM, the sliding week and
+  the day / month budgets. Per-minute request counters are not persisted: the
+  gateway metrics above and the `model_usages` history already record
+  per-request consumption.
+- Snapshots land in `gateway_rate_limit_usages`, one row per combination and
+  window. Calendar windows upsert the same row every cycle; a rolling window
+  slides with every read, so each cycle writes a new snapshot row — a
+  consumption trend at the flush interval. Raise the interval (e.g. to
+  `300`–`3600`) if you do not need per-minute rolling snapshots.
+- `user_id` / `api_key_id` of `0` marks a row that could not be attributed.
+  Default-plan and user-budget rows aggregate a user's API-key and dashboard
+  traffic into one bucket, so they carry no key id; a snapshot of a
+  `key-<id>` combination whose key has since been deleted keeps the key id
+  and lands on `user_id` 0 — history survives key deletion.
+- `quota` is the limit as of the flush. After a limits change the gateway
+  keeps enforcing the previous value for up to one reconcile interval, so a
+  fresh snapshot can briefly trail what is actually enforced.
+- Rows older than 90 days are pruned on every cycle.
+
+!!! note
+
+    The endpoint and the flusher read the same Redis the gateway writes its
+    counters to — `gateway_rate_limit.redis` — not the server's top-level
+    `redis_url`.
+
 ## Metrics
 
 The plugin declares three counters per rate-limit decision:
