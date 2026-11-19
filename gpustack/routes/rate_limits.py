@@ -7,18 +7,24 @@ counters the gateway's ``gpustack-rate-limit`` plugin keeps in Redis, read
 through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Request
+from sqlalchemy import or_
 from sqlmodel import select
 
-from gpustack.api.exceptions import NotFoundException
+from gpustack.api.exceptions import (
+    BadRequestException,
+    InvalidException,
+    NotFoundException,
+)
 from gpustack.api.tenant import TenantContext, is_platform_wide
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowState,
     RateLimitWindowSpec,
+    default_plan_windows,
     key_windows,
     read_windows,
     reader_from_config,
@@ -26,8 +32,11 @@ from gpustack.gateway.rate_limit_usage import (
     user_limit_windows,
 )
 from gpustack.schemas.api_keys import ApiKey
+from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
 from gpustack.schemas.rate_limits import (
     ApiKeyRateLimits,
+    RateLimitResetCreate,
+    RateLimitResetStatus,
     RateLimitWindowUsage,
     RateLimitsResponse,
     UserRateLimits,
@@ -41,6 +50,15 @@ router = APIRouter()
 # Module-level indirection so tests can substitute the reader construction;
 # production callers get the config-wired factory.
 _reader_factory = reader_from_config
+
+# Resets allowed per floating window, per reset kind. The window floats
+# with the presses themselves: two presses in one week make the next press
+# available a week after the first one, not on the next calendar boundary.
+RESET_QUOTA = 2
+RESET_WINDOW_SECONDS = {"weekly": 604800, "monthly": 30 * 86400}
+# The long token window periods each reset kind forgives, matched against
+# the published windows of the target user.
+_RESET_PERIODS = {"weekly": "604800s", "monthly": "each_month"}
 
 
 def _mode(rlc: Optional[GatewayRateLimitConfig]) -> str:
@@ -88,6 +106,53 @@ def _window_usage(
         limit=spec.limit,
         used=state.used if state is not None else None,
         reset_seconds=state.reset_seconds if state is not None else None,
+    )
+
+
+def _reader(request: Request, cfg: Config):
+    """The config-wired Redis reader, cached on the app for the process."""
+    reader = getattr(request.app.state, "rate_limit_usage_reader", None)
+    if reader is None:
+        reader = _reader_factory(cfg)
+        # "redis" mode implies a reader by construction; cache it for the
+        # process (see reader_from_config: one pool, reused connections).
+        request.app.state.rate_limit_usage_reader = reader
+    return reader
+
+
+async def _reset_status(
+    session, target_id: int, kind: str, now: datetime
+) -> RateLimitResetStatus:
+    """Presses still available for one window kind under the floating quota.
+
+    Only self-service presses count against the quota: an admin resetting
+    on the user's behalf (``reset_by_user_id`` pointing at someone else)
+    is a support action and never consumes the user's own allowance.
+    """
+    window = timedelta(seconds=RESET_WINDOW_SECONDS[kind])
+    counted = (
+        await session.exec(
+            select(GatewayRateLimitReset)
+            .where(
+                GatewayRateLimitReset.user_id == target_id,
+                GatewayRateLimitReset.kind == kind,
+                GatewayRateLimitReset.reset_at > now - window,
+                or_(
+                    GatewayRateLimitReset.reset_by_user_id.is_(None),
+                    GatewayRateLimitReset.reset_by_user_id == target_id,
+                ),
+            )
+            .order_by(GatewayRateLimitReset.reset_at)
+        )
+    ).all()
+    available = RESET_QUOTA - len(counted)
+    # The oldest counted press ages out of the floating window first; when
+    # it does, its allowance frees up for the next press.
+    next_available_at = counted[0].reset_at + window if available <= 0 else None
+    return RateLimitResetStatus(
+        quota=RESET_QUOTA,
+        available=max(available, 0),
+        next_available_at=next_available_at,
     )
 
 
@@ -171,18 +236,22 @@ async def get_rate_limits(
     states: List[Optional[RateLimitWindowState]]
     usage_error = None
     if mode == "redis":
-        reader = getattr(request.app.state, "rate_limit_usage_reader", None)
-        if reader is None:
-            reader = _reader_factory(cfg)
-            # "redis" mode implies a reader by construction; cache it for the
-            # process (see reader_from_config: one pool, reused connections).
-            request.app.state.rate_limit_usage_reader = reader
+        reader = _reader(request, cfg)
         states, usage_error = await read_windows(
             reader, all_specs, now=now, timezone_name=rlc.timezone
         )
     else:
         # Local mode keeps no counters: windows render with limits only.
         states = [None] * len(all_specs)
+
+    # Reset-button state only exists where there are counters to clear;
+    # in local mode the plugin keeps nothing a reset could forgive.
+    resets = None
+    if mode == "redis":
+        resets = {
+            kind: await _reset_status(session, target.id, kind, now)
+            for kind in RESET_WINDOW_SECONDS
+        }
 
     # Keyed by id(): the specs are plain dataclasses, so two windows of the
     # same shape compare equal and a value-keyed dict would collapse
@@ -200,6 +269,7 @@ async def get_rate_limits(
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
             ],
+            resets=resets,
         ),
         api_keys=[
             ApiKeyRateLimits(
@@ -215,3 +285,86 @@ async def get_rate_limits(
             for key in live_keys
         ],
     )
+
+
+@router.post("/rate-limits/reset", response_model=RateLimitResetStatus)
+async def reset_rate_limit(
+    body: RateLimitResetCreate,
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: Request,
+):
+    """Forgive the target user's weekly or monthly token budget mid-window.
+
+    Deletes the gateway's Redis counters of that window kind (the budget
+    restarts from zero on the next request), records the press in
+    ``gateway_rate_limit_resets`` and returns the fresh quota state.
+
+    Scoping mirrors ``get_rate_limits``: self by default, a foreign
+    ``user_id`` only for a platform-wide admin. An admin bypasses the
+    floating quota — their press is a support action, recorded with
+    ``reset_by_user_id`` and never counted against the user's own
+    allowance.
+
+    Args:
+        body: the window kind, the required reason note, and optionally
+            the user to reset (admin expansion).
+        session: async DB session.
+        user: the authenticated caller.
+        ctx: the request's tenant context; gates the admin expansion.
+        request: the FastAPI request; the server config lives on app.state.
+
+    Returns:
+        RateLimitResetStatus: the quota state after the press.
+    """
+    cfg: Config = request.app.state.server_config
+    rlc = cfg.gateway_rate_limit
+    if _mode(rlc) != "redis":
+        raise InvalidException(
+            message="Rate-limit resets require the Redis counter backend"
+        )
+    if body.kind not in _RESET_PERIODS:
+        raise InvalidException(message=f"kind must be one of {sorted(_RESET_PERIODS)}")
+    if not body.description.strip():
+        raise InvalidException(message="description is required")
+
+    target = await _resolve_target(session, user, ctx, body.user_id)
+    now = datetime.now(timezone.utc)
+
+    # Everything the reset forgives: the user-level long token windows of
+    # this kind, the user's own limits and the default-plan fallback alike.
+    # A user with no such window has nothing to forgive.
+    windows = user_limit_windows(rlc, target.id, target) + default_plan_windows(
+        rlc, target.id
+    )
+    counter_keys = [
+        w.redis_key for w in windows if w.period == _RESET_PERIODS[body.kind]
+    ]
+    if not counter_keys:
+        raise InvalidException(
+            message=f"No {body.kind} budget is configured for this user"
+        )
+
+    status = await _reset_status(session, target.id, body.kind, now)
+    if not is_platform_wide(user, ctx) and status.available <= 0:
+        raise BadRequestException(message="Reset quota exhausted for this period")
+
+    # The row lands before the counters are deleted: the counter rebuild
+    # keys its cutoff off this table, so a rebuild that races the delete
+    # must never see deleted counters without their cutoff.
+    await GatewayRateLimitReset.create(
+        session,
+        GatewayRateLimitReset(
+            user_id=target.id,
+            kind=body.kind,
+            reset_at=now,
+            reset_by_user_id=user.id if user.id != target.id else None,
+            description=body.description.strip(),
+        ),
+    )
+
+    reader = _reader(request, cfg)
+    await reader.client.delete(*counter_keys)
+
+    return await _reset_status(session, target.id, body.kind, now)

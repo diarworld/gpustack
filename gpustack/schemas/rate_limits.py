@@ -12,7 +12,7 @@ absent-able.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,25 @@ class RateLimitWindowUsage(BaseModel):
     reset_seconds: Optional[int] = None
 
 
+class RateLimitResetStatus(BaseModel):
+    """Where the user stands against the floating reset quota of one window.
+
+    The quota floats with the resets themselves: pressing the button twice
+    in one week makes the next press available a week after the first
+    press, not on the next calendar boundary. ``next_available_at`` is
+    ``None`` while presses remain.
+    """
+
+    # Resets allowed per floating window (7 days for the weekly budget,
+    # 30 for the monthly one).
+    quota: int
+    # Presses still available now; 0 means the button is disabled.
+    available: int
+    # When the oldest counted reset ages out of the floating window and a
+    # press frees up. Only set once ``available`` reaches 0.
+    next_available_at: Optional[datetime] = None
+
+
 class UserRateLimits(BaseModel):
     """The caller's user-level limits and their live windows.
 
@@ -60,6 +79,10 @@ class UserRateLimits(BaseModel):
     weekly_limit: Optional[int] = None
     monthly_limit: Optional[int] = None
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
+    # Reset-button state per long token window kind (``weekly`` /
+    # ``monthly``), only in redis mode -- in local mode there are no
+    # counters a reset could clear.
+    resets: Optional[Dict[str, RateLimitResetStatus]] = None
 
 
 class ApiKeyRateLimits(BaseModel):
@@ -76,6 +99,19 @@ class ApiKeyRateLimits(BaseModel):
     # day quota) or ``user`` (the user limit combo alone).
     source: str
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
+
+
+class RateLimitResetCreate(BaseModel):
+    """One reset-button press: which window and why it was forgiven."""
+
+    # 'weekly' or 'monthly' — the long token window kind to forgive.
+    kind: str
+    # Required note on what the budget was spent on; the UI enforces the
+    # textarea and the route rejects blanks.
+    description: str
+    # Whose budget to reset; defaults to the caller. Honored only for a
+    # platform-wide admin (the same gate as the GET expansion).
+    user_id: Optional[int] = None
 
 
 class RateLimitsResponse(BaseModel):

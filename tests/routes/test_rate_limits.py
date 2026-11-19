@@ -6,19 +6,24 @@ like the ones ``tests/routes/test_api_keys.py`` uses to call route handlers
 directly.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 from redis.exceptions import RedisError
 from zoneinfo import ZoneInfoNotFoundError
 
-from gpustack.api.exceptions import NotFoundException
+from gpustack.api.exceptions import (
+    BadRequestException,
+    InvalidException,
+    NotFoundException,
+)
 from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
 from gpustack.gateway.rate_limit import rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import RateLimitUsageReader, RateLimitWindowState
 from gpustack.routes import rate_limits
 from gpustack.schemas.api_keys import ApiKey
+from gpustack.schemas.rate_limits import RateLimitResetCreate
 from gpustack.schemas.users import User
 
 # A fixed instant with a 12h elapsed UTC day, so calendar boundaries are
@@ -97,13 +102,32 @@ def _shapes(windows):
 class FakeSession:
     """Stand-in for the async session the endpoint uses: admin user loads
     resolve through ``session.get`` (what ``one_by_id`` calls), the api-keys
-    listing through ``session.exec``."""
+    listing through ``session.exec``, and reset-quota reads through the
+    ``gateway_rate_limit_resets`` statements. Writes are recorded, not
+    persisted."""
 
-    def __init__(self, users=(), keys=()):
+    def __init__(self, users=(), keys=(), resets=()):
         self._users = {u.id: u for u in users}
         self._keys = list(keys)
+        self._resets = sorted(resets, key=lambda r: r.reset_at)
         self.get_calls = []
         self.statements = []
+        self.added = []
+        # What ActiveRecordMixin's event publishing touches on save.
+        self.sync_session = SimpleNamespace(
+            in_transaction=lambda: True,
+            autobegin=True,
+            begin=lambda: None,
+        )
+        self.info = {}
+        self.is_active = True
+        self.dirty = set()
+
+    async def flush(self, targets=None):
+        pass
+
+    async def rollback(self):
+        pass
 
     async def get(self, cls, id, **kwargs):
         self.get_calls.append(id)
@@ -111,7 +135,44 @@ class FakeSession:
 
     async def exec(self, statement):
         self.statements.append(statement)
+        text = self._compiled(statement)
+        if "gateway_rate_limit_resets" in text:
+            return SimpleNamespace(all=lambda: self._matching_resets(text))
         return SimpleNamespace(all=lambda: list(self._keys))
+
+    @staticmethod
+    def _compiled(statement) -> str:
+        """The statement with literals inlined, so the fake can read the
+        kind / user filters the real database would apply."""
+        try:
+            return str(statement.compile(compile_kwargs={"literal_binds": True}))
+        except Exception:
+            return str(statement)
+
+    def _matching_resets(self, text):
+        """Rows the reset-status query would fetch: the kind and user
+        filters read off the compiled statement, the self-service filter
+        (an admin's press never counts) mirrored in Python."""
+        matched = [
+            row
+            for row in self._resets
+            if f"kind = '{row.kind}'" in text
+            and f"user_id = {row.user_id}" in text
+            and (row.reset_by_user_id is None or row.reset_by_user_id == row.user_id)
+        ]
+        matched.sort(key=lambda r: r.reset_at)
+        return matched
+
+    def add(self, obj):
+        self.added.append(obj)
+        self._resets.append(obj)
+        self._resets.sort(key=lambda r: r.reset_at)
+
+    async def commit(self):
+        pass
+
+    async def refresh(self, obj):
+        pass
 
 
 class FakeReader:
@@ -124,6 +185,12 @@ class FakeReader:
         self.specs = []
         self._states = states or {}
         self._error = error
+        self.deleted = []
+        self.client = SimpleNamespace(delete=self._delete)
+
+    async def _delete(self, *keys):
+        self.deleted.extend(keys)
+        return len(keys)
 
     async def window_states(self, specs, *, now, timezone_name):
         self.specs.extend(specs)
@@ -586,3 +653,166 @@ async def test_reader_failure_surfaces_only_the_class_name(
     for window in _all_windows(response):
         assert window.used is None
         assert window.reset_seconds is None
+
+
+def _reset(user_id, kind, at, by=None):
+    """A recorded reset row, aware UTC as UTCDateTime returns it."""
+    return SimpleNamespace(user_id=user_id, kind=kind, reset_at=at, reset_by_user_id=by)
+
+
+@pytest.mark.asyncio
+async def test_get_reports_floating_reset_quota(frozen_now, monkeypatch):
+    """The response carries per-kind reset state: two presses per floating
+    window, the already-used ones counted, the disabled button carrying the
+    instant the oldest counted press ages out."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=2)),
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=1)),
+        # An admin reset on the user's behalf never consumes their quota.
+        _reset(7, "monthly", FIXED_NOW - timedelta(days=3), by=1),
+    ]
+    session = FakeSession(users=[user], keys=[], resets=resets)
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+    )
+
+    weekly = response.user.resets["weekly"]
+    assert weekly.quota == 2
+    assert weekly.available == 0
+    # The oldest self press was two days ago: it frees up in five.
+    assert weekly.next_available_at == FIXED_NOW + timedelta(days=5)
+    monthly = response.user.resets["monthly"]
+    assert monthly.available == 2
+    assert monthly.next_available_at is None
+
+
+@pytest.mark.asyncio
+async def test_reset_records_row_and_clears_counters(frozen_now, monkeypatch):
+    """A press records the audit row (with the reason note), deletes the
+    weekly counters of both the user combo and the default-plan fallback,
+    and answers with the decremented quota."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user], keys=[])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    status = await rate_limits.reset_rate_limit(
+        session=session,
+        user=user,
+        ctx=_ctx(10),
+        request=_request(cfg),
+        body=RateLimitResetCreate(kind="weekly", description="backfill job"),
+    )
+
+    assert status.available == 1
+    assert status.next_available_at is None
+    (row,) = session.added
+    assert row.user_id == 7 and row.kind == "weekly"
+    assert row.description == "backfill job"
+    # The press is a self-service one: it counts against the quota.
+    assert row.reset_by_user_id is None
+    # The published weekly counter went away (the default plan publishes
+    # no weekly window; its day / month counters are untouched kinds).
+    assert reader.deleted == [
+        "gpustack-rate-limit|user-7|consumer=gpustack-7|t:604800s"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reset_quota_exhausted_rejects(frozen_now, monkeypatch):
+    """Two presses inside the floating window exhaust it: the third is
+    rejected and nothing is recorded or deleted."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=6)),
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=1)),
+    ]
+    session = FakeSession(users=[user], keys=[], resets=resets)
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    with pytest.raises(BadRequestException):
+        await rate_limits.reset_rate_limit(
+            session=session,
+            user=user,
+            ctx=_ctx(10),
+            request=_request(cfg),
+            body=RateLimitResetCreate(kind="weekly", description="again"),
+        )
+    assert session.added == [] and reader.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_bypasses_quota(frozen_now, monkeypatch):
+    """A platform-wide admin resets on the user's behalf without touching
+    the user's own allowance: the row is recorded with the acting admin,
+    the quota state stays untouched."""
+    cfg = _redis_cfg()
+    admin = _user(1, is_admin=True, weekly=50_000, monthly=90_000)
+    target = _user(7, weekly=100_000, monthly=200_000)
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=1)),
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=2)),
+    ]
+    session = FakeSession(users=[admin, target], keys=[], resets=resets)
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    status = await rate_limits.reset_rate_limit(
+        session=session,
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        body=RateLimitResetCreate(kind="weekly", description="approved", user_id=7),
+    )
+
+    (row,) = session.added
+    assert row.user_id == 7 and row.reset_by_user_id == 1
+    # The admin's own press does not consume the user's quota.
+    assert status.available == 0
+    assert status.next_available_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_validations(frozen_now, monkeypatch):
+    """Unknown kinds, blank notes and window kinds the user does not have
+    are rejected before anything is written or deleted."""
+    cfg = _redis_cfg()
+    user = _user(7, monthly=200_000)
+    session = FakeSession(users=[user], keys=[])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    with pytest.raises(InvalidException):
+        await rate_limits.reset_rate_limit(
+            session=session,
+            user=user,
+            ctx=_ctx(10),
+            request=_request(cfg),
+            body=RateLimitResetCreate(kind="daily", description="x"),
+        )
+    with pytest.raises(InvalidException):
+        await rate_limits.reset_rate_limit(
+            session=session,
+            user=user,
+            ctx=_ctx(10),
+            request=_request(cfg),
+            body=RateLimitResetCreate(kind="weekly", description="   "),
+        )
+    # No weekly budget is configured for this user at all.
+    with pytest.raises(InvalidException):
+        await rate_limits.reset_rate_limit(
+            session=session,
+            user=user,
+            ctx=_ctx(10),
+            request=_request(cfg),
+            body=RateLimitResetCreate(kind="weekly", description="x"),
+        )
+    assert session.added == [] and reader.deleted == []

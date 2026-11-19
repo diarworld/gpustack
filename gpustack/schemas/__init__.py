@@ -100,6 +100,9 @@ from gpustack.schemas.resource_events import (  # noqa: F401  table registration
     ResourceEvent,
     ResourceEventArchive,
 )
+from gpustack.schemas.gateway_rate_limit_resets import (  # noqa: F401  table registration
+    GatewayRateLimitReset,
+)
 from gpustack.schemas.common import PaginatedList
 from gpustack.schemas.benchmark import (
     ModelInstanceRuntimeInfo,
@@ -297,6 +300,7 @@ __all__ = [
     "MeteredUsageArchive",
     "ResourceEvent",
     "ResourceEventArchive",
+    "GatewayRateLimitReset",
     "ModelFile",
     "ModelFileCreate",
     "ModelFileUpdate",

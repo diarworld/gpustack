@@ -154,13 +154,15 @@ their `reset_seconds` counts down to the boundary in the deployment timezone.
 ### Counter Recovery
 
 The plugin's Redis counters are the only enforcement state: when the
-rate-limit Redis loses them — a fresh instance, a flush without persistence —
-calendar quotas restart from zero and users who already spent their day /
-week / month budget get it back for the rest of the window. To close that
-gap, the server replays once at startup the consumption it already recorded
-in `model_usage_details` into the very counters the plugin reads, and only
-into counters that do not exist yet — a live counter is never touched, so
-against a healthy Redis this is a cheap no-op.
+rate-limit Redis loses them — a fresh instance, a failover, a flush without
+persistence — calendar quotas restart from zero and users who already spent
+their day / week / month budget get it back for the rest of the window. To
+close that gap, the server replays the consumption it already recorded in
+`model_usage_details` into the very counters the plugin reads, and only
+into counters that do not exist yet — a live counter is never touched. The
+pass runs on a loop (every 5 minutes): each cycle probes the counters with
+one pipelined EXISTS, and the details scan only runs when something is
+actually missing, so a Redis flush heals itself within one interval.
 
 Not exact by design:
 
@@ -172,16 +174,35 @@ Not exact by design:
   aborted or untracked requests can leave a rebuilt total slightly off the
   lost one.
 
-A marker key written after a successful pass (TTL past the longest calendar
-window) short-circuits the scan while the Redis keeps its data; losing the
-Redis loses the marker, which re-arms the rebuild. Enabling persistence
-(AOF / RDB) on the rate-limit Redis avoids the rebuild entirely.
+Enabling persistence (AOF / RDB) on the rate-limit Redis avoids the rebuild
+entirely.
 
 !!! note
 
     The endpoint and the rebuilder talk to the same Redis the gateway writes
     its counters to — `gateway_rate_limit.redis` — not the server's
     top-level `redis_url`.
+
+### Resetting a Budget
+
+The weekly and monthly budget cards on the Usage page carry a reset
+button: pressing it deletes the user's counters of that window kind, so
+the budget restarts from zero mid-window without waiting for the natural
+boundary. Every press is recorded in `gateway_rate_limit_resets` — the
+reason note is required and lands in the row, together with the user, the
+press date and, when an admin pressed on someone's behalf, who did.
+
+Two presses per window are free; the quota floats with the presses
+themselves — two resets inside one week make the next one available a
+week after the first press, not on the next calendar boundary. Once both
+are spent the button disables until the oldest press ages out of the
+window. A platform-wide admin is not quota-limited: their presses (their
+own budget or another user's) are recorded but never consume the user's
+own allowance.
+
+The counter rebuild cooperates with resets: usage recorded before the
+latest reset of a window kind is forgiven, so a rebuild after a Redis
+loss resumes from the reset instead of resurrecting the forgiven spend.
 
 ## Metrics
 
