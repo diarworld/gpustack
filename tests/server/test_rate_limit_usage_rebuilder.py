@@ -101,6 +101,7 @@ class FakeAsyncSession:
     def __init__(self, queue):
         self._queue = queue
         self.calls = 0
+        self.statements = []
 
     async def __aenter__(self):
         return self
@@ -109,6 +110,7 @@ class FakeAsyncSession:
         return False
 
     async def exec(self, statement):
+        self.statements.append(statement)
         item = self._queue[self.calls % len(self._queue)]
         self.calls += 1
         return FakeResult(item)
@@ -274,15 +276,20 @@ async def test_warmup_replaces_a_stale_counter(frozen_now, monkeypatch):
     day_key = key_windows(rlc, key42)[0].redis_key
     rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
-    client, _, _ = await _run(
-        monkeypatch,
-        rlc,
-        [user7],
-        [key42],
-        rows,
-        existing={day_key},
+    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
+    monkeypatch.setattr(
+        rebuilder,
+        "reader_from_config",
+        lambda cfg: SimpleNamespace(client=FakeRedis()),
     )
-    # The stale live member the gateway wrote is gone with the counter.
+    rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
+    client = FakeRedis(existing={day_key})
+    # The gateway's own live member: whatever the young counter counted.
+    client.zsets[day_key] = {"<uuid-of-live-request>|77": 5}
+
+    await rebuild._rebuild(rlc, client)
+
     assert _tokens(client.zsets[day_key]) == {
         f"rebuild-7-42-{hour_ts(datetime(2026, 11, 19, 9, 0))}|150": (
             150,
@@ -426,6 +433,33 @@ async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
     await rebuild._rebuild(rlc, client)
     assert rebuild._warmed is True
     assert _tokens(client.zsets[day_key])
+
+
+@pytest.mark.asyncio
+async def test_scan_bounds_follow_the_local_date(frozen_now, monkeypatch):
+    """``model_usage_details.date`` holds the deployment timezone's date,
+    which runs ahead of UTC: at 12:00 UTC in a +13 timezone it is already
+    tomorrow locally, and the locally-dated rows of that day must be in
+    the scan range."""
+    rlc = _cfg(timezone="Pacific/Auckland")
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    # 11:30 UTC = 00:30 local (Nov 20): the row is dated tomorrow-UTC.
+    rows = [_row(7, 42, datetime(2026, 11, 19, 11, 30), 300, 0)]
+
+    client, shared, rebuild = await _run(monkeypatch, rlc, [user7], [key42], rows)
+
+    # The scan's upper date bound is the local date, not the UTC one.
+    rows_statement = next(
+        str(s.compile(compile_kwargs={"literal_binds": True}))
+        for s in shared.statements
+        if "model_usage_details" in str(s)
+    )
+    assert "2026-11-20" in rows_statement
+
+    # And the row itself landed in the key's day counter.
+    day_key = key_windows(rlc, key42)[0].redis_key
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[day_key]).values()) == 300
 
 
 @pytest.mark.asyncio

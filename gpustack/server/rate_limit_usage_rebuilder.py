@@ -40,6 +40,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlmodel import select
@@ -119,6 +120,10 @@ class RateLimitUsageRebuilder:
     def __init__(self, config: Config):
         self._config = config
         self._warmed = False
+        rlc = config.gateway_rate_limit
+        # The details table's ``date`` column holds this timezone's calendar
+        # date, so the scan bounds follow it, not UTC.
+        self._timezone = rlc.timezone if rlc is not None else "UTC"
 
     async def start(self):
         if self._config.gateway_rate_limit is None:
@@ -241,15 +246,19 @@ class RateLimitUsageRebuilder:
         than resurrect it. ``cutoffs`` tells which (user, kind) pairs the
         ``forgiven`` map governs; the rest read ``plain``.
 
-        The range rides the indexed ``date`` column; the in-window filter
-        runs per row on the coalesced completion stamp, so rows whose
-        ``date`` sits a timezone shift away from the window still classify
-        correctly. Keyless rows (UI traffic) bucket under ``api_key_id``
-        None and feed only user-level combos.
+        The range rides the indexed ``date`` column, which holds the
+        deployment timezone's calendar date -- it can sit a day ahead of or
+        behind the UTC date, so the bounds are padded and the real filter
+        runs per row on the coalesced completion stamp. Keyless rows (UI
+        traffic) bucket under ``api_key_id`` None and feed only user-level
+        combos.
         """
+        local_now = now.astimezone(ZoneInfo(self._timezone))
         min_date = (
-            datetime.fromtimestamp(min_start_ts, timezone.utc) - timedelta(days=1)
-        ).date()
+            (datetime.fromtimestamp(min_start_ts, timezone.utc) - timedelta(days=1))
+            .astimezone(ZoneInfo(self._timezone))
+            .date()
+        )
         async with async_session() as session:
             resets = (await session.exec(select(GatewayRateLimitReset))).all()
             rows = (
@@ -266,7 +275,7 @@ class RateLimitUsageRebuilder:
                         ModelUsageDetails.completion_token_count,
                     ).where(
                         ModelUsageDetails.date >= min_date,
-                        ModelUsageDetails.date <= now.date(),
+                        ModelUsageDetails.date <= local_now.date(),
                     )
                 )
             ).all()
@@ -323,7 +332,7 @@ class RateLimitUsageRebuilder:
         the rebuild can only add. ZADD merges into a member set either
         way, never overwriting a live member.
         """
-        commands: List[Tuple[str, Optional[Dict[str, int]]]] = []
+        commands: List[Tuple[str, Dict[str, int]]] = []
         for redis_key in targets:
             spec, user_id, api_key_id = specs[redis_key]
             start_ts = starts[redis_key]
@@ -361,15 +370,16 @@ class RateLimitUsageRebuilder:
             if not members and not replace:
                 # Nothing to restore for a missing counter.
                 continue
-            # None members = DEL only: the stale counter must not survive
-            # the warm-up even when the database has nothing in the window.
-            commands.append((redis_key, members or None))
+            commands.append((redis_key, members))
 
         for i in range(0, len(commands), ZADD_BATCH):
             pipe = client.pipeline(transaction=False)
             for redis_key, members in commands[i : i + ZADD_BATCH]:
-                if members is None:
+                if replace:
+                    # The database picture replaces whatever survived: a
+                    # counter that kept only its recent history would stay
+                    # undercounted if the rebuild merely merged into it.
                     pipe.delete(redis_key)
-                else:
+                if members:
                     pipe.zadd(redis_key, members)
             await pipe.execute(raise_on_error=True)
