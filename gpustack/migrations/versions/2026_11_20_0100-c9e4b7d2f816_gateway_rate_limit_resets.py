@@ -36,6 +36,9 @@ def upgrade() -> None:
         sa.Column('reset_at', UTCDateTime(), nullable=False),
         sa.Column('reset_by_user_id', sa.Integer(), nullable=True),
         sa.Column('description', sa.Text(), nullable=False),
+        # The TimestampsMixin column set: soft-delete marker, unused here
+        # (resets are immutable) but part of the model the ORM selects.
+        sa.Column('deleted_at', UTCDateTime(), nullable=True),
         sa.Column('created_at', UTCDateTime(), nullable=False),
         sa.Column('updated_at', UTCDateTime(), nullable=False),
         sa.PrimaryKeyConstraint('id'),
