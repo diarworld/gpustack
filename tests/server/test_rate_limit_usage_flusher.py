@@ -387,9 +387,10 @@ async def test_second_flush_updates_the_same_rows(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_query_windows_are_not_persisted(frozen_now, monkeypatch):
-    """Only token windows land: the per-minute request counter is skipped
-    while the same combo's per-minute token window is kept."""
+async def test_per_minute_windows_are_not_persisted(frozen_now, monkeypatch):
+    """Only long token windows land: the per-minute request AND token
+    counters are skipped, while the same sweep's weekly sliding window
+    still produces its row."""
     redis = FakeRedis(
         _seed(
             {
@@ -399,15 +400,18 @@ async def test_query_windows_are_not_persisted(frozen_now, monkeypatch):
                 f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:60s": [
                     (10, "t", 500)
                 ],
+                f"{rate_limit_plugin_name}|user-7|consumer=gpustack-7|t:604800s": [
+                    (30, "w", 900)
+                ],
             }
         )
     )
-    session = FakeSession(users=[_user(7)])
+    session = FakeSession(users=[_user(7, weekly=100_000)])
     await _run_cycle(monkeypatch, _flusher(_cfg()), redis, session)
 
-    assert [(row.kind, row.period, row.usage) for row in session.added] == [
-        ("token_rolling", "60s", 500)
-    ]
+    assert [
+        (row.combo_name, row.kind, row.period, row.usage) for row in session.added
+    ] == [("user-7", "token_rolling", "604800s", 900)]
 
 
 @pytest.mark.asyncio

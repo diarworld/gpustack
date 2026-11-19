@@ -29,6 +29,7 @@ from sqlmodel import select
 from gpustack.config.config import Config
 from gpustack.gateway.rate_limit_usage import (
     DEFAULT_PLAN_COMBO,
+    ROLLING_TOKEN_PERIOD,
     RULE_NAME,
     RateLimitUsageReader,
     RateLimitWindowSpec,
@@ -45,10 +46,14 @@ from gpustack.server.db import async_session
 
 logger = logging.getLogger(__name__)
 
-# Only token windows are persisted. The query windows are per-minute request
-# counts: they would churn a row every cycle and say nothing the model_usages
-# time series does not already record. Retention bounds the rest.
+# Only token windows are persisted, and only their long ones: per-minute
+# windows (request counts and per-minute tokens alike) churn a row every
+# cycle and are already covered by model_usages, while the weekly and
+# calendar snapshots are the table's analytics payload. Retention bounds
+# the rest.
 FLUSH_KINDS = ("token_rolling", "token_calendar")
+# The per-minute rolling token period, from the shared period vocabulary.
+MINUTE_PERIOD = ROLLING_TOKEN_PERIOD
 
 # Snapshots older than this are pruned in the same pass that upserts.
 RETENTION_DAYS = 90
@@ -320,7 +325,7 @@ class RateLimitUsageFlusher:
                 if parsed is None:
                     logger.debug("Skipping unparseable rate-limit key: %s", key)
                     continue
-                if parsed.kind not in FLUSH_KINDS:
+                if parsed.kind not in FLUSH_KINDS or parsed.period == MINUTE_PERIOD:
                     continue
                 found.append((key, parsed))
             if cursor == 0:
