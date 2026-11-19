@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import pytest
+
 from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS, rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import (
@@ -134,6 +136,23 @@ def test_unlimited_key_falls_back_to_user_capture_identity():
     ]
 
 
+def test_legacy_token_key_governs_fallback_windows():
+    """Deployment-token rows never bind a key combo: the reconciler skips
+    them when publishing combos, so their requests are governed by the
+    fallback group exactly like unkeyed traffic -- even when the row carries
+    explicit limits."""
+    key = _KeyStub(id=42, access_key="", user_id=6, rpm_limit=5)
+    windows = expected_windows(_cfg(), 6, key, 100_000, 200_000)
+    assert all("key-42|" not in w.redis_key for w in windows)
+    # Same window set an unkeyed request path gets.
+    assert [w.redis_key for w in windows] == [
+        w.redis_key for w in expected_windows(_cfg(), 6, None, 100_000, 200_000)
+    ]
+    # source_for classifies by the key row's own limits, not by which combo
+    # the reconciler published.
+    assert source_for(key, 100_000, 200_000) == "key"
+
+
 def test_source_for():
     limited = _KeyStub(id=1, access_key="ak-1", user_id=6, rpm_limit=5)
     unlimited = _KeyStub(id=2, access_key="ak-2", user_id=6)
@@ -161,12 +180,17 @@ def test_calendar_window_seconds_honours_timezone():
 
 
 def test_calendar_window_seconds_rejects_rolling_periods():
-    import pytest
-
     with pytest.raises(ValueError):
         calendar_window_seconds(
             "60s", datetime(2026, 11, 19, tzinfo=timezone.utc), "UTC"
         )
+
+
+def test_calendar_window_seconds_rejects_naive_datetime():
+    """A naive stamp would be silently read as server-local time, shifting
+    every calendar boundary."""
+    with pytest.raises(ValueError):
+        calendar_window_seconds("each_day", datetime(2026, 11, 19, 12, 0, 0), "UTC")
 
 
 def test_no_windows_when_nothing_configured():

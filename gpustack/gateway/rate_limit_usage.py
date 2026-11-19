@@ -14,9 +14,9 @@ where ``kind`` is ``q`` for rolling query windows, ``t`` for token windows
 A key that is off by one byte reads an empty counter, so the golden strings
 in ``tests/gateway/test_rate_limit_usage.py`` pin the layout.
 
-Combo semantics mirror the reconciler (``gpustack.server.
-gateway_rate_limit_reconciler``), whose group rules decide which keys exist
-for a given request path:
+Combo semantics mirror the reconciler
+(``gpustack.server.gateway_rate_limit_reconciler``), whose group rules decide
+which keys exist for a given request path:
 
 * a key with any explicit limit binds a non-fallback combo -- the fallback
   group is suppressed for its requests, so only that combo's windows exist;
@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 
 from gpustack.config.config import GatewayRateLimitConfig
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS, rate_limit_plugin_name
-from gpustack.security import gateway_consumer_identity
+from gpustack.security import gateway_consumer_identity, is_legacy_token_access_key
 
 if TYPE_CHECKING:
     from gpustack.schemas.api_keys import ApiKey
@@ -58,6 +58,8 @@ ROLLING_WEEKLY_PERIOD = f"{WEEK_IN_SECONDS}s"
 DAY_PERIOD = "each_day"
 MONTH_PERIOD = "each_month"
 
+# The plugin's full calendar vocabulary: the pair above plus each_year, which
+# the plugin declares but the reconciler never publishes.
 _CALENDAR_PERIODS = (DAY_PERIOD, MONTH_PERIOD, "each_year")
 
 
@@ -289,11 +291,20 @@ def expected_windows(
     windows; otherwise the fallback group governs, giving the default plan's
     windows followed by the user budget combo's.
 
+    Deployment-token rows (legacy access keys) count as keyless: the
+    reconciler never publishes a ``key-<id>`` combo for them, so their
+    requests are governed by the fallback group regardless of what limits
+    the row carries.
+
     Calendar windows carry ``window_seconds=None``: their length is not
     fixed, it follows the boundary in ``rlc.timezone`` (see
     :func:`calendar_window_seconds`).
     """
-    if key is not None and _has_explicit_limits(key):
+    if (
+        key is not None
+        and not is_legacy_token_access_key(key.access_key)
+        and _has_explicit_limits(key)
+    ):
         return _key_windows(rlc, key, weekly, monthly)
     return _default_plan_windows(rlc, user_id) + _user_budget_windows(
         user_id, weekly, monthly
@@ -323,6 +334,8 @@ def calendar_window_seconds(period: str, now: datetime, timezone_name: str) -> i
     arithmetic runs on aware datetimes in the target zone, matching the
     plugin's own ``periodEnd`` computation.
     """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
     if period not in _CALENDAR_PERIODS:
         raise ValueError(f"unknown calendar period: {period!r}")
     local = now.astimezone(ZoneInfo(timezone_name))
