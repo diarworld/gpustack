@@ -32,7 +32,9 @@ on inference paths (the standard OpenAI/Anthropic endpoints and
 
 ## Deployment-Wide Defaults
 
-Defaults apply to every consumer and are set in the server config file:
+Defaults apply to every consumer and are set in the server config file (the
+YAML file the server loads through `--config-file` or the
+`GPUSTACK_CONFIG_FILE` environment variable):
 
 ```yaml
 gateway_rate_limit:
