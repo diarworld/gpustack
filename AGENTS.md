@@ -157,6 +157,35 @@ Rules:
   new dependencies, and breaking API changes when present. Mention unaffected areas
   only when relevant to understanding the change.
 
+## Ops
+
+Operational artifacts for the deployed clusters are kept **outside this repository**
+in `C:\Users\dmitry\Projects\gpustack-ops\`, not here. This repo holds product source
+only; do not commit deployment material into it.
+
+```
+gpustack-ops/
+  gpustack-install-runbook.md   the Deckhouse install guide for this environment
+  deploy/          Helm values, server/worker/ingress manifests, model yamls
+  debug/           CDI and GPU-runtime debugging, image-mirroring jobs, ad-hoc pods
+  mirror/          image mirroring Jobs
+  secrets/         live secrets and DB dumps — never commit or log these
+```
+
+Rules:
+
+- `secrets/` holds real credentials (OIDC client secret, HuggingFace token,
+  `GPUSTACK_TOKEN`, OpenAPI keys) and a full database dump. Never read them into a
+  response, never echo them to a log, and never `git add` them. Rotate any secret that
+  leaked outside the repo.
+- `secrets/` and `deploy/helm-values.yaml` both embed the same OIDC secret; treat
+  `helm-values.yaml` as sensitive too.
+- Charts are released from this repo (packaged with the version stamped from the
+  placeholder) to the Artifactory Helm repo `helm-local-dataplatform`; the
+  `dataplatform` Helm repo is registered locally. See the runbook for the flow.
+- A `.gitignore` change is intentionally **not** tracked — protection comes from the
+  artifacts living outside the repo, not from ignore rules.
+
 ## Notes
 
 If something here contradicts what the code actually does, the code wins — and fixing
