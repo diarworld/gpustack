@@ -27,16 +27,30 @@ class TestRateLimitPlugin:
         assert rate_limit_plugin(cfg=make_cfg(GatewayRateLimitConfig())) is None
 
     def test_enabled_without_limits_publishes_a_passthrough_base(self):
-        """Enabling with no limits configured is how the reconciler takes
-        ownership of the combinations before any default exists: the plugin
-        must be on the gateway with its base fields, but not declare an empty
-        combinations list the reconciler would have to diff against."""
-        result = build(enabled=True)
+        """Enabling with every default off (``default_concurrency=0``) is how
+        the reconciler takes ownership of the combinations before any default
+        exists: the plugin must be on the gateway with its base fields, but
+        not declare an empty combinations list the reconciler would have to
+        diff against."""
+        result = build(enabled=True, default_concurrency=0)
         assert result is not None
         name, spec = result
         assert name == rate_limit_plugin_name
         assert "limit_combinations" not in spec.defaultConfig
         assert spec.defaultConfig["rule_name"] == rate_limit_plugin_name
+
+    def test_concurrency_default_alone_publishes_one_fallback_combo(self):
+        """The concurrency cap defaults to 1, so a freshly enabled
+        deployment enforces something even with every other axis unset:
+        the fallback combo carries only the concurrency block."""
+        _, spec = build(enabled=True)
+        (combo,) = spec.defaultConfig["limit_combinations"]
+        assert combo["name"] == "default-plan"
+        assert combo["is_fallback"] is True
+        assert combo["concurrency_limits"] == {"default": 1}
+        assert "query_limits" not in combo
+        assert "token_limits" not in combo
+        assert "token_quota" not in combo
 
     def test_sits_in_the_reserved_slot_after_ext_auth_and_ai_statistics(self):
         """Priority 600: ext-auth (360) has injected the consumer identity by

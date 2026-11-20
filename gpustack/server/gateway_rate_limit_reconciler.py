@@ -16,10 +16,13 @@ fallback) decide the layout:
   least one key, matching the user's consumer shapes via a capture that
   merges the API-key and UI forms into one shared bucket. Carries everything
   that caps the user's keys together: requests and tokens per minute (the
-  user's setting or the deployment default) and the weekly / monthly token
+  user's setting or the deployment default), the weekly / monthly token
   budgets (setting only -- the monthly falls back to the deployment
-  default). Non-fallback so it ANDs with the key combos below: a user cap
-  must bind every key, explicitly-limited or not.
+  default), and the per-model in-flight caps (the deployment
+  ``default_concurrency`` restated as the block default plus the user's
+  per-model overrides; admins carry no concurrency block at all, which is
+  what exempts them). Non-fallback so it ANDs with the key combos below: a
+  user cap must bind every key, explicitly-limited or not.
 * **Key combos (non-fallback).** One per API key, matching that key's exact
   consumer string, carrying one calendar day quota -- the key's own
   ``daily_token_limit`` or the deployment default. Unset fields inherit
@@ -52,6 +55,7 @@ from gpustack.gateway.rate_limit import (
     default_plan_combination,
     rate_limit_plugin_name,
     rate_limit_spec,
+    user_concurrency_limits,
 )
 from gpustack.gateway.utils import ensure_wasm_plugin
 from gpustack.schemas.api_keys import ApiKey
@@ -135,8 +139,14 @@ def user_limits_combination(user: Principal, cfg: Config) -> Optional[Dict[str, 
     )
     if monthly:
         combo["token_quota"] = {"each_month": monthly}
+    concurrency = user_concurrency_limits(user, rlc)
+    if concurrency:
+        combo["concurrency_limits"] = concurrency
     if not (
-        "query_limits" in combo or "token_limits" in combo or "token_quota" in combo
+        "query_limits" in combo
+        or "token_limits" in combo
+        or "token_quota" in combo
+        or "concurrency_limits" in combo
     ):
         return None
     return combo

@@ -26,6 +26,8 @@ from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowSpec,
     default_plan_windows,
     key_windows,
+    model_concurrency_specs,
+    read_concurrency,
     read_windows,
     reader_from_config,
     source_for,
@@ -35,6 +37,7 @@ from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
 from gpustack.schemas.rate_limits import (
     ApiKeyRateLimits,
+    ModelConcurrencyUsage,
     RateLimitResetCreate,
     RateLimitResetStatus,
     RateLimitWindowUsage,
@@ -244,6 +247,22 @@ async def get_rate_limits(
         # Local mode keeps no counters: windows render with limits only.
         states = [None] * len(all_specs)
 
+    # Per-model in-flight caps with their live slot counts. The specs come
+    # from the user's own ``model_concurrency_limits`` (empty for admins --
+    # exempt -- and users without overrides); local mode has no
+    # server-readable counters, so ``running`` stays unset there too.
+    concurrency_specs = model_concurrency_specs(rlc, target.id, target)
+    concurrency_running: List[Optional[int]] = [None] * len(concurrency_specs)
+    if concurrency_specs and mode == "redis":
+        reader = _reader(request, cfg)
+        counts, concurrency_error = await read_concurrency(
+            reader, [spec.redis_key for spec in concurrency_specs]
+        )
+        if concurrency_error is not None:
+            usage_error = usage_error or concurrency_error
+        else:
+            concurrency_running = list(counts)
+
     # Reset-button state only exists where there are counters to clear;
     # in local mode the plugin keeps nothing a reset could forgive.
     resets = None
@@ -268,6 +287,14 @@ async def get_rate_limits(
             monthly_limit=target.monthly_token_limit,
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
+            ],
+            model_concurrency=[
+                ModelConcurrencyUsage(
+                    model=spec.model,
+                    limit=spec.limit,
+                    running=running,
+                )
+                for spec, running in zip(concurrency_specs, concurrency_running)
             ],
             resets=resets,
         ),

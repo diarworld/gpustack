@@ -27,6 +27,14 @@ RPM ve TPM kısa patlamalara karşı korur; haftalık ve aylık bütçeler süre
 
 Kartların altındaki tablo, API anahtarlarınızın her birini günlük token hakkına karşı gösterir — anahtarın kendi günlük limiti veya dağıtım varsayılanı — gün için kullanılan / limit değeriyle birlikte. Günlük pencere takvime hizalıdır ve dağıtım saat diliminde gece yarısı sıfırlanır.
 
+## Model Başına Eşzamanlı İstek { #model-concurrency }
+
+Hız ve bütçe pencerelerinin ötesinde, ağ geçidi isteklerinizin — tüm API anahtarlarınız ve oturumlarınız genelinde — tek bir model üzerinde aynı anda çalışabileceği sayıyı sınırlar. Dağıtım varsayılanı **1**'dir: bir modele yönelik bir istek hâlâ çalışırken, aynı modele yönelik ikinci paralel istek, ilki bitene kadar `429 Too Many Requests` ile reddedilir. Slot, istek tamamlanır tamamlanmaz serbest kalır — pencere beklenmez.
+
+Her model ayrı sayılır: bir modeldeki devam eden istek, diğer modellere yapılan istekleri engellemez. Yöneticiler bu sınıra tabi değildir.
+
+Varsayılan ve model başına geçersiz kılmalar, yönetici tarafından hesabınızda ayarlanır. Açık bir geçersiz kılması olmayan model dağıtım varsayılanını izler; `0` geçersiz kırması o model için sınırı tamamen kaldırır.
+
 ## Sayılar Nereden Geliyor { #where-the-numbers-come-from }
 
 - **Dağıtım varsayılanları** — yönetici tarafından herkes için ayarlanır: RPM, TPM, günlük ve aylık token'lar. Ayarlanmamış bir varsayılan, o pencerenin sınırlandırılmadığı anlamına gelir.

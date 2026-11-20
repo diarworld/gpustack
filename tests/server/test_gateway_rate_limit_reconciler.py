@@ -36,6 +36,10 @@ def make_user(id=42, **limits):
     user.tpm_limit = limits.get("tpm_limit")
     user.weekly_token_limit = limits.get("weekly_token_limit")
     user.monthly_token_limit = limits.get("monthly_token_limit")
+    # Explicit: a MagicMock attribute would auto-create a truthy is_admin
+    # and silently turn every fixture user into an exempt admin.
+    user.is_admin = limits.get("is_admin", False)
+    user.model_concurrency_limits = limits.get("model_concurrency_limits")
     return user
 
 
@@ -131,7 +135,54 @@ class TestUserLimitsCombination:
         assert combo["token_quota"] == {"each_month": 50_000_000}
 
     def test_nothing_configured_anywhere_renders_nothing(self):
-        assert user_limits_combination(make_user(), make_cfg()) is None
+        # With the concurrency cap off (0) and no rate fields anywhere, the
+        # combo renders nothing; the concurrency default of 1 is what keeps
+        # a combo alive in every other configuration.
+        assert (
+            user_limits_combination(make_user(), make_cfg(default_concurrency=0))
+            is None
+        )
+
+    def test_concurrency_default_inherits_into_the_user_combo(self):
+        """The user combo suppresses the fallback plan, so the deployment
+        concurrency default must be restated on it -- inheriting by omission
+        would leave key-holding users uncapped."""
+        combo = user_limits_combination(make_user(), make_cfg())
+        assert combo["concurrency_limits"] == {"default": 1}
+
+    def test_per_model_overrides_land_in_the_models_map(self):
+        user = make_user(model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
+        combo = user_limits_combination(user, make_cfg())
+        assert combo["concurrency_limits"] == {
+            "default": 1,
+            "models": {"glm-5.3-flash": 4, "free": 0},
+        }
+
+    def test_zero_default_with_overrides_caps_only_named_models(self):
+        """``default_concurrency=0`` turns the deployment cap off; a user's
+        per-model map must still cap exactly the models it names."""
+        user = make_user(model_concurrency_limits={"glm-5.3-flash": 2})
+        combo = user_limits_combination(user, make_cfg(default_concurrency=0))
+        assert combo["concurrency_limits"] == {"models": {"glm-5.3-flash": 2}}
+
+    def test_admins_are_exempt_by_omission(self):
+        """A non-fallback match suppresses the fallback plan, so an admin
+        combo without the concurrency block exempts the account entirely --
+        even when per-model overrides linger on the row."""
+        user = make_user(is_admin=True, model_concurrency_limits={"glm-5.3-flash": 4})
+        combo = user_limits_combination(user, make_cfg(default_rpm=10))
+        assert "concurrency_limits" not in combo
+
+    def test_concurrency_alone_keeps_the_combo_alive(self):
+        """A user with no rate fields or budgets must still get a combo once
+        the deployment concurrency cap is on: their requests would otherwise
+        fall through to the fallback plan and lose the per-user bucket."""
+        combo = user_limits_combination(make_user(), make_cfg())
+        assert combo["name"] == "user-42"
+        assert "query_limits" not in combo
+        assert "token_limits" not in combo
+        assert "token_quota" not in combo
+        assert combo["concurrency_limits"] == {"default": 1}
 
 
 class TestFitCombinations:
@@ -191,9 +242,11 @@ class TestReconcileSpecDiff:
         assert combo["is_fallback"] is True
 
     def test_no_combinations_leaves_the_base_without_the_key(self):
-        """No defaults configured and an empty database: the plugin stays a
-        passthrough instead of enforcing an empty plan."""
-        spec = reconcile_spec_diff(None, make_cfg(), [])
+        """Every default off (``default_concurrency=0``) and an empty
+        database: the plugin stays a passthrough instead of enforcing an
+        empty plan. With the concurrency default of 1 the default plan is
+        never empty."""
+        spec = reconcile_spec_diff(None, make_cfg(default_concurrency=0), [])
         assert "limit_combinations" not in spec.defaultConfig
 
 

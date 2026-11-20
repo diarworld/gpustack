@@ -68,7 +68,16 @@ def _ctx(current_principal_id) -> SimpleNamespace:
     return SimpleNamespace(current_principal_id=current_principal_id)
 
 
-def _user(id, *, is_admin=False, weekly=None, monthly=None, rpm=None, tpm=None) -> User:
+def _user(
+    id,
+    *,
+    is_admin=False,
+    weekly=None,
+    monthly=None,
+    rpm=None,
+    tpm=None,
+    model_concurrency_limits=None,
+) -> User:
     return User(
         id=id,
         name=f"user-{id}",
@@ -77,6 +86,7 @@ def _user(id, *, is_admin=False, weekly=None, monthly=None, rpm=None, tpm=None) 
         tpm_limit=tpm,
         weekly_token_limit=weekly,
         monthly_token_limit=monthly,
+        model_concurrency_limits=model_concurrency_limits,
     )
 
 
@@ -179,12 +189,23 @@ class FakeReader:
     """Records the specs it is asked to read; returns the seeded state for
     keys that have one (a default otherwise). With ``error`` set, every
     key WITHOUT a seeded state raises — which is what makes a mixed batch:
-    some reads succeed, some fail."""
+    some reads succeed, some fail. Concurrency counts are seeded the same
+    way via ``concurrency`` (default 0), with ``concurrency_error`` failing
+    the whole batch."""
 
-    def __init__(self, states=None, error=None):
+    def __init__(
+        self,
+        states=None,
+        error=None,
+        concurrency=None,
+        concurrency_error=None,
+    ):
         self.specs = []
         self._states = states or {}
         self._error = error
+        self.concurrency_keys = []
+        self._concurrency = concurrency or {}
+        self._concurrency_error = concurrency_error
         self.deleted = []
         self.client = SimpleNamespace(delete=self._delete)
 
@@ -203,6 +224,12 @@ class FakeReader:
             else:
                 states.append(RateLimitWindowState(used=3, reset_seconds=10))
         return states
+
+    async def concurrency_counts(self, keys):
+        self.concurrency_keys.extend(keys)
+        if self._concurrency_error is not None:
+            raise self._concurrency_error
+        return [self._concurrency.get(key, 0) for key in keys]
 
 
 class FakeRedis:
@@ -366,6 +393,86 @@ async def test_admin_unknown_user_is_404(frozen_now):
             user_id=999,
         )
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_model_concurrency_reports_overrides_with_running_counts(
+    frozen_now, monkeypatch
+):
+    """The per-model block mirrors the user's ``model_concurrency_limits``
+    with live slot counts; the keys read are the plugin's concurrency
+    layout under the user limit combo."""
+    cfg = _redis_cfg()
+    user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
+    session = FakeSession(users=[user], keys=[])
+    reader = FakeReader(
+        concurrency={
+            "gpustack-rate-limit|user-7|consumer=gpustack-7|c:glm-5.3-flash": 2,
+            "gpustack-rate-limit|user-7|consumer=gpustack-7|c:free": 0,
+        }
+    )
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+
+    assert [(m.model, m.limit, m.running) for m in response.user.model_concurrency] == [
+        ("free", 0, 0),
+        ("glm-5.3-flash", 4, 2),
+    ]
+    assert sorted(reader.concurrency_keys) == [
+        "gpustack-rate-limit|user-7|consumer=gpustack-7|c:free",
+        "gpustack-rate-limit|user-7|consumer=gpustack-7|c:glm-5.3-flash",
+    ]
+    assert response.usage_error is None
+
+
+@pytest.mark.asyncio
+async def test_model_concurrency_admin_and_no_overrides_get_nothing(
+    frozen_now, monkeypatch
+):
+    """Admins are exempt (nothing enforced), and a user without overrides
+    has no itemized per-model caps: both get an empty block and no
+    concurrency reads at all."""
+    cfg = _redis_cfg()
+    admin = _user(1, is_admin=True, model_concurrency_limits={"glm": 4})
+    plain = _user(7)
+    session = FakeSession(users=[admin, plain])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    admin_response = await rate_limits.get_rate_limits(
+        session=session, user=admin, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+    plain_response = await rate_limits.get_rate_limits(
+        session=session, user=plain, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+
+    assert admin_response.user.model_concurrency == []
+    assert plain_response.user.model_concurrency == []
+    assert reader.concurrency_keys == []
+
+
+@pytest.mark.asyncio
+async def test_model_concurrency_failure_fails_open(frozen_now, monkeypatch):
+    """A failed concurrency read blanks the running counts instead of
+    mixing fresh and stale numbers, and surfaces the same usage_error
+    channel the window reads use."""
+    cfg = _redis_cfg()
+    user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4})
+    session = FakeSession(users=[user], keys=[])
+    reader = FakeReader(concurrency_error=ConnectionError("down"))
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+
+    assert response.usage_error == "ConnectionError"
+    assert [(m.model, m.limit, m.running) for m in response.user.model_concurrency] == [
+        ("glm-5.3-flash", 4, None)
+    ]
 
 
 @pytest.mark.asyncio

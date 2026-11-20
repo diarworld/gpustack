@@ -15,6 +15,9 @@ replica.
   at midnight on the deployment timezone (daily) and on the 1st of the month
   (monthly).
 - **Weekly token budgets** — a rolling 7-day window.
+- **Concurrent requests per model** — a cap on how many of a user's requests
+  may run against one model at the same time; a slot is taken while a request
+  runs and freed when its stream ends.
 
 A request that exceeds a limit is rejected at the gateway with
 `429 Too Many Requests` in the OpenAI error format, before any model instance
@@ -45,10 +48,15 @@ gateway_rate_limit:
   default_tpm: 768000
   default_daily_tokens: 10000000
   default_monthly_tokens: 100000000
+  default_concurrency: 1
 ```
 
-All the `default_*` fields are optional; an unset field means no limit of that
-kind. The plugin stays a passthrough until at least one limit is configured.
+All the `default_*` fields except `default_concurrency` are optional; an unset
+field means no limit of that kind. `default_concurrency` defaults to **1** —
+one in-flight request per model per user — because a runaway batch client
+holding dozens of parallel streams is the failure mode the cap exists for; set
+it to `0` to turn the concurrency cap off deployment-wide. Every other field
+stays a passthrough until configured.
 
 Redis must be reachable from the gateway pods. Declare it in the McpBridge
 that serves the gateway (or point `service_name` at a Kubernetes Service
@@ -69,6 +77,41 @@ Explicit limits override the deployment defaults:
 The weekly budget has no deployment-wide default: only accounts with an
 explicit weekly budget are capped on it. Users without explicit budgets and
 keys without explicit limits are governed by the deployment defaults alone.
+
+### Per-Model Concurrency
+
+The `default_concurrency` deployment default (1) caps how many requests one
+user may run against **one model** at the same time: a second parallel
+request to the same model is rejected with 429 while the first is still
+streaming, while requests to different models proceed independently. The
+count is of in-flight requests, not a rate — a slot is acquired when the
+request passes the gateway and released when its stream ends, so a finished
+request frees its slot immediately.
+
+Admins are exempt from the concurrency cap. Per-model overrides are set on
+the user account via `model_concurrency_limits` — a map of model name to
+that model's cap for the account, where `0` means explicit unlimited:
+
+```json
+{
+  "model_concurrency_limits": {
+    "glm-5.3-flash": 4,
+    "qwen3.8-27b": 2,
+    "text-embedding-model": 0
+  }
+}
+```
+
+Models absent from the map inherit `default_concurrency`. An admin can edit
+the map per user in the user settings drawer; changes take effect within one
+reconcile interval (30 seconds by default).
+
+!!! note
+
+    A slot whose release is lost — a gateway crash mid-stream — is reclaimed
+    automatically after an hour (`concurrency_stale_seconds` on the plugin,
+    tunable through `gateway_rate_limit.plugin_config`), so a crashed stream
+    cannot lock a user's slot forever.
 
 Changes take effect within one reconcile interval (30 seconds by default, see
 `GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS`).
@@ -100,7 +143,10 @@ The response carries:
   (rate limiting is on without Redis, so limits come back without counters)
   or `disabled` (the feature is off; the Usage page hides the section).
 - `user` — the user's weekly and monthly token budgets (whichever are set),
-  each with its live window.
+  each with its live window, plus `model_concurrency` — the per-model
+  in-flight caps set on the account (`model_concurrency_limits`), each with
+  its live `running` slot count. Only explicitly named models are itemized;
+  admins (exempt) and users without overrides get an empty list.
 - `api_keys` — one entry per live API key: its explicit `rpm_limit`,
   `tpm_limit` and `daily_token_limit` (unset fields are omitted — they
   inherit the deployment defaults), which limit `source` governs it (`key`,
@@ -212,7 +258,8 @@ The plugin declares three counters per rate-limit decision:
 - `gpustack_rate_limit_rejected_total` — rejected requests, attributed to the
   combination and window that triggered the rejection.
 - `gpustack_rate_limit_value_total` — the spend written into each window
-  bucket (1 per request for query windows, the token count for token windows).
+  bucket (1 per request for query windows and concurrency acquires, the token
+  count for token windows).
 
 The Higress AI statistics plugin fuses these into the route-level Envoy
 metrics, so on the gateway's Prometheus endpoint they are exposed under the

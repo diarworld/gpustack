@@ -35,6 +35,23 @@ quota — the key's own daily limit or the deployment default — with a spent /
 limit readout for the current day. The daily window is calendar-aligned and
 resets at midnight in the deployment timezone.
 
+## Model Concurrency
+
+Beyond the rate and budget windows, the gateway caps how many of your requests
+— across all of your API keys and sessions — may run against a single model at
+the same time. The deployment default is **1**: while one request to a model is
+still running, a second parallel request to the same model is rejected with
+`429 Too Many Requests` until the first one finishes. The slot frees up the
+moment a request completes — there is no window to wait out.
+
+Each model is counted separately: a running request against one model does not
+block requests against other models. Administrators are not subject to this
+limit.
+
+The default and the per-model overrides are set by the administrator on your
+account. A model without an explicit override follows the deployment default,
+and an override of `0` lifts the cap for that model entirely.
+
 ## Where the Numbers Come From
 
 - **Deployment defaults** — set by the administrator for everyone: RPM, TPM,

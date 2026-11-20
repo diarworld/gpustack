@@ -60,6 +60,23 @@ class RateLimitResetStatus(BaseModel):
     next_available_at: Optional[datetime] = None
 
 
+class ModelConcurrencyUsage(BaseModel):
+    """One per-model in-flight cap and where it stands.
+
+    Only models the user's row names explicitly are itemized; every other
+    model inherits the deployment ``default_concurrency`` and has no
+    itemized counter. ``running`` is the live slot count (one member per
+    in-flight request), ``None`` when it could not be read (Redis
+    unavailable, or local mode where the plugin keeps no server-readable
+    counters).
+    """
+
+    model: str
+    # 0 = explicit unlimited for this model.
+    limit: int
+    running: Optional[int] = None
+
+
 class UserRateLimits(BaseModel):
     """The caller's user-level limits and their live windows.
 
@@ -79,6 +96,10 @@ class UserRateLimits(BaseModel):
     weekly_limit: Optional[int] = None
     monthly_limit: Optional[int] = None
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
+    # Per-model in-flight caps (``model_concurrency_limits``) with their
+    # live slot counts; empty for admins (exempt) and users without
+    # per-model overrides.
+    model_concurrency: List[ModelConcurrencyUsage] = Field(default_factory=list)
     # Reset-button state per long token window kind (``weekly`` /
     # ``monthly``), only in redis mode -- in local mode there are no
     # counters a reset could clear.

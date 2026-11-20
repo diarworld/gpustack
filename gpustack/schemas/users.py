@@ -28,7 +28,7 @@ working unchanged.
 
 import re
 from datetime import datetime
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 
 from pydantic import (
     AliasChoices,
@@ -45,6 +45,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from gpustack.schemas.common import ListParams, PaginatedList
 from gpustack.schemas.principals import (  # noqa: F401  re-exports
     AuthProviderEnum,
+    PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME,
+    PRINCIPAL_MAX_CONCURRENCY_MODELS,
     Principal,
     PrincipalType,
 )
@@ -147,6 +149,38 @@ class UserBase(SQLModel):
     tpm_limit: Optional[int] = None
     weekly_token_limit: Optional[int] = None
     monthly_token_limit: Optional[int] = None
+    # Per-model in-flight caps: model name -> cap, 0 = explicit unlimited.
+    # Models absent from the map inherit the deployment
+    # ``gateway_rate_limit.default_concurrency``; admins are exempt from
+    # the cap entirely. Validated against the same bounds the gateway
+    # plugin's ConcurrencySpec accepts, so a combo rendered from this map
+    # is never refused at gateway config parse.
+    model_concurrency_limits: Optional[Dict[str, int]] = None
+
+    @field_validator("model_concurrency_limits")
+    @classmethod
+    def _validate_model_concurrency_limits(
+        cls, value: Optional[Dict[str, int]]
+    ) -> Optional[Dict[str, int]]:
+        if value is None:
+            return None
+        if len(value) > PRINCIPAL_MAX_CONCURRENCY_MODELS:
+            raise ValueError(
+                f"model_concurrency_limits supports at most "
+                f"{PRINCIPAL_MAX_CONCURRENCY_MODELS} models, got {len(value)}"
+            )
+        for name, quota in value.items():
+            if not name or len(name) > PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME:
+                raise ValueError(
+                    f"model_concurrency_limits keys must be 1.."
+                    f"{PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME} characters"
+                )
+            if quota < 0:
+                raise ValueError(
+                    f"model_concurrency_limits[{name!r}] must be >= 0 "
+                    "(0 means unlimited)"
+                )
+        return value
 
 
 class UserCreate(UserBase):

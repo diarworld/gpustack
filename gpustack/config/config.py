@@ -168,6 +168,15 @@ class GatewayRateLimitConfig(BaseModel):
     default_daily_tokens: Optional[int] = Field(default=None, ge=1)
     default_monthly_tokens: Optional[int] = Field(default=None, ge=1)
 
+    # Simultaneous in-flight requests one user may run against one model.
+    # Unlike the axes above, the default is ON (1): a runaway batch client
+    # holding dozens of parallel streams is the failure mode this cap
+    # exists for, and "off unless configured" would leave every deployment
+    # exposed to it. 0 turns the cap off deployment-wide; admins are always
+    # exempt and per-model overrides live on the user row
+    # (``model_concurrency_limits``).
+    default_concurrency: int = Field(default=1, ge=0)
+
     # Extra plugin fields passed through verbatim, for knobs the server does
     # not model (e.g. ``enable_on_path_suffix``). Validated by the plugin at
     # parse time on the gateway; kept separate so this model stays an

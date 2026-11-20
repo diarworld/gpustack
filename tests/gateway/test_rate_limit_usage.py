@@ -7,7 +7,7 @@ endpoint would read keys the plugin never writes.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Optional
+from typing import Dict, Optional
 
 import pytest
 
@@ -21,7 +21,9 @@ from gpustack.gateway.rate_limit_usage import (
     calendar_window_seconds,
     default_plan_windows,
     expected_windows,
+    model_concurrency_specs,
     parse_member_count,
+    read_concurrency,
     read_windows,
     reader_from_config,
     source_for,
@@ -63,6 +65,8 @@ class _UserStub:
     tpm_limit: Optional[int] = None
     weekly_token_limit: Optional[int] = None
     monthly_token_limit: Optional[int] = None
+    is_admin: bool = False
+    model_concurrency_limits: Optional[Dict[str, int]] = None
 
 
 def _shapes(windows):
@@ -116,29 +120,39 @@ class _FakeRedis:
 
 
 class _FakePipeline:
-    """Queues ZRANGEBYSCORE commands and replays them on ``execute`` — the
-    slice of redis-py's pipeline the batched reader uses."""
+    """Queues ZRANGEBYSCORE / ZCARD commands and replays them on ``execute``
+    — the slice of redis-py's pipeline the batched readers use."""
 
     def __init__(self, client):
         self._client = client
         self._commands = []
 
     def zrangebyscore(self, key, lo, hi, withscores=False):
-        self._commands.append((key, lo, hi, withscores))
+        self._commands.append(("zrangebyscore", key, lo, hi, withscores))
+        return self
+
+    def zcard(self, key):
+        self._commands.append(("zcard", key))
         return self
 
     async def execute(self, raise_on_error=True):
         results = []
-        for key, lo, hi, withscores in self._commands:
+        for command in self._commands:
             try:
-                results.append(
-                    self._client._zrangebyscore_sync(key, lo, hi, withscores)
-                )
+                results.append(self._execute_one(command))
             except Exception as exc:
                 if raise_on_error:
                     raise
                 results.append(exc)
         return results
+
+    def _execute_one(self, command):
+        kind = command[0]
+        if kind == "zrangebyscore":
+            _, key, lo, hi, withscores = command
+            return self._client._zrangebyscore_sync(key, lo, hi, withscores)
+        _, key = command
+        return len(self._client._members.get(key, []))
 
 
 def test_default_plan_windows_are_the_fallback_set():
@@ -250,6 +264,84 @@ def test_source_for():
     assert source_for(key) == "user+key"
     assert source_for(legacy) == "user+key"
     assert source_for(None) == "user"
+
+
+def test_model_concurrency_specs_key_layout():
+    """The concurrency keys must be byte-identical to what the plugin
+    writes: the user limit combo, the captured user segment, and the
+    ``c:<model>`` suffix the slot ZSET lives under."""
+    user = _UserStub(model_concurrency_limits={"glm-5.3-flash": 4})
+    specs = model_concurrency_specs(_cfg(), 42, user)
+    assert len(specs) == 1
+    assert specs[0].model == "glm-5.3-flash"
+    assert specs[0].limit == 4
+    assert specs[0].redis_key == (
+        f"{rate_limit_plugin_name}|user-42|consumer=gpustack-42|c:glm-5.3-flash"
+    )
+
+
+def test_model_concurrency_specs_are_sorted_and_override_only():
+    """Deterministic order for the wire payload, and only the models the
+    row names: every other model inherits the deployment default and has
+    no itemized counter to read."""
+    user = _UserStub(
+        model_concurrency_limits={"qwen3.8-27b": 2, "glm-5.3-flash": 4, "free": 0}
+    )
+    specs = model_concurrency_specs(_cfg(), 42, user)
+    assert [(s.model, s.limit) for s in specs] == [
+        ("free", 0),
+        ("glm-5.3-flash", 4),
+        ("qwen3.8-27b", 2),
+    ]
+
+
+def test_model_concurrency_specs_admin_reports_nothing():
+    """Admins are exempt from the cap, so their row reports no enforced
+    per-model limits regardless of what its map holds."""
+    user = _UserStub(is_admin=True, model_concurrency_limits={"glm": 4})
+    assert model_concurrency_specs(_cfg(), 42, user) == []
+
+
+def test_model_concurrency_specs_without_overrides_is_empty():
+    assert model_concurrency_specs(_cfg(), 42, _UserStub()) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrency_counts_pipeline_zcard():
+    """One pipelined ZCARD per key returns the live slot count -- the same
+    number the gateway's check compares against."""
+    key_a = f"{rate_limit_plugin_name}|user-42|consumer=gpustack-42|c:glm"
+    key_b = f"{rate_limit_plugin_name}|user-42|consumer=gpustack-42|c:qwen"
+    client = _FakeRedis(
+        {
+            key_a: [(1000, "req-1|1"), (1005, "req-2|1")],
+            # key_b exists but holds no members: an empty slot set reads 0,
+            # not a missing key.
+            key_b: [],
+        }
+    )
+    counts = await RateLimitUsageReader(client).concurrency_counts([key_a, key_b])
+    assert counts == [2, 0]
+
+
+@pytest.mark.asyncio
+async def test_read_concurrency_fails_open():
+    class _BrokenRedis(_FakeRedis):
+        def pipeline(self, transaction=False):
+            raise ConnectionError("down")
+
+    counts, error = await read_concurrency(
+        RateLimitUsageReader(_BrokenRedis({})), ["k1"]
+    )
+    assert counts is None
+    assert error == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_read_concurrency_empty_keys_is_a_clean_noop():
+    counts, error = await read_concurrency(RateLimitUsageReader(_FakeRedis({})), [])
+    assert counts == []
+    assert error is None
 
 
 def test_calendar_window_seconds_utc():

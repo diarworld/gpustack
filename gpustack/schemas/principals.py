@@ -31,8 +31,9 @@ principals. ACLs reference principals directly.
 
 from datetime import datetime
 from enum import Enum
-from typing import ClassVar, List, Optional, TYPE_CHECKING
+from typing import ClassVar, Dict, List, Optional, TYPE_CHECKING
 
+from pydantic import field_validator
 from sqlalchemy import BigInteger, Enum as SQLEnum, String, Text, text
 from sqlmodel import (
     Column,
@@ -40,6 +41,7 @@ from sqlmodel import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Relationship,
     SQLModel,
 )
@@ -177,6 +179,14 @@ class OrgRole(str, Enum):
     MEMBER = "member"
 
 
+# Bounds on the per-model in-flight cap map (``model_concurrency_limits``),
+# mirroring what the gateway plugin's ConcurrencySpec accepts — the
+# reconciler renders the column straight into the plugin's combo JSON, so a
+# value the plugin would refuse must never leave the server.
+PRINCIPAL_MAX_CONCURRENCY_MODELS = 100
+PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME = 256
+
+
 # --------------------------------------------------------------------
 # Principal — unified identity table
 # --------------------------------------------------------------------
@@ -309,6 +319,43 @@ class PrincipalBase(SQLModel):
     monthly_token_limit: Optional[int] = Field(
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
+
+    # Per-model in-flight caps (USER rows only; the gateway concurrency
+    # limit keys its slots per model). Maps a model name to that model's
+    # cap for this account; a stored 0 is an explicit unlimited. Models
+    # absent from the map inherit the deployment
+    # ``gateway_rate_limit.default_concurrency``. Bounds mirror what the
+    # plugin's ConcurrencySpec accepts, so the reconciler's rendered combo
+    # can never be refused by the gateway's config parse.
+    model_concurrency_limits: Optional[Dict[str, int]] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
+    @field_validator("model_concurrency_limits")
+    @classmethod
+    def _validate_model_concurrency_limits(
+        cls, value: Optional[Dict[str, int]]
+    ) -> Optional[Dict[str, int]]:
+        if value is None:
+            return None
+        if len(value) > PRINCIPAL_MAX_CONCURRENCY_MODELS:
+            raise ValueError(
+                f"model_concurrency_limits supports at most "
+                f"{PRINCIPAL_MAX_CONCURRENCY_MODELS} models, "
+                f"got {len(value)}"
+            )
+        for name, quota in value.items():
+            if not name or len(name) > PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME:
+                raise ValueError(
+                    f"model_concurrency_limits keys must be 1.."
+                    f"{PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME} characters"
+                )
+            if quota < 0:
+                raise ValueError(
+                    f"model_concurrency_limits[{name!r}] must be >= 0 "
+                    "(0 means unlimited)"
+                )
+        return value
 
     def model_post_init(self, __context) -> None:
         # Defense-in-depth: ``is_admin`` is the platform-wide superuser

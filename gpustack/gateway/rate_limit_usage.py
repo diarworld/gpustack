@@ -295,6 +295,48 @@ def key_windows(
     ]
 
 
+@dataclass
+class ModelConcurrencySpec:
+    """One per-model in-flight cap: which slot counter it tracks."""
+
+    model: str
+    # 0 = explicit unlimited for this model.
+    limit: int
+    redis_key: str
+
+
+def model_concurrency_specs(
+    rlc: GatewayRateLimitConfig, user_id: int, user: Optional["Principal"]
+) -> List[ModelConcurrencySpec]:
+    """The per-model in-flight caps enforced for one user, mirroring the
+    reconciler's combo layout: the user limit combo carries the
+    ``concurrency_limits`` block, and the plugin keys one ZSET per (combo,
+    model) with the ``c:<model>`` suffix and the same consumer dimension
+    fragment as every other user-level window.
+
+    Only the models the user's row names in ``model_concurrency_limits``
+    are itemized -- the deployment ``default_concurrency`` applies to
+    every other model but has no single counter to read. Admins are
+    exempt from the cap (their combo omits the block), so an admin row
+    reports nothing regardless of what its map holds.
+    """
+    if getattr(user, "is_admin", False):
+        return []
+    overrides = getattr(user, "model_concurrency_limits", None) or {}
+    identity = f"{USER_IDENTITY_PREFIX}{user_id}"
+    combo = user_limit_combo(user_id)
+    return [
+        ModelConcurrencySpec(
+            model=model,
+            limit=overrides[model],
+            redis_key=(
+                f"{RULE_NAME}|{combo}|{CONSUMER_DIM_PREFIX}{identity}|c:{model}"
+            ),
+        )
+        for model in sorted(overrides)
+    ]
+
+
 def expected_windows(
     rlc: GatewayRateLimitConfig,
     user_id: int,
@@ -588,6 +630,26 @@ class RateLimitUsageReader:
             )
         return state
 
+    async def concurrency_counts(self, keys: List[str]) -> List[int]:
+        """Current ZSET size per key, one pipeline round trip.
+
+        The concurrency counter is the plain cardinality of the slot ZSET:
+        one member per running request, so ``ZCARD`` reads "running right
+        now" without any window math -- stale slots the plugin has not
+        pruned yet inflate the number, which is exactly what the gateway
+        enforces against too. Commands run in the same pipelined shape as
+        :meth:`window_states` (one connection, no per-key round trip); any
+        command-level failure raises so the caller can fail open.
+        """
+        pipe = self._client.pipeline(transaction=False)
+        for key in keys:
+            pipe.zcard(key)
+        results = await pipe.execute(raise_on_error=False)
+        first_error = next((r for r in results if isinstance(r, BaseException)), None)
+        if first_error is not None:
+            raise first_error
+        return [int(count) for count in results]
+
 
 async def read_windows(
     reader: RateLimitUsageReader,
@@ -615,6 +677,25 @@ async def read_windows(
         usage_error = type(exc).__name__
         logger.warning("rate-limit window reads failed: %s", usage_error)
         return [None] * len(specs), usage_error
+
+
+async def read_concurrency(
+    reader: RateLimitUsageReader, keys: List[str]
+) -> Tuple[Optional[List[int]], Optional[str]]:
+    """Read every concurrency counter at once, failing open.
+
+    Same contract as :func:`read_windows`: any failure discards the whole
+    batch (the consumer renders "—") and only the exception's class name
+    surfaces.
+    """
+    if not keys:
+        return [], None
+    try:
+        return await reader.concurrency_counts(keys), None
+    except Exception as exc:
+        usage_error = type(exc).__name__
+        logger.warning("rate-limit concurrency reads failed: %s", usage_error)
+        return None, usage_error
 
 
 def reader_from_config(cfg: Config) -> Optional[RateLimitUsageReader]:

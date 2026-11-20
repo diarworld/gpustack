@@ -16,7 +16,7 @@ Combination semantics worth restating, because the reconciler leans on both:
 
 from typing import Any, Dict, List, Optional
 
-from gpustack.config.config import Config
+from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.client import McpBridgeRegistry, WasmPluginSpec
 from gpustack.gateway.plugins import plugin_spec_overrides
 
@@ -51,6 +51,37 @@ def consumer_user_capture(user_id: int) -> str:
     return rf"regexp_capture:^(?:[^.]+\.)?(gpustack-{user_id})$"
 
 
+def user_concurrency_limits(
+    user: Any, rlc: GatewayRateLimitConfig
+) -> Optional[Dict[str, Any]]:
+    """The ``concurrency_limits`` block for one user's combo, or ``None``.
+
+    ``user`` is a Principal row (only ``is_admin`` and
+    ``model_concurrency_limits`` are read; duck-typed so tests can pass
+    simple stand-ins). Admins are exempt by omission: their combo is a
+    non-fallback match, so leaving the block off suppresses the fallback
+    plan's cap for everything they run. Everyone else gets the deployment
+    default restated as the block's ``default`` -- the user combo
+    suppresses the fallback, so inheriting means restating, exactly like
+    the rate fields -- plus the user's per-model overrides. A stored 0 is
+    an explicit unlimited for that model; ``default`` is only emitted when
+    the deployment cap is on, so ``{"models": {...}}`` alone caps just the
+    named models.
+    """
+    if getattr(user, "is_admin", False):
+        return None
+    overrides = getattr(user, "model_concurrency_limits", None) or {}
+    default = rlc.default_concurrency
+    if not default and not overrides:
+        return None
+    block: Dict[str, Any] = {}
+    if default:
+        block["default"] = default
+    if overrides:
+        block["models"] = dict(overrides)
+    return block
+
+
 def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
     """The deployment-wide defaults as one fallback combination.
 
@@ -65,7 +96,10 @@ def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
         token_quota["each_day"] = rlc.default_daily_tokens
     if rlc.default_monthly_tokens:
         token_quota["each_month"] = rlc.default_monthly_tokens
-    if not (query_limits or token_limits or token_quota):
+    concurrency_limits = (
+        {"default": rlc.default_concurrency} if rlc.default_concurrency else None
+    )
+    if not (query_limits or token_limits or token_quota or concurrency_limits):
         return None
 
     combo: Dict[str, Any] = {
@@ -79,6 +113,8 @@ def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
         combo["token_limits"] = token_limits
     if token_quota:
         combo["token_quota"] = token_quota
+    if concurrency_limits:
+        combo["concurrency_limits"] = concurrency_limits
     return combo
 
 

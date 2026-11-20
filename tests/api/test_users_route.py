@@ -6,6 +6,8 @@ paths. Mock-based per :mod:`tests.api.test_p2_routes`.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
+
 from gpustack.api.exceptions import InternalServerErrorException, InvalidException
 from gpustack.routes import users as users_route
 from gpustack.schemas.users import AuthProviderEnum, UserCreate
@@ -509,3 +511,43 @@ def test_user_list_params_rejects_unknown_sort_field():
 def test_user_list_params_no_sort_by_returns_none():
     params = users_route.UserListParams()
     assert params.order_by is None
+
+
+class TestModelConcurrencyLimitsValidation:
+    """The per-model in-flight cap map: bounds mirror what the gateway
+    plugin's ConcurrencySpec accepts, so a combo rendered from this map is
+    never refused at gateway config parse."""
+
+    def test_accepts_positive_and_explicit_zero(self):
+        body = UserCreate(
+            username="alice",
+            model_concurrency_limits={"glm-5.3-flash": 4, "free": 0},
+        )
+        assert body.model_concurrency_limits == {
+            "glm-5.3-flash": 4,
+            "free": 0,
+        }
+
+    def test_rejects_negative_quota(self):
+        with pytest.raises(ValidationError, match=">= 0"):
+            UserCreate(username="alice", model_concurrency_limits={"glm": -1})
+
+    def test_rejects_empty_model_name(self):
+        with pytest.raises(ValidationError, match="1..256"):
+            UserCreate(username="alice", model_concurrency_limits={"": 1})
+
+    def test_rejects_oversized_model_name(self):
+        with pytest.raises(ValidationError, match="1..256"):
+            UserCreate(
+                username="alice",
+                model_concurrency_limits={"m" * 257: 1},
+            )
+
+    def test_rejects_too_many_models(self):
+        limits = {f"model-{i}": 1 for i in range(101)}
+        with pytest.raises(ValidationError, match="at most 100"):
+            UserCreate(username="alice", model_concurrency_limits=limits)
+
+    def test_none_stays_none(self):
+        body = UserCreate(username="alice")
+        assert body.model_concurrency_limits is None
