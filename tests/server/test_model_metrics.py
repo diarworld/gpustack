@@ -43,8 +43,9 @@ def test_queries_cover_every_card_field_over_the_shared_rate_window():
     assert queries["requests_waiting"].startswith(
         'sum by (model_id) (gpustack:num_requests_waiting{'
     )
-    assert f"rate(gpustack:prompt_tokens_total{{model_id=~\"1|2\"}}[{RATE_WINDOW}])" in (
-        queries["prompt_tokens_per_second"]
+    assert (
+        f"rate(gpustack:prompt_tokens_total{{model_id=~\"1|2\"}}[{RATE_WINDOW}])"
+        in (queries["prompt_tokens_per_second"])
     )
     assert (
         f"rate(gpustack:generation_tokens_total{{model_id=~\"1|2\"}}[{RATE_WINDOW}])"

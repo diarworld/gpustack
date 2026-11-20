@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import and_, col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from typing import Any, Awaitable, Callable, List, Optional, Set, Tuple, Union, Dict
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from gpustack.schemas.model_routes import (
     AccessPolicyEnum,
@@ -35,8 +35,13 @@ from gpustack.schemas.links import ModelRoutePrincipalLink
 from gpustack.schemas.principals import platform_principal_id
 from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.schemas.model_provider import ModelProvider
+from gpustack.schemas.model_metrics import MyModelMetrics
 from gpustack.schemas.models import Model
 from gpustack.server.controllers import notify_model_ai_proxy_change
+from gpustack.server.model_metrics import (
+    aggregate_route_metrics,
+    collect_models_utilization,
+)
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
 from gpustack.api.streaming import tenant_streaming
@@ -1990,6 +1995,113 @@ async def get_my_models(
         include_grants=user.is_admin,
         include_owner_prefix=True,
     )
+
+
+# One card grid refresh carries at most a page of cards; anything larger
+# is abuse or a bug, not a render.
+_METRICS_IDS_LIMIT = 50
+
+
+def _parse_metrics_ids(ids: str) -> List[int]:
+    """The ids query parameter -> deduplicated ordered ints."""
+    requested: List[int] = []
+    for chunk in (ids or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            value = int(chunk)
+        except ValueError:
+            raise InvalidException(f"Invalid my-model id '{chunk}'.")
+        if value not in requested:
+            requested.append(value)
+    if len(requested) > _METRICS_IDS_LIMIT:
+        raise InvalidException(
+            f"Too many ids: at most {_METRICS_IDS_LIMIT} per request."
+        )
+    return requested
+
+
+async def _visible_my_model_ids(
+    session: AsyncSession, ctx: TenantContext, requested_ids: List[int]
+) -> List[int]:
+    """The subset of the requested ids the caller may see, decided by the
+    same predicates the list endpoint applies to rows."""
+    user = ctx.user
+    if user.is_admin:
+        conditions = [
+            col(ModelRoute.id).in_(requested_ids),
+            col(ModelRoute.deleted_at).is_(None),
+        ]
+        # Act-as mirrors what an Org member would see; the All view
+        # (no principal set) reads every route.
+        if ctx.current_principal_id is not None:
+            conditions.extend(_model_route_grant_conditions(ctx))
+        stmt = select(ModelRoute.id).where(*conditions)
+    else:
+        stmt = select(MyModel.id).where(
+            col(MyModel.id).in_(requested_ids),
+            MyModel.user_id == user.id,
+        )
+        visibility = _my_model_visibility_sql(ctx)
+        if visibility is not None:
+            stmt = stmt.where(visibility)
+    return list((await session.exec(stmt)).all())
+
+
+async def _my_models_target_model_ids(
+    session: AsyncSession, visible_ids: List[int]
+) -> Dict[int, List[int]]:
+    """Route id -> the internal model ids Prometheus labels its series
+    with: the targets' deployments plus a single-target route's auto-
+    created model. Routes without local deployments have no series."""
+    stmt = (
+        select(ModelRoute)
+        .where(col(ModelRoute.id).in_(visible_ids))
+        .options(selectinload(ModelRoute.route_targets))
+    )
+    route_models: Dict[int, List[int]] = {}
+    for route in (await session.exec(stmt)).all():
+        model_ids = set()
+        if route.created_model_id:
+            model_ids.add(route.created_model_id)
+        for target in route.route_targets or []:
+            if target.model_id:
+                model_ids.add(target.model_id)
+        route_models[route.id] = sorted(model_ids)
+    return route_models
+
+
+@my_models_router.get("/metrics", response_model=List[MyModelMetrics])
+async def get_my_models_metrics(
+    request: Request,
+    session: SessionDep,
+    ctx: TenantContextDep,
+    ids: str = Query(description="Comma-separated my-model (route) ids."),
+):
+    """Live utilization for the my-models cards, one row per visible id.
+
+    A card's id names a route while Prometheus labels series with the
+    internal model ids behind the route's targets; the mapping happens
+    here so a caller only ever receives series of routes it may see.
+    Invisible ids simply have no row, and fields without usable series
+    come back None — unknown, never a fabricated zero.
+    """
+    requested_ids = _parse_metrics_ids(ids)
+    visible_ids = await _visible_my_model_ids(session, ctx, requested_ids)
+    if not visible_ids:
+        return []
+    route_models = await _my_models_target_model_ids(session, visible_ids)
+    per_model = await collect_models_utilization(
+        getattr(request.app.state, "http_client_no_proxy", None),
+        sorted({model_id for ids in route_models.values() for model_id in ids}),
+    )
+    per_route = aggregate_route_metrics(route_models, per_model)
+    return [
+        MyModelMetrics(id=route_id, **per_route[route_id])
+        for route_id in requested_ids
+        if route_id in per_route
+    ]
 
 
 @my_models_router.get("/{id}", response_model=ModelRoutePublic)

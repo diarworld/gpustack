@@ -122,9 +122,7 @@ def parse_instant_results(
                 model_id = int(raw)
             except (TypeError, ValueError):
                 continue
-            row = per_model.setdefault(
-                model_id, {key: None for key in _FIELD_KEYS}
-            )
+            row = per_model.setdefault(model_id, {key: None for key in _FIELD_KEYS})
             row[name] = instant_value(entry)
     return per_model
 
