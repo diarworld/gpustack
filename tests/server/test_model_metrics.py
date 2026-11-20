@@ -33,6 +33,7 @@ def test_queries_cover_every_card_field_over_the_shared_rate_window():
         "generation_tokens_per_second",
         "kv_cache_usage_ratio",
         "prefix_cache_hit_rate",
+        "prefix_cache_hit_rate_fallback",
         "ttft_sum_rate",
         "ttft_count_rate",
     }
@@ -56,6 +57,14 @@ def test_queries_cover_every_card_field_over_the_shared_rate_window():
     )
     assert queries["prefix_cache_hit_rate"] == (
         'avg by (model_id) (gpustack:prefix_cache_hit_rate{model_id=~"1|2"})'
+    )
+    assert (
+        f"rate(gpustack:prefix_cache_hits_total{{model_id=~\"1|2\"}}[{RATE_WINDOW}])"
+        in queries["prefix_cache_hit_rate_fallback"]
+    )
+    assert (
+        "gpustack:prefix_cache_queries_total"
+        in queries["prefix_cache_hit_rate_fallback"]
     )
     assert (
         "rate(gpustack:time_to_first_token_seconds_sum{model_id=~\"1|2\"}"
@@ -100,6 +109,35 @@ def test_parse_skips_series_without_a_model_id_label():
         {"requests_running": [{"metric": {}, "value": [0, "1"]}]}
     )
     assert per_model == {}
+
+
+def test_parse_falls_back_to_counter_ratio_when_gauge_is_missing():
+    # Most vLLM releases publish the hit/query counters but no precomputed
+    # gauge; the windowed ratio fills the card in the same way the model
+    # dashboard's Cache Hit Rate panel is built.
+    per_model = parse_instant_results(
+        {
+            "prefix_cache_hit_rate_fallback": [
+                _entry(1, "0.95"),
+                _entry(2, str(math.nan)),
+            ]
+        }
+    )
+    assert per_model[1]["prefix_cache_hit_rate"] == 0.95
+    # A NaN ratio means no traffic in the window: unknown, not 0%.
+    assert per_model[2]["prefix_cache_hit_rate"] is None
+    assert "prefix_cache_hit_rate_fallback" not in per_model[1]
+
+
+def test_parse_prefers_gauge_over_counter_ratio():
+    per_model = parse_instant_results(
+        {
+            "prefix_cache_hit_rate": [_entry(1, "0.8")],
+            "prefix_cache_hit_rate_fallback": [_entry(1, "0.95")],
+        }
+    )
+    assert per_model[1]["prefix_cache_hit_rate"] == 0.8
+    assert "prefix_cache_hit_rate_fallback" not in per_model[1]
 
 
 def test_route_aggregation_combines_targets_and_weights_ttft_by_traffic():

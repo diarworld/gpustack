@@ -44,6 +44,9 @@ _FIELD_KEYS = (
     "generation_tokens_per_second",
     "kv_cache_usage_ratio",
     "prefix_cache_hit_rate",
+    # Input only: the counter ratio that fills prefix_cache_hit_rate in
+    # when the engine publishes no precomputed gauge. Never a card field.
+    "prefix_cache_hit_rate_fallback",
     "ttft_sum_rate",
     "ttft_count_rate",
 )
@@ -94,6 +97,16 @@ def build_utilization_queries(model_ids: List[int]) -> Dict[str, str]:
         "prefix_cache_hit_rate": (
             f"avg by (model_id) (gpustack:prefix_cache_hit_rate{{{selector}}})"
         ),
+        # The gauge is optional: engines that only publish the hit/query
+        # counters (most vLLM releases) still yield the hit rate as the
+        # windowed counter ratio — the same figure the model dashboard's
+        # Cache Hit Rate panel renders.
+        "prefix_cache_hit_rate_fallback": (
+            "sum by (model_id) "
+            f"(rate(gpustack:prefix_cache_hits_total{{{selector}}}[{RATE_WINDOW}]))"
+            " / sum by (model_id) "
+            f"(rate(gpustack:prefix_cache_queries_total{{{selector}}}[{RATE_WINDOW}]))"
+        ),
         "ttft_sum_rate": (
             "sum by (model_id) "
             "(rate(gpustack:time_to_first_token_seconds_sum{"
@@ -124,6 +137,13 @@ def parse_instant_results(
                 continue
             row = per_model.setdefault(model_id, {key: None for key in _FIELD_KEYS})
             row[name] = instant_value(entry)
+    for row in per_model.values():
+        # The counter ratio fills the gap where the engine publishes no
+        # precomputed gauge; a NaN ratio (no traffic in the window) stays
+        # "unknown" and the card hides the field.
+        if row["prefix_cache_hit_rate"] is None:
+            row["prefix_cache_hit_rate"] = row["prefix_cache_hit_rate_fallback"]
+        row.pop("prefix_cache_hit_rate_fallback", None)
     return per_model
 
 
