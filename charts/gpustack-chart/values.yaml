@@ -290,6 +290,11 @@ higressPlugins:
     tag: "0.2.3.post5"
 worker:
   enabled: false
+  # Tolerations for the worker DaemonSets. Empty by default: a worker must not
+  # land on a node its taints forbid, and clusters that taint GPU nodes (e.g. a
+  # GPU operator stamping nvidia.com/gpu:NoSchedule) must name those taints here
+  # or the DaemonSet renders zero pods.
+  tolerations: []
   # Address of the GPUStack server the workers register with, e.g.
   # `http://gpustack.example.com:30080`.
   #

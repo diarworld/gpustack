@@ -24,7 +24,7 @@ one's pods and reschedule a whole runtime for a nodeSelector change.
 {{- if include "gpustack.workerCPUEnabled" . }}
 {{- $cpuLabel := dict "feature.gpustack.ai/acceleratable" "false" }}
 {{- $cpuSel := mergeOverwrite (deepCopy $base) $cpuLabel }}
-{{- $workers = append $workers (dict "name" "cpu" "dsName" $dsBasename "runtime" "" "nodeSelector" $cpuSel) }}
+{{- $workers = append $workers (dict "name" "cpu" "dsName" $dsBasename "runtime" "" "nodeSelector" $cpuSel "tolerations" $.Values.worker.tolerations) }}
 {{- end }}
 
 {{- /* GPU vendor DaemonSets — all get suffixed names. */}}
@@ -36,7 +36,7 @@ one's pods and reschedule a whole runtime for a nodeSelector change.
     {{- $vendorSel = dict $pciLabel "true" }}
   {{- end }}
   {{- $merged := mergeOverwrite (deepCopy $base) $vendorSel }}
-  {{- $workers = append $workers (dict "name" $vendor "dsName" (printf "%s-%s" $dsBasename $vendor) "runtime" $vendor "nodeSelector" $merged) }}
+  {{- $workers = append $workers (dict "name" $vendor "dsName" (printf "%s-%s" $dsBasename $vendor) "runtime" $vendor "nodeSelector" $merged "tolerations" $.Values.worker.tolerations) }}
 {{- end }}
 
 {{- /*
@@ -349,6 +349,10 @@ spec:
       hostIPC: true
       serviceAccountName: {{ $.Release.Name }}-worker
       dnsPolicy: ClusterFirstWithHostNet
+      {{- with $w.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if or (eq $w.runtime "nvidia") (eq $w.runtime "mthreads") }}
       runtimeClassName: {{ $w.runtime }}
       {{- end }}
