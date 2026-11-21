@@ -18,10 +18,12 @@ The following CLI flags are available for OIDC configuration:
 | `--oidc-client-id`                                    | OIDC client ID.                                                                                                                                                      |
 | `--oidc-client-secret`                                | OIDC client secret.                                                                                                                                                  |
 | `--oidc-redirect-uri`                                 | The redirect URI configured in your OIDC application. This must be set to `<server-url>/auth/oidc/callback`.                                                         |
+| `--oidc-scopes` (Optional)                            | Space- or comma-separated scopes requested at the authorization endpoint, e.g., `openid profile email org_id`. Defaults to `openid profile email`.                   |
 | `--external-auth-provider-name` (Optional)            | Name of the identity provider shown on the login page's SSO button, e.g., `Okta`. Defaults to `OIDC` when unset.                                                     |
 | `--external-auth-name` (Optional)                     | Mapping of OIDC user information to username, e.g., `preferred_username`. By default, the `email` claim is used if available.                                        |
 | `--external-auth-full-name` (Optional)                | Mapping of OIDC user information to user's full name. Multiple elements can be combined, e.g., `name` or `firstName+lastName`. By default, the `name` claim is used. |
 | `--external-auth-avatar-url` (Optional)               | Mapping of OIDC user information to user's avatar URL. By default, the `picture` claim is used if available.                                                         |
+| `--external-auth-claims` (Optional)                   | Comma-separated claim names persisted onto the user's `external_attributes` at every login, e.g., `title,org_id,division`. See [Capturing IdP claims](#capturing-idp-claims). |
 | `--external-auth-default-inactive` (Optional)         | Prevents new SSO users from being activated by default.                                                                                                              |
 | `--external-auth-post-logout-redirect-key` (Optional) | Generic parameter name for post-logout redirection across different IdPs (e.g., Auth0 `returnTo`). Applied to both OIDC and SAML.                                    |
 
@@ -39,7 +41,19 @@ GPUSTACK_EXTERNAL_AUTH_FULL_NAME="name"
 GPUSTACK_EXTERNAL_AUTH_AVATAR_URL="picture"
 GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
 GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo"  # e.g., for Auth0
+GPUSTACK_OIDC_SCOPES="openid profile email"
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division"
 ```
+
+### Capturing IdP claims
+
+By default GPUStack reads only the username, full name, and avatar from the IdP. To keep additional user facts on the GPUStack user record — e.g., to automate per-user quotas from job title or org division — list the claim names with `--external-auth-claims`:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division,cost_center,shop_id"
+```
+
+On every SSO login GPUStack copies the current values of these claims from the userinfo response into the user's `external_attributes` (visible in `GET /users/{id}`), rewriting whatever a previous login stored — the IdP is the source of truth. Claims arrive only if the IdP emits them for your client: those behind *optional* client scopes must be requested via `--oidc-scopes`, while claims behind *default* client scopes are always included.
 
 ### Example: Integrate with Auth0 OIDC
 

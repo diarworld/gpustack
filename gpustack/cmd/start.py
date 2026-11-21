@@ -443,6 +443,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("OIDC_REDIRECT_URI"),
     )
     server_group.add_argument(
+        "--oidc-scopes",
+        type=str,
+        help="Space- or comma-separated scopes requested at the OIDC authorization endpoint, e.g., 'openid profile email org_id'. Defaults to 'openid profile email'. Claims from scopes the IdP marks optional are only emitted when requested here.",
+        default=get_gpustack_env("OIDC_SCOPES"),
+    )
+    server_group.add_argument(
         "--oidc-skip-userinfo",
         action=OptionalBoolAction,
         help="Skip using the UserInfo endpoint and retrieve user details from the ID token.",
@@ -585,6 +591,12 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         type=str,
         help="Mapping of external authentication user information to user's avatar URL. e.g.,'picture'. For SAML, you must configure the full attribute name like 'http://schemas.auth0.com/picture' or simplify with 'picture' by '--saml-sp-attribute-prefix'.",
         default=get_gpustack_env("EXTERNAL_AUTH_AVATAR_URL"),
+    )
+    server_group.add_argument(
+        "--external-auth-claims",
+        type=str,
+        help="Comma-separated claim/attribute names persisted onto the user's external_attributes at every SSO login, e.g., 'title,org_id,division'. Useful for automating per-user quotas from IdP data. The IdP is authoritative: values are rewritten on each login.",
+        default=get_gpustack_env("EXTERNAL_AUTH_CLAIMS"),
     )
     server_group.add_argument(
         "--external-auth-default-inactive",
@@ -924,12 +936,14 @@ def set_server_options(args, config_data: dict):
         "external_auth_name",
         "external_auth_full_name",
         "external_auth_avatar_url",
+        "external_auth_claims",
         "external_auth_default_inactive",
         "external_auth_insecure_skip_tls_verify",
         "oidc_issuer",
         "oidc_client_id",
         "oidc_client_secret",
         "oidc_redirect_uri",
+        "oidc_scopes",
         "external_auth_post_logout_redirect_key",
         "oidc_skip_userinfo",
         "oidc_use_userinfo",

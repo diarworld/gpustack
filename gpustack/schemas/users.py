@@ -28,7 +28,7 @@ working unchanged.
 
 import re
 from datetime import datetime
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from pydantic import (
     AliasChoices,
@@ -156,6 +156,10 @@ class UserBase(SQLModel):
     # plugin's ConcurrencySpec accepts, so a combo rendered from this map
     # is never refused at gateway config parse.
     model_concurrency_limits: Optional[Dict[str, int]] = None
+    # Claims captured from the SSO IdP at login (see Principal
+    # ``external_attributes``). IdP-owned: rewritten on every SSO login,
+    # so admin writes here are a seed/testing aid, not a source of truth.
+    external_attributes: Optional[Dict[str, Any]] = None
 
     @field_validator("model_concurrency_limits")
     @classmethod

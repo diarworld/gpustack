@@ -3,6 +3,7 @@ import functools
 import hmac
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 import httpx
@@ -798,6 +799,67 @@ def _coerce_group_claim(raw) -> List[str]:
     return out
 
 
+def _oidc_scope_param(config: Config) -> str:
+    """Build the ``scope`` parameter for the authorization request.
+
+    ``oidc_scopes`` accepts space- or comma-separated names so both the
+    OAuth convention (``"openid profile email"``) and the env-var style
+    (``"openid,profile,email"``) work. Claims living behind scopes the
+    IdP marks *optional* are only emitted when requested here, which is
+    why the list is configurable; scopes wired as *default* client
+    scopes on the IdP client arrive regardless.
+
+    ``openid`` is forced in: the authorization code flow is undefined
+    without it, and a custom list that forgot it would break the login
+    before any claim mapping matters.
+    """
+    raw = config.oidc_scopes or "openid profile email"
+    scopes = [s for s in re.split(r"[,\s]+", raw) if s]
+    if "openid" not in scopes:
+        scopes.insert(0, "openid")
+    return " ".join(scopes)
+
+
+async def _save_oidc_external_attributes(
+    session, user, user_data: Dict, config: Config
+) -> None:
+    """Persist the claims named by ``external_auth_claims`` onto the
+    user's ``external_attributes`` — the hook that lets IdP-held facts
+    (job title, org division, cost center, …) drive per-user automation
+    such as quota assignment.
+
+    The IdP is authoritative, matching the group-sync contract: the
+    stored map is rewritten from the current login on every sign-in, so
+    a claim the IdP stopped sending disappears instead of going stale.
+    When none of the configured names are found the map is emptied and
+    a warning is logged — that shape almost always means the claims
+    exist behind scopes the login request never asked for (see
+    :func:`_oidc_scope_param`), not that the user lost their title.
+    """
+    claim_names = [
+        name.strip()
+        for name in (config.external_auth_claims or "").split(",")
+        if name.strip()
+    ]
+    if not claim_names:
+        return
+    attributes = {name: user_data[name] for name in claim_names if name in user_data}
+    if not attributes:
+        logger.warning(
+            "None of the configured external_auth_claims %s were found in "
+            "the OIDC user data; clearing external_attributes for user '%s'. "
+            "Check that the claims' scopes are requested (--oidc-scopes) or "
+            "wired as default client scopes on the IdP client.",
+            claim_names,
+            user.name,
+        )
+    if user.external_attributes == attributes:
+        return
+    user.external_attributes = attributes
+    session.add(user)
+    await session.commit()
+
+
 # OIDC login and callback endpoints
 
 
@@ -811,7 +873,7 @@ async def oidc_login(request: Request):
             "response_type": "code",
             "client_id": config.oidc_client_id,
             "redirect_uri": config.oidc_redirect_uri,
-            "scope": "openid profile email",
+            "scope": _oidc_scope_param(config),
             "state": state,
         }
     )
@@ -871,6 +933,12 @@ async def oidc_callback(request: Request, session: SessionDep):
 
             # Get user data from token or userinfo endpoint
             user_data = await get_oidc_user_data(client, res_data, config)
+            # Diagnostics for claim capture (``external_auth_claims``):
+            # log which claim names the IdP actually sent, so "claim not
+            # configured on the client" can be told apart from "claim
+            # misnamed in --external-auth-claims" without IdP console
+            # access. Keys only — values never go to the logs.
+            logger.debug("OIDC user data claims: %s", sorted(user_data.keys()))
 
             if config.external_auth_name:
                 # If external_auth_name is set, use it as username.
@@ -919,6 +987,7 @@ async def oidc_callback(request: Request, session: SessionDep):
     )
 
     await _sync_oidc_groups_if_enabled(session, user, user_data, config)
+    await _save_oidc_external_attributes(session, user, user_data, config)
 
     jwt_manager: JWTManager = request.app.state.jwt_manager
     access_token = jwt_manager.create_jwt_token(

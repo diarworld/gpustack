@@ -31,7 +31,7 @@ principals. ACLs reference principals directly.
 
 from datetime import datetime
 from enum import Enum
-from typing import ClassVar, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, List, Optional, TYPE_CHECKING
 
 from pydantic import field_validator
 from sqlalchemy import BigInteger, Enum as SQLEnum, String, Text, text
@@ -330,6 +330,17 @@ class PrincipalBase(SQLModel):
     # plugin's ConcurrencySpec accepts, so the reconciler's rendered combo
     # can never be refused by the gateway's config parse.
     model_concurrency_limits: Optional[Dict[str, int]] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
+    # Claims captured from the SSO IdP at login (``external_auth_claims``
+    # names them: title, org division, cost center, …), keyed by claim
+    # name. Rewritten from the IdP's current values on every SSO login —
+    # the IdP is authoritative, so hand edits here survive only until the
+    # next sign-in. NULL for Local users and for deployments that capture
+    # no claims. JSON so quota automation can read the payload without a
+    # join table.
+    external_attributes: Optional[Dict[str, Any]] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
 

@@ -355,6 +355,10 @@ class Config(WorkerConfig, BaseSettings):
     external_auth_name: Optional[str] = None  # external auth name
     external_auth_full_name: Optional[str] = None  # external auth full name
     external_auth_avatar_url: Optional[str] = None  # external auth avatar url
+    # Comma-separated IdP claim names (e.g. ``title,org_id,division``)
+    # persisted onto the user's ``external_attributes`` at every SSO
+    # login. Unset means "capture nothing".
+    external_auth_claims: Optional[str] = None  # external auth claims to persist
     external_auth_default_inactive: bool = False  # external auth default inactive
     # Skip TLS verification for the external-auth IdP handshake (OIDC/CAS).
     # Testing against self-signed IdPs only; never enable in production.
@@ -377,6 +381,11 @@ class Config(WorkerConfig, BaseSettings):
     oidc_client_id: Optional[str] = None  # oidc client id
     oidc_client_secret: Optional[str] = None  # oidc client secret
     oidc_redirect_uri: Optional[str] = None  # oidc redirect uri
+    # Space- or comma-separated scopes sent on the authorization request.
+    # Unset falls back to "openid profile email"; ``openid`` is always
+    # enforced. Custom claims need their scopes listed here *or* the
+    # scopes wired as default client scopes on the IdP client.
+    oidc_scopes: Optional[str] = None  # oidc authorization scopes
     oidc_issuer: Optional[str] = None  # oidc issuer
     oidc_skip_userinfo: bool = False  # skip to request the oidc user_info endpoint
     oidc_use_userinfo: Optional[bool] = (
