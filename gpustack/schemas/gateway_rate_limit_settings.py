@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import ClassVar, List, Optional
 
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import BigInteger, Column
+from sqlalchemy import BigInteger, Column, Integer
 from sqlmodel import Field, SQLModel
 
 from gpustack.mixins import BaseModelMixin
@@ -31,7 +31,9 @@ class GatewayRateLimitSettings(SQLModel, BaseModelMixin, table=True):
     # NULL inherits the ``gateway_rate_limit`` config-file default; an
     # explicit value wins. Bounds mirror GatewayRateLimitConfig (ge=1,
     # concurrency ge=0) and are enforced on the Update model.
-    default_rpm: Optional[int] = Field(default=None, sa_column=Column(nullable=True))
+    default_rpm: Optional[int] = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
     default_tpm: Optional[int] = Field(
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
@@ -39,7 +41,7 @@ class GatewayRateLimitSettings(SQLModel, BaseModelMixin, table=True):
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
     default_concurrency: Optional[int] = Field(
-        default=None, sa_column=Column(nullable=True)
+        default=None, sa_column=Column(Integer, nullable=True)
     )
     # Free schedule: whole free days plus a daily window (which may wrap
     # past midnight). All wall-clock values are UTC -- the plugin only
