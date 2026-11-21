@@ -311,7 +311,7 @@ async def test_replicas_run_what_fits_when_the_cluster_is_smaller(monkeypatch):
         worker_id=5,
         component="store",
         state=CacheServiceStateEnum.RUNNING,
-        component_addresses={"master": "10.0.0.5:50051"},
+        component_addresses={"master": "10.0.0.5:50051", "master.host": "10.0.0.5"},
     )
     create = _patch_reconcile(
         monkeypatch,
@@ -521,7 +521,7 @@ async def test_lowered_replica_count_deletes_the_surplus(monkeypatch):
         state=CacheServiceStateEnum.RUNNING,
         port=50051,
     )
-    addresses = {"master": "10.0.0.5:50051"}
+    addresses = {"master": "10.0.0.5:50051", "master.host": "10.0.0.5"}
     stores = [
         _instance(
             id=22 + offset,
@@ -574,8 +574,75 @@ async def test_dependent_component_gets_stamped_dependency_address(monkeypatch):
     stores = [row for row in created if row.component == "store"]
     assert {row.worker_id for row in stores} == {5, 6}
     assert all(
-        row.component_addresses == {"master": "10.0.0.5:50051"} for row in stores
+        row.component_addresses
+        == {"master": "10.0.0.5:50051", "master.host": "10.0.0.5"}
+        for row in stores
     )
+
+
+@pytest.mark.asyncio
+async def test_dependent_stamp_carries_the_dependency_named_ports(monkeypatch):
+    """A dependent that reaches a second listener of its dependency — a
+    store building the master's metadata URL — renders
+    component.<name>.host and component.<name>.ports.<name> from its
+    stamp, so the stamp has to carry them beside the address. An
+    address-only stamp (the shape older services were created with)
+    renders those templates empty and is stale against the full one:
+    the reconcile replaces it."""
+    from gpustack.schemas.cache_providers import CacheProviderComponent
+
+    provider = _pool_provider()
+    provider.components["master"] = CacheProviderComponent(
+        run_command="pool-master --port {{port}}",
+        ports=["rpc", "metadata", "metrics"],
+        address_port="rpc",
+        metrics_port="metrics",
+        attach_endpoint=True,
+        gpu_access=False,
+    )
+    service = _service(worker_id=None)
+    master = _instance(
+        id=21,
+        worker_id=5,
+        component="master",
+        state=CacheServiceStateEnum.RUNNING,
+        port=40001,
+        ports={"rpc": 40001, "metadata": 40006, "metrics": 40010},
+    )
+    address_only_store = _instance(
+        id=22,
+        worker_id=5,
+        component="store",
+        component_addresses={"master": "10.0.0.5:40001"},
+        state=CacheServiceStateEnum.RUNNING,
+        port=40011,
+    )
+    create = _patch_reconcile(
+        monkeypatch,
+        provider,
+        workers=[_worker(5)],
+        worker=_worker(5),
+        instance_lists=[[master, address_only_store], [master]],
+    )
+
+    controller = CacheServiceController(MagicMock())
+    await controller._reconcile_service(MagicMock(), service)
+
+    expected = {
+        "master": "10.0.0.5:40001",
+        "master.host": "10.0.0.5",
+        "master.rpc": "40001",
+        "master.metadata": "40006",
+        "master.metrics": "40010",
+    }
+    # The address-only stamp cannot render the dependency's second
+    # listener, so the instance is stale and gets recreated with the
+    # full stamp.
+    address_only_store.delete.assert_awaited_once()
+    created = [call.args[1] for call in create.await_args_list]
+    stores = [row for row in created if row.component == "store"]
+    assert stores
+    assert all(row.component_addresses == expected for row in stores)
 
 
 @pytest.mark.asyncio
@@ -1779,7 +1846,7 @@ async def test_a_pool_smaller_than_asked_for_says_so(monkeypatch):
         worker_id=5,
         component="store",
         state=CacheServiceStateEnum.RUNNING,
-        component_addresses={"master": "10.0.0.5:50051"},
+        component_addresses={"master": "10.0.0.5:50051", "master.host": "10.0.0.5"},
     )
     _patch_reconcile(
         monkeypatch,

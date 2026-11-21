@@ -1401,11 +1401,7 @@ class CacheServiceController:
             spec = provider.get_component(component) if provider else None
             stale_address = False
             if spec is not None and spec.depends_on:
-                expected = {
-                    name: address
-                    for name, address in addresses.items()
-                    if name == spec.depends_on
-                }
+                expected = self._dependency_stamps(addresses, spec.depends_on)
                 # No address to hand down reads two ways: the dependency has
                 # not come up yet — leave the dependent alone — or it was
                 # turned off, in which case an instance still carrying its
@@ -1455,7 +1451,7 @@ class CacheServiceController:
                 if spec.depends_on not in addresses:
                     # Converges on the dependency's RUNNING event.
                     continue
-                instance_addresses = {spec.depends_on: addresses[spec.depends_on]}
+                instance_addresses = self._dependency_stamps(addresses, spec.depends_on)
             # Whatever room the surviving rows left over is what to create.
             missing = [
                 worker_id
@@ -1503,6 +1499,26 @@ class CacheServiceController:
             )
             return
         await self._sync_service_aggregate(session, service, provider)
+
+    @staticmethod
+    def _dependency_stamps(
+        addresses: Dict[str, str], depends_on: str
+    ) -> Dict[str, str]:
+        """Everything a dependent of ``depends_on`` renders against: the
+        component's address plus the host and named-port stamps its env
+        and flag templates use (``component.<name>.host``,
+        ``component.<name>.ports.<name>``). The address alone is the
+        dependency's RPC listener; a dependent that reaches a second
+        listener — a store building the master's metadata URL — needs the
+        rest, and a stamp without them renders those templates empty,
+        dropping the env entry that carries the URL.
+        """
+        prefix = f"{depends_on}."
+        return {
+            name: address
+            for name, address in addresses.items()
+            if name == depends_on or name.startswith(prefix)
+        }
 
     async def _component_addresses(
         self,
