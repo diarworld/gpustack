@@ -4,7 +4,7 @@ translation_status: translated
 
 # Kotalar { #quotas }
 
-Kullanım → Genel Bakış sayfasındaki **Limits** bölümü, ağ geçidinin trafiğinize şu anda uyguladığı kotaları gösterir: her hakkın ne kadarının kullanıldığını, her pencerenin ne zaman sıfırlandığını ve haftalık ile aylık bütçeler için bir sıfırlama düğmesini. Bölüm her zaman yalnızca size aittir: kendi limitlerinizi görürsünüz, bir yönetici kendi limitlerini görür.
+Kullanım sayfasındaki **Limits** sekmesi, ağ geçidinin trafiğinize şu anda uyguladığı kotaları gösterir: her hakkın ne kadarının kullanıldığını, her pencerenin ne zaman sıfırlandığını ve haftalık ile aylık bütçeler için bir sıfırlama düğmesini. Bölüm her zaman yalnızca size aittir; bir yönetici ayrıca kartın üzerindeki seçiciden herhangi bir kullanıcıyı belirleyebilir.
 
 ![Usage quotas](../assets/usage/usage-quotas.png)
 
@@ -29,7 +29,7 @@ Kartların altındaki tablo, ulaşabildiğiniz hazır (ready) modelleri yoğunlu
 
 ## Model Başına Eşzamanlı İstek { #model-concurrency }
 
-Hız ve bütçe pencerelerinin ötesinde, ağ geçidi isteklerinizin — tüm API anahtarlarınız ve oturumlarınız genelinde — tek bir model üzerinde aynı anda çalışabileceği sayıyı sınırlar. Dağıtım varsayılanı **1**'dir: bir modele yönelik bir istek hâlâ çalışırken, aynı modele yönelik ikinci paralel istek, ilki bitene kadar `429 Too Many Requests` ile reddedilir. Slot, istek tamamlanır tamamlanmaz serbest kalır — pencere beklenmez; bu yüzden bu reddedilmeler `Retry-After` başlığı taşımaz.
+Hız ve bütçe pencerelerinin ötesinde, ağ geçidi isteklerinizin — tüm API anahtarlarınız ve oturumlarınız genelinde — tek bir model üzerinde aynı anda çalışabileceği sayıyı sınırlar. Dağıtım varsayılanı **2**'dir: bir modele yönelik iki istek hâlâ çalışırken, aynı modele yönelik üçüncü paralel istek, biri bitene kadar `429 Too Many Requests` ile reddedilir. Slot, istek tamamlanır tamamlanmaz serbest kalır — pencere beklenmez; bu yüzden bu reddedilmeler `Retry-After` başlığı taşımaz.
 
 Her model ayrı sayılır: bir modeldeki devam eden istek, diğer modellere yapılan istekleri engellemez. Yöneticiler bu sınıra tabi değildir.
 
@@ -40,7 +40,7 @@ Varsayılan ve model başına geçersiz kılmalar, yönetici tarafından hesabı
 - **Dağıtım varsayılanları** — yönetici tarafından herkes için ayarlanır: RPM, TPM, aylık token'lar ve model başına eşzamanlılık sınırı. Ayarlanmamış bir varsayılan, o pencerenin sınırlandırılmadığı anlamına gelir.
 - **Kullanıcı düzeyi limitler** — yöneticinin hesabınıza ayarladığı haftalık ve aylık token bütçeleri ile RPM ve TPM; tüm anahtarlarınız ve oturumlarınız tarafından paylaşılır.
 
-Bu dağıtım şu varsayılanları kullanır:
+Bu dağıtım şu varsayılanları kullanır (yöneticiler Limits sekmesinde düzenler; bkz. [Dağıtım varsayılanlarını düzenleme](#editing-the-deployment-defaults)):
 
 | Pencere   | Varsayılan                                                              |
 | --------- | ----------------------------------------------------------------------- |
@@ -48,8 +48,21 @@ Bu dağıtım şu varsayılanları kullanır:
 | TPM       | dakikada 768.000 token                                                  |
 | Ay        | kullanıcı başına aylık 100.000.000 token                                |
 | Hafta     | varsayılan yok — yalnızca açık haftalık bütçesi olan hesaplar sınırlanır |
+| Eşzamanlılık | model başına 2 istek                                                  |
 
  Dahili detaylar — ağ geçidi yapılandırması, varsayılanlar, hata davranışı ve metrikler — [Rate Limiting](rate-limiting.md) bölümünde açıklanmıştır.
+
+## Dağıtım Varsayılanlarını Düzenleme { #editing-the-deployment-defaults }
+
+Yöneticiler dağıtım varsayılanlarını — RPM, TPM, aylık token bütçesi ve model başına eşzamanlılık sınırını — Kullanım → Limits sekmesinde (**Dağıtım varsayılanları**) düzenler. Boş alan "sunucu yapılandırma dosyasındaki değeri devral" demektir; eşzamanlılık için `0` sınırı tamamen kapatır. Kaydedilen değişiklik bir sonraki uzlaştırma turunda (bir dakika içinde) ağ geçidine ulaşır, yeniden başlatma gerekmez.
+
+## Serbest Pencereler { #free-windows }
+
+Aynı form dağıtım genelinde **serbest pencereyi** yayımlar: günlük bir zaman aralığı (gece yarısını aşabilir) artı tamamen serbest günler; değerler UTC olarak saklanır. Takvim etkin olduğunda ağ geçidi hız sınırlamayı tamamen askıya alır — her istek kabul edilir, eşzamanlılık slotu alınmaz ve limit sayaçları donar.
+
+Pencere **içinde başlayan** bir istek, akışı pencerenin sonunu aşsa bile tümüyle ücretsizdir; dışarıda başlayan istek tamamen sınırlı kalır. Kullanım istatistikleri ve raporlar her zamanki gibi toplanmaya devam eder — duran yalnızca limit muhasebesidir.
+
+Pencere etkin olduğunda Limits kartı, donmuş bir sayacın arıza sanılmaması için **Serbest saatler** rozeti gösterir. Form saatleri tarayıcınızın saat diliminde gösterir ve kaydederken UTC'ye çevirir; günler UTC'ye göredir.
 
 ## Bütçeyi Sıfırlama { #resetting-a-budget }
 

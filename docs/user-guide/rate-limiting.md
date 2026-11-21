@@ -36,9 +36,10 @@ on inference paths (the standard OpenAI/Anthropic endpoints and
 
 ## Deployment-Wide Defaults
 
-Defaults apply to every consumer and are set in the server config file (the
-YAML file the server loads through `--config-file` or the
-`GPUSTACK_CONFIG_FILE` environment variable):
+Defaults apply to every consumer without an explicit limit of their own. A
+fresh deployment seeds them from the server config file (the YAML file the
+server loads through `--config-file` or the `GPUSTACK_CONFIG_FILE`
+environment variable):
 
 ```yaml
 gateway_rate_limit:
@@ -56,6 +57,13 @@ gateway_rate_limit:
   default_concurrency: 1
 ```
 
+From then on the defaults live in the database and are edited on the
+Usage → Limits tab (**Deployment defaults**), which overrides the config
+file — the config file keeps serving only as the bootstrap seed and as the
+source for the fields the form leaves empty. An empty field in the form (a
+`null` in the database) inherits the config-file value, so a deployment can
+move a default back to the file without a restart.
+
 All the `default_*` fields except `default_concurrency` are optional; an unset
 field means no limit of that kind. `default_concurrency` defaults to **1** —
 one in-flight request per model per user — because a runaway batch client
@@ -64,6 +72,28 @@ it to `0` to turn the concurrency cap off deployment-wide. Every other field
 stays a passthrough until configured. `rejected_code` / `rejected_msg` are
 absent by default so the plugin's per-limit rejection texts apply; an explicit
 value overrides them.
+
+### Free Windows
+
+The same form publishes a deployment-wide **free window**: a daily time span
+(possibly spanning midnight) plus whole free days. The schedule rides the
+plugin's `free_windows` config, evaluated in the plugin-wide `timezone`:
+
+```yaml
+free_windows:
+  enabled: true
+  start: "15:00"        # HH:MM in the plugin-wide timezone
+  end: "06:00"          # may wrap past midnight
+  days: ["sat", "sun"]  # mon..sun; empty = the daily window every day
+```
+
+Inside the schedule the plugin suspends every check: requests admitted there
+run no limits, take no concurrency slots and add nothing to the counters —
+the whole request is free if it **starts** inside the window, even when it
+streams past the end. Usage statistics from `ai-statistics` are unaffected.
+The `gpustack_rate_limit_free_skipped_total` metric counts the bypassed
+requests. The UI shows the schedule in the browser's timezone; the stored
+values (and the days) are UTC wall-clock.
 
 Redis must be reachable from the gateway pods. Declare it in the McpBridge
 that serves the gateway (or point `service_name` at a Kubernetes Service
@@ -83,13 +113,13 @@ governed by the deployment defaults alone.
 
 ### Per-Model Concurrency
 
-The `default_concurrency` deployment default (1) caps how many requests one
-user may run against **one model** at the same time: a second parallel
-request to the same model is rejected with 429 while the first is still
-streaming, while requests to different models proceed independently. The
-count is of in-flight requests, not a rate — a slot is acquired when the
-request passes the gateway and released when its stream ends, so a finished
-request frees its slot immediately.
+The `default_concurrency` deployment default (1 unless the deployment edits
+it) caps how many requests one user may run against **one model** at the same
+time: a second parallel request to the same model is rejected with 429 while
+the first is still streaming, while requests to different models proceed
+independently. The count is of in-flight requests, not a rate — a slot is
+acquired when the request passes the gateway and released when its stream
+ends, so a finished request frees its slot immediately.
 
 Admins are exempt from the concurrency cap. Per-model overrides are set on
 the user account via `model_concurrency_limits` — a map of model name to
