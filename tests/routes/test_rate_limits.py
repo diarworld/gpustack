@@ -22,7 +22,10 @@ from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
 from gpustack.gateway.rate_limit import rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import RateLimitUsageReader, RateLimitWindowState
 from gpustack.routes import rate_limits
-from gpustack.schemas.rate_limits import RateLimitResetCreate
+from gpustack.schemas.rate_limits import (
+    FreeWindowUsage,
+    RateLimitResetCreate,
+)
 from gpustack.schemas.users import User
 
 # A fixed instant with a 12h elapsed UTC day, so calendar boundaries are
@@ -130,6 +133,11 @@ class FakeSession:
     async def exec(self, statement):
         self.statements.append(statement)
         text = self._compiled(statement)
+        if "gateway_rate_limit_settings" in text:
+            # No settings row stored: the endpoint's read fails back to
+            # the config file (and a disabled free window), which is what
+            # a fresh fake session should look like.
+            return SimpleNamespace(first=lambda: None)
         if "gateway_rate_limit_resets" in text:
             return SimpleNamespace(all=lambda: self._matching_resets(text))
         if "non_admin_user_models" in text:
@@ -161,8 +169,11 @@ class FakeSession:
 
     def add(self, obj):
         self.added.append(obj)
-        self._resets.append(obj)
-        self._resets.sort(key=lambda r: r.reset_at)
+        # The settings row (no ``kind``) never participates in the reset
+        # queries the fake answers.
+        if hasattr(obj, "kind"):
+            self._resets.append(obj)
+            self._resets.sort(key=lambda r: r.reset_at)
 
     async def commit(self):
         pass
@@ -335,10 +346,12 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     # table; the per-key view is gone, so no api_keys statement ever runs.
     assert response.user.concurrency_default == 1
     assert session.statements
-    # Every statement is either the reset-quota read or the ready-models
-    # view; no api_keys statement ever runs.
+    # Every statement is either the settings read+seed, the reset-quota
+    # read or the ready-models view; no api_keys statement ever runs.
     assert all(
-        "gateway_rate_limit_resets" in str(s) or "non_admin_user_models" in str(s)
+        "gateway_rate_limit_resets" in str(s)
+        or "gateway_rate_limit_settings" in str(s)
+        or "non_admin_user_models" in str(s)
         for s in session.statements
     )
 
@@ -907,3 +920,92 @@ async def test_reset_validations(frozen_now, monkeypatch):
             body=RateLimitResetCreate(kind="weekly", description="x"),
         )
     assert session.added == [] and reader.deleted == []
+
+
+class TestFreeWindowBadge:
+    """The ``free`` block on the response: the admin-editable schedule and
+    whether the moment of the read sits inside it."""
+
+    @staticmethod
+    def _patch(monkeypatch, free):
+        async def _effective(session, cfg):
+            return cfg.gateway_rate_limit, free
+
+        monkeypatch.setattr(rate_limits, "effective_rate_limit", _effective)
+
+    @pytest.mark.asyncio
+    async def test_free_block_reports_the_schedule_and_activity(
+        self, frozen_now, monkeypatch
+    ):
+        """FIXED_NOW is Wednesday 12:00 UTC: outside the seeded evening /
+        weekend schedule, so ``active`` is false while the schedule itself
+        still travels to the UI."""
+        from gpustack.gateway.rate_limit_settings import FreeWindow
+
+        cfg = _redis_cfg()
+        user = _user(7)
+        session = FakeSession(users=[user])
+        monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: FakeReader())
+        TestFreeWindowBadge._patch(
+            monkeypatch,
+            FreeWindow(enabled=True, start="15:00", end="06:00", days=["sat", "sun"]),
+        )
+
+        response = await rate_limits.get_rate_limits(
+            session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+        )
+        assert response.free == FreeWindowUsage(
+            enabled=True,
+            active=False,
+            start="15:00",
+            end="06:00",
+            days=["sat", "sun"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_inside_the_window_the_badge_flips_active(
+        self, frozen_now, monkeypatch
+    ):
+        """12:00 UTC Wednesday is 15:00 MSK -- inside the window when the
+        deployment judges the schedule in Europe/Moscow. The UI uses this
+        to badge a frozen counter instead of a broken read."""
+        from gpustack.gateway.rate_limit_settings import FreeWindow
+
+        cfg = _redis_cfg(timezone="Europe/Moscow")
+        user = _user(7)
+        session = FakeSession(users=[user])
+        monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: FakeReader())
+        TestFreeWindowBadge._patch(
+            monkeypatch,
+            FreeWindow(enabled=True, start="15:00", end="06:00", days=["sat"]),
+        )
+
+        response = await rate_limits.get_rate_limits(
+            session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+        )
+        assert response.free.active is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_settings_seed_leaves_the_defaults_alone(
+        self, frozen_now, monkeypatch
+    ):
+        """Without a stored row the read seeds one in memory: limits stay
+        NULL (inherit) and the free schedule comes back enabled with the
+        deployment defaults."""
+        cfg = _redis_cfg()
+        user = _user(7)
+        session = FakeSession(users=[user])
+        monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: FakeReader())
+
+        response = await rate_limits.get_rate_limits(
+            session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+        )
+        # The seeded schedule is evenings/nights/weekends in UTC; FIXED_NOW
+        # (Wed 12:00 UTC) is outside it.
+        assert response.free.enabled is True
+        assert response.free.active is False
+        assert response.free.start == "15:00"
+        assert response.free.end == "06:00"
+        assert response.free.days == ["sat", "sun"]
+        # The user windows still inherit the config-file defaults.
+        assert response.user.concurrency_default == 1

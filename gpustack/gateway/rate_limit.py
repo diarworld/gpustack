@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.client import McpBridgeRegistry, WasmPluginSpec
 from gpustack.gateway.plugins import plugin_spec_overrides
+from gpustack.gateway.rate_limit_settings import FreeWindow
 
 rate_limit_plugin_name = "gpustack-rate-limit"
 
@@ -82,13 +83,16 @@ def user_concurrency_limits(
     return block
 
 
-def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
+def default_plan_combination(rlc: GatewayRateLimitConfig) -> Optional[Dict[str, Any]]:
     """The deployment-wide defaults as one fallback combination.
 
     ``None`` when no default is configured: the plugin stays a passthrough
     until the reconciler has database-driven combinations to add.
+
+    Takes the effective config (the settings row already layered over the
+    config file), not the raw ``Config``: the UI edits the row, and the
+    fallback plan must always publish what admins currently run under.
     """
-    rlc = cfg.gateway_rate_limit
     query_limits = {"per_minute": rlc.default_rpm} if rlc.default_rpm else None
     token_limits = {"per_minute": rlc.default_tpm} if rlc.default_tpm else None
     token_quota: Dict[str, int] = {}
@@ -146,12 +150,16 @@ def rate_limit_redis_registry(
     )
 
 
-def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
+def rate_limit_base_config(
+    cfg: Config, free: Optional[FreeWindow] = None
+) -> Dict[str, Any]:
     """The ``defaultConfig`` fields that do not depend on the database.
 
     The redis block names the McpBridge registry, not the raw Service
     FQDN -- the registry is what turns the service into an Envoy cluster
-    the plugin's redis client can address.
+    the plugin's redis client can address. ``free`` rides the base when
+    the deployment carries a free-window schedule: it applies to every
+    combination, database-driven or fallback.
     """
     rlc = cfg.gateway_rate_limit
     # rejected_code / rejected_msg stay absent unless the operator set them:
@@ -165,6 +173,11 @@ def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
         # produced it.
         "show_limit_quota_header": True,
     }
+    if free is not None and free.enabled:
+        # A disabled schedule stays absent rather than sending
+        # ``{"enabled": false}``: to the plugin the two are equivalent, and
+        # the absent key keeps the CR free of dead config.
+        config["free_windows"] = free.plugin_config()
     if rlc.rejected_code is not None:
         config["rejected_code"] = rlc.rejected_code
     if rlc.rejected_msg:
@@ -184,7 +197,11 @@ def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
     return config
 
 
-def rate_limit_spec(cfg: Config, combinations: List[Dict[str, Any]]) -> WasmPluginSpec:
+def rate_limit_spec(
+    cfg: Config,
+    combinations: List[Dict[str, Any]],
+    free: Optional[FreeWindow] = None,
+) -> WasmPluginSpec:
     """The full expected spec for one set of combinations.
 
     Priority 600 is the slot the plugin chain reserves for rate limiting:
@@ -192,7 +209,7 @@ def rate_limit_spec(cfg: Config, combinations: List[Dict[str, Any]]) -> WasmPlug
     and after ai-statistics (900) has written ``ai_log`` by the time this
     plugin's response-phase hook reads the token counts from it.
     """
-    default_config = rate_limit_base_config(cfg)
+    default_config = rate_limit_base_config(cfg, free=free)
     if combinations:
         default_config["limit_combinations"] = list(combinations)
     return WasmPluginSpec(

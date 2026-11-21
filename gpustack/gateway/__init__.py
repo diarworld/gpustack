@@ -700,8 +700,11 @@ def rate_limit_plugin(cfg: Config) -> Optional[Tuple[str, WasmPluginSpec]]:
     """
     if not cfg.gateway_rate_limit.enabled:
         return None
-    default_combo = default_plan_combination(cfg)
+    default_combo = default_plan_combination(cfg.gateway_rate_limit)
     combinations = [default_combo] if default_combo is not None else []
+    # No free window here on purpose: this pass is create-only bootstrap
+    # and runs before the database is reachable for the settings row --
+    # the reconciler's first pass publishes the schedule.
     return (
         rate_limit_plugin_name,
         rate_limit_spec(cfg, combinations),

@@ -1,9 +1,10 @@
 """Keeps the gateway's rate-limit combinations in step with the database.
 
-The ``gpustack-rate-limit`` plugin enforces deployment-wide defaults from
-``gateway_rate_limit`` in the config file. Per-key and per-user limits are
-mutable state the server owns, so this reconciler plays the same role for the
-rate-limit CR that :class:`~gpustack.server.gateway_auth_reconciler.
+The ``gpustack-rate-limit`` plugin enforces the deployment-wide defaults the
+admins edit on the Usage page (the ``gateway_rate_limit_settings`` row,
+seeded from ``gateway_rate_limit`` in the config file). Per-key and per-user
+limits are mutable state the server owns, so this reconciler plays the same
+role for the rate-limit CR that :class:`~gpustack.server.gateway_auth_reconciler.
 GatewayAuthReconciler` plays for ext-auth: move the server off the request
 path and onto the change-propagation path. Events trigger; every pass
 rebuilds the combinations from the database in full.
@@ -23,22 +24,25 @@ fallback) decide the layout:
   per-model overrides; admins carry no concurrency block at all, which is
   what exempts them). Non-fallback so it ANDs with the default plan
   fallback below: a user cap must bind every request they send.
-* **The default plan** from the config file, unchanged: the fallback safety
-  net for requests whose combos were left out under byte pressure or whose
-  consumer no longer matches a live user.
+* **The default plan** from the effective defaults (settings row over the
+  config file): the fallback safety net for requests whose combos were
+  left out under byte pressure or whose consumer no longer matches a live
+  user.
+* **The free-window schedule** rides the base config: during those windows
+  the plugin suspends every check and the limit counters freeze.
 """
 
 import asyncio
 import json
 import logging
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kubernetes_asyncio import client as k8s_client
 from sqlmodel import select
 
 from gpustack import envs
-from gpustack.config.config import Config
+from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway import get_async_k8s_config
 from gpustack.gateway.client.extensions_higress_io_v1_api import (
     ExtensionsHigressIoV1Api,
@@ -51,9 +55,11 @@ from gpustack.gateway.rate_limit import (
     rate_limit_spec,
     user_concurrency_limits,
 )
+from gpustack.gateway.rate_limit_settings import FreeWindow, effective_rate_limit
 from gpustack.gateway.utils import ensure_wasm_plugin
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.config import GatewayModeEnum
+from gpustack.schemas.gateway_rate_limit_settings import GatewayRateLimitSettings
 from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.server.bus import EventType
 from gpustack.server.db import async_session
@@ -66,18 +72,21 @@ _WATCH_RETRY_MIN_SECONDS = 1
 _WATCH_RETRY_MAX_SECONDS = 30
 
 
-def user_limits_combination(user: Principal, cfg: Config) -> Optional[Dict[str, Any]]:
+def user_limits_combination(
+    user: Principal, rlc: GatewayRateLimitConfig
+) -> Optional[Dict[str, Any]]:
     """The per-user combo: every limit that caps the user's keys together.
 
     Non-fallback on purpose: non-fallback combos AND, so this binds every
     request of the user alongside the default plan fallback. The match
     captures the user suffix, merging the API-key and UI consumer shapes
     into one shared bucket. Unset fields inherit the deployment defaults
-    from ``gateway_rate_limit`` -- every active user with keys gets the
-    deployment plan even when an admin has set nothing, because the user
-    combos these requests match suppress the fallback default plan.
+    -- every active user with keys gets the deployment plan even when an
+    admin has set nothing, because the user combos these requests match
+    suppress the fallback default plan. ``rlc`` is the effective config:
+    the settings row already layered over the config file (see
+    :mod:`gpustack.gateway.rate_limit_settings`).
     """
-    rlc = cfg.gateway_rate_limit
     combo: Dict[str, Any] = {
         "name": f"user-{user.id}",
         "match": [{"source": "consumer", "value": consumer_user_capture(user.id)}],
@@ -143,7 +152,11 @@ def fit_combinations(
 
 
 def reconcile_spec_diff(
-    current_spec: Optional[Any], cfg: Config, combinations: List[Dict[str, Any]]
+    current_spec: Optional[Any],
+    cfg: Config,
+    rlc: GatewayRateLimitConfig,
+    combinations: List[Dict[str, Any]],
+    free: FreeWindow,
 ) -> Any:
     """The reconciler's diff: the full expected spec, ignoring the live one.
 
@@ -156,13 +169,16 @@ def reconcile_spec_diff(
     missing CR is rebuilt for the same reason the ext-auth reconciler
     rebuilds its own: ``ensure_wasm_plugin`` creates from this result, and an
     absent rate-limit CR means the deployment defaults are the only thing
-    standing between the users and the limits they were given.
+    standing between the users and the limits they were given. ``rlc`` is the
+    effective config (the settings row layered over the config file) and
+    ``free`` the UI-editable free-window schedule; the fallback plan and the
+    schedule ride the base config so they apply to every combination.
     """
     combos = list(combinations)
-    default_combo = default_plan_combination(cfg)
+    default_combo = default_plan_combination(rlc)
     if default_combo is not None:
         combos.insert(0, default_combo)
-    return rate_limit_spec(cfg, combos)
+    return rate_limit_spec(cfg, combos, free=free)
 
 
 class GatewayRateLimitReconciler:
@@ -192,6 +208,7 @@ class GatewayRateLimitReconciler:
         await asyncio.gather(
             self._watch(ApiKey, "api_key"),
             self._watch(Principal, "principal"),
+            self._watch(GatewayRateLimitSettings, "settings"),
             self._flush_loop(),
         )
 
@@ -240,7 +257,8 @@ class GatewayRateLimitReconciler:
                 logger.exception(f"Failed to reconcile gateway rate limit: {e}")
 
     async def reconcile(self):
-        combinations = await self._build_combinations()
+        rlc, free = await self._effective()
+        combinations = await self._build_combinations(rlc)
         await ensure_wasm_plugin(
             api=self._extensions_api,
             name=rate_limit_plugin_name,
@@ -248,11 +266,20 @@ class GatewayRateLimitReconciler:
             spec_diff=partial(
                 reconcile_spec_diff,
                 cfg=self._config,
+                rlc=rlc,
                 combinations=combinations,
+                free=free,
             ),
         )
 
-    async def _build_combinations(self) -> List[Dict[str, Any]]:
+    async def _effective(self) -> Tuple[GatewayRateLimitConfig, FreeWindow]:
+        """The deployment defaults and free schedule, read in one session."""
+        async with async_session() as session:
+            return await effective_rate_limit(session, self._config)
+
+    async def _build_combinations(
+        self, rlc: GatewayRateLimitConfig
+    ) -> List[Dict[str, Any]]:
         """Every database-driven combination, within the CR byte budget."""
         async with async_session() as session:
             users = (
@@ -275,7 +302,7 @@ class GatewayRateLimitReconciler:
         for user in users:
             if user.id not in keys_by_user:
                 continue
-            combo = user_limits_combination(user, self._config)
+            combo = user_limits_combination(user, rlc)
             if combo is not None:
                 combinations.append(combo)
         return fit_combinations(combinations, self._budget)

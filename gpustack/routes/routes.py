@@ -14,6 +14,7 @@ from gpustack.routes import (
     dashboard,
     debug,
     draft_models,
+    gateway_rate_limit_settings,
     gpu_devices,
     gpu_instance_ssh_public_keys,
     gpu_instance_templates,
@@ -448,6 +449,11 @@ tenant_routers = model_routers + [
 # Platform-only routers — admin can manage globally; non-admin gets 403.
 admin_routers = [
     {"router": users.router, "prefix": "/users", "tags": ["Users"]},
+    {
+        "router": gateway_rate_limit_settings.router,
+        "prefix": "/rate-limit-settings",
+        "tags": ["Rate Limit Settings"],
+    },
     {
         "router": organizations.router,
         "prefix": "/organizations",

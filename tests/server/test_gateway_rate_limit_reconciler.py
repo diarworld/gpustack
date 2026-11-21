@@ -21,6 +21,19 @@ def make_cfg(**kwargs):
     return cfg
 
 
+def make_rlc(**kwargs):
+    # The effective config the reconciler builds combos from: the settings
+    # row layered over the config file. Tests pass it directly.
+    return GatewayRateLimitConfig(enabled=True, **kwargs)
+
+
+def no_free():
+    """An absent schedule: the reconciler omits the plugin block entirely."""
+    from gpustack.gateway.rate_limit_settings import FreeWindow
+
+    return FreeWindow(enabled=False, start="00:00", end="00:00", days=[])
+
+
 def make_user(id=42, **limits):
     user = MagicMock()
     user.id = id
@@ -38,7 +51,7 @@ def make_user(id=42, **limits):
 class TestUserLimitsCombination:
     def test_buckets_both_consumer_shapes_on_the_user_segment(self):
         combo = user_limits_combination(
-            make_user(), make_cfg(default_rpm=10, default_monthly_tokens=1_000_000)
+            make_user(), make_rlc(default_rpm=10, default_monthly_tokens=1_000_000)
         )
         (match,) = combo["match"]
         expression = match["value"].removeprefix("regexp_capture:")
@@ -52,14 +65,14 @@ class TestUserLimitsCombination:
         combos AND, fallback combos are suppressed the moment any of them
         matches."""
         combo = user_limits_combination(
-            make_user(), make_cfg(default_rpm=10, default_monthly_tokens=1_000_000)
+            make_user(), make_rlc(default_rpm=10, default_monthly_tokens=1_000_000)
         )
         assert "is_fallback" not in combo
 
     def test_unset_fields_inherit_the_deployment_default(self):
         combo = user_limits_combination(
             make_user(),
-            make_cfg(
+            make_rlc(
                 default_rpm=60,
                 default_tpm=100_000,
                 default_monthly_tokens=5_000_000,
@@ -77,7 +90,7 @@ class TestUserLimitsCombination:
             weekly_token_limit=5_000,
             monthly_token_limit=50_000_000,
         )
-        combo = user_limits_combination(user, make_cfg(default_rpm=60))
+        combo = user_limits_combination(user, make_rlc(default_rpm=60))
         assert combo["query_limits"] == {"per_minute": 30}
         assert combo["token_limits"] == {
             "per_minute": 200_000,
@@ -91,7 +104,7 @@ class TestUserLimitsCombination:
         # combo renders nothing; the concurrency default of 1 is what keeps
         # a combo alive in every other configuration.
         assert (
-            user_limits_combination(make_user(), make_cfg(default_concurrency=0))
+            user_limits_combination(make_user(), make_rlc(default_concurrency=0))
             is None
         )
 
@@ -99,12 +112,12 @@ class TestUserLimitsCombination:
         """The user combo suppresses the fallback plan, so the deployment
         concurrency default must be restated on it -- inheriting by omission
         would leave key-holding users uncapped."""
-        combo = user_limits_combination(make_user(), make_cfg())
+        combo = user_limits_combination(make_user(), make_rlc())
         assert combo["concurrency_limits"] == {"default": 1}
 
     def test_per_model_overrides_land_in_the_models_map(self):
         user = make_user(model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
-        combo = user_limits_combination(user, make_cfg())
+        combo = user_limits_combination(user, make_rlc())
         assert combo["concurrency_limits"] == {
             "default": 1,
             "models": {"glm-5.3-flash": 4, "free": 0},
@@ -114,7 +127,7 @@ class TestUserLimitsCombination:
         """``default_concurrency=0`` turns the deployment cap off; a user's
         per-model map must still cap exactly the models it names."""
         user = make_user(model_concurrency_limits={"glm-5.3-flash": 2})
-        combo = user_limits_combination(user, make_cfg(default_concurrency=0))
+        combo = user_limits_combination(user, make_rlc(default_concurrency=0))
         assert combo["concurrency_limits"] == {"models": {"glm-5.3-flash": 2}}
 
     def test_admins_are_exempt_by_omission(self):
@@ -122,14 +135,14 @@ class TestUserLimitsCombination:
         combo without the concurrency block exempts the account entirely --
         even when per-model overrides linger on the row."""
         user = make_user(is_admin=True, model_concurrency_limits={"glm-5.3-flash": 4})
-        combo = user_limits_combination(user, make_cfg(default_rpm=10))
+        combo = user_limits_combination(user, make_rlc(default_rpm=10))
         assert "concurrency_limits" not in combo
 
     def test_concurrency_alone_keeps_the_combo_alive(self):
         """A user with no rate fields or budgets must still get a combo once
         the deployment concurrency cap is on: their requests would otherwise
         fall through to the fallback plan and lose the per-user bucket."""
-        combo = user_limits_combination(make_user(), make_cfg())
+        combo = user_limits_combination(make_user(), make_rlc())
         assert combo["name"] == "user-42"
         assert "query_limits" not in combo
         assert "token_limits" not in combo
@@ -172,13 +185,30 @@ class TestReconcileSpecDiff:
         combos = [{"name": "user-1", "match": []}]
 
         stale = {"defaultConfig": {"rule_name": "ancient"}}
-        spec = reconcile_spec_diff(stale, cfg, combos)
+        spec = reconcile_spec_diff(
+            stale, cfg, cfg.gateway_rate_limit, combos, no_free()
+        )
 
         assert spec.defaultConfig["rule_name"] == "gpustack-rate-limit"
         assert spec.defaultConfig["limit_combinations"] == (
-            [default_plan_combination(cfg)] + combos
+            [default_plan_combination(cfg.gateway_rate_limit)] + combos
         )
         assert spec.priority == 600
+
+    def test_free_schedule_rides_the_base_config(self):
+        """The free window is deployment-wide: it must reach the plugin's
+        ``free_windows`` block regardless of which combinations exist."""
+        from gpustack.gateway.rate_limit_settings import FreeWindow
+
+        cfg = make_cfg(default_rpm=60)
+        free = FreeWindow(enabled=True, start="15:00", end="06:00", days=["sat"])
+        spec = reconcile_spec_diff(None, cfg, cfg.gateway_rate_limit, [], free)
+        assert spec.defaultConfig["free_windows"] == {
+            "enabled": True,
+            "start": "15:00",
+            "end": "06:00",
+            "days": ["sat"],
+        }
 
     def test_defaults_survive_a_pass_without_database_combinations(self):
         """The static pass bootstraps the CR with the default plan, but the
@@ -186,7 +216,7 @@ class TestReconcileSpecDiff:
         the defaults would silence the deployment-wide limits until the next
         server restart."""
         cfg = make_cfg(default_rpm=60)
-        spec = reconcile_spec_diff(None, cfg, [])
+        spec = reconcile_spec_diff(None, cfg, cfg.gateway_rate_limit, [], no_free())
         (combo,) = spec.defaultConfig["limit_combinations"]
         assert combo["name"] == "default-plan"
         assert combo["is_fallback"] is True
@@ -196,7 +226,8 @@ class TestReconcileSpecDiff:
         database: the plugin stays a passthrough instead of enforcing an
         empty plan. With the concurrency default of 1 the default plan is
         never empty."""
-        spec = reconcile_spec_diff(None, make_cfg(default_concurrency=0), [])
+        cfg = make_cfg(default_concurrency=0)
+        spec = reconcile_spec_diff(None, cfg, cfg.gateway_rate_limit, [], no_free())
         assert "limit_combinations" not in spec.defaultConfig
 
 
@@ -207,6 +238,7 @@ class TestReconcilePass:
 
     @pytest.mark.asyncio
     async def test_a_pass_writes_the_reconciler_spec_to_the_right_cr(self, monkeypatch):
+        from gpustack.gateway.rate_limit_settings import FreeWindow
         from gpustack.server.gateway_rate_limit_reconciler import (
             GatewayRateLimitReconciler,
         )
@@ -216,8 +248,15 @@ class TestReconcilePass:
         async def _ensure(**kwargs):
             applied.append(kwargs)
 
-        async def _build(self):
+        async def _build(self, rlc):
             return [{"name": "user-7", "match": []}]
+
+        async def _effective(self):
+            cfg = self._config
+            return (
+                cfg.gateway_rate_limit,
+                FreeWindow(enabled=False, start="00:00", end="00:00", days=[]),
+            )
 
         monkeypatch.setattr(
             "gpustack.server.gateway_rate_limit_reconciler.ensure_wasm_plugin",
@@ -227,6 +266,11 @@ class TestReconcilePass:
             "gpustack.server.gateway_rate_limit_reconciler."
             "GatewayRateLimitReconciler._build_combinations",
             _build,
+        )
+        monkeypatch.setattr(
+            "gpustack.server.gateway_rate_limit_reconciler."
+            "GatewayRateLimitReconciler._effective",
+            _effective,
         )
 
         reconciler = GatewayRateLimitReconciler.__new__(GatewayRateLimitReconciler)
@@ -244,3 +288,6 @@ class TestReconcilePass:
         spec = call["spec_diff"](None)
         combos = spec.defaultConfig["limit_combinations"]
         assert [combo["name"] for combo in combos] == ["default-plan", "user-7"]
+        # A disabled schedule must not leak into the plugin config at all:
+        # absent and inert are the same thing to the plugin.
+        assert "free_windows" not in spec.defaultConfig

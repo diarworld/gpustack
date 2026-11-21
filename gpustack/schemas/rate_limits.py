@@ -121,6 +121,27 @@ class RateLimitResetCreate(BaseModel):
     user_id: Optional[int] = None
 
 
+class FreeWindowUsage(BaseModel):
+    """The deployment's free-window schedule and whether it covers ``now``.
+
+    During a free window the gateway suspends every check and the limit
+    counters freeze; ``active`` tells the UI to badge the section so a
+    frozen counter is not mistaken for a broken read. The schedule is the
+    admin-editable one (``gateway_rate_limit_settings``), evaluated in the
+    deployment's rate-limit timezone.
+    """
+
+    enabled: bool
+    # Whether the moment this response was generated at falls inside the
+    # schedule. Always false when ``enabled`` is false.
+    active: bool = False
+    # UTC wall-clock window ("15:00".."06:00"); may wrap past midnight.
+    start: str
+    end: str
+    # Whole free days, "mon".."sun".
+    days: List[str] = Field(default_factory=list)
+
+
 class RateLimitsResponse(BaseModel):
     """The whole rate-limit picture for the caller's user."""
 
@@ -131,4 +152,6 @@ class RateLimitsResponse(BaseModel):
     generated_at: datetime
     # Short error string when the Redis read failed; ``None`` = healthy.
     usage_error: Optional[str] = None
+    # The free-window schedule; present whenever rate limiting is on.
+    free: Optional[FreeWindowUsage] = None
     user: UserRateLimits

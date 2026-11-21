@@ -301,12 +301,14 @@ class PrincipalBase(SQLModel):
     # kinds — they never hold an API key). Enforced by the gpustack-rate-limit
     # plugin against Redis counters, bucketed per user so every key of the
     # account draws on the same allowance. ``rpm_limit`` / ``tpm_limit`` /
-    # ``monthly_token_limit`` fall back to the ``gateway_rate_limit``
-    # deployment defaults when NULL; the budgets (weekly / monthly) have no
-    # deployment default, because a default budget silently capping every
-    # account is not a safe thing to imply. Rate limits are sliding
-    # per-minute windows; weekly is a rolling 7-day window; monthly resets on
-    # the calendar boundary of the deployment timezone.
+    # ``monthly_token_limit`` fall back to the deployment defaults when NULL
+    # -- the editable ``gateway_rate_limit_settings`` row, seeded from the
+    # ``gateway_rate_limit`` config file (see
+    # :mod:`gpustack.gateway.rate_limit_settings`). The budgets (weekly /
+    # monthly) have no deployment default, because a default budget silently
+    # capping every account is not a safe thing to imply. Rate limits are
+    # sliding per-minute windows; weekly is a rolling 7-day window; monthly
+    # resets on the calendar boundary of the deployment timezone.
     rpm_limit: Optional[int] = Field(
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
@@ -323,8 +325,8 @@ class PrincipalBase(SQLModel):
     # Per-model in-flight caps (USER rows only; the gateway concurrency
     # limit keys its slots per model). Maps a model name to that model's
     # cap for this account; a stored 0 is an explicit unlimited. Models
-    # absent from the map inherit the deployment
-    # ``gateway_rate_limit.default_concurrency``. Bounds mirror what the
+    # absent from the map inherit the deployment concurrency default (the
+    # editable ``gateway_rate_limit_settings`` row). Bounds mirror what the
     # plugin's ConcurrencySpec accepts, so the reconciler's rendered combo
     # can never be refused by the gateway's config parse.
     model_concurrency_limits: Optional[Dict[str, int]] = Field(

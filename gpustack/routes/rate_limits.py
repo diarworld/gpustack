@@ -31,9 +31,11 @@ from gpustack.gateway.rate_limit_usage import (
     reader_from_config,
     user_limit_windows,
 )
+from gpustack.gateway.rate_limit_settings import effective_rate_limit
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
 from gpustack.schemas.model_routes import MyModel
 from gpustack.schemas.rate_limits import (
+    FreeWindowUsage,
     ModelConcurrencyUsage,
     RateLimitResetCreate,
     RateLimitResetStatus,
@@ -211,8 +213,11 @@ async def get_rate_limits(
         limiting is disabled.
     """
     cfg: Config = request.app.state.server_config
-    rlc = cfg.gateway_rate_limit
-    mode = _mode(rlc)
+    # Feature on/off and the counter backend stay config-file state (they
+    # decide whether the reconciler and the plugin run at all); the limit
+    # values are the effective ones -- the settings row admins edit,
+    # layered over the config file.
+    mode = _mode(cfg.gateway_rate_limit)
     # One aware instant shared by every read in this request: the counters
     # and their resets must describe the same moment.
     now = datetime.now(timezone.utc)
@@ -223,6 +228,7 @@ async def get_rate_limits(
         return RateLimitsResponse(mode=mode, generated_at=now, user=UserRateLimits())
 
     target = await _resolve_target(session, user, ctx, user_id)
+    rlc, free = await effective_rate_limit(session, cfg)
 
     # The user limit combo is non-fallback and governs every request of the
     # user, so these windows are the effective user-level picture: requests
@@ -291,6 +297,13 @@ async def get_rate_limits(
         mode=mode,
         generated_at=now,
         usage_error=usage_error,
+        free=FreeWindowUsage(
+            enabled=free.enabled,
+            active=free.is_active(now, rlc.timezone),
+            start=free.start,
+            end=free.end,
+            days=free.days,
+        ),
         user=UserRateLimits(
             rpm_limit=target.rpm_limit,
             tpm_limit=target.tpm_limit,

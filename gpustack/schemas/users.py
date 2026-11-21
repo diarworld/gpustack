@@ -143,16 +143,16 @@ class UserBase(SQLModel):
     # Gateway rate limits, admin-settable. Same names as the Principal
     # columns so ``update_user``'s straight ``model_dump`` write and
     # ``UserPublic.model_validate(principal)`` both need no mapping. NULL
-    # inherits the deployment default from ``gateway_rate_limit``; the
-    # weekly budget has none.
+    # inherits the deployment default (the editable
+    # ``gateway_rate_limit_settings`` row); the weekly budget has none.
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
     weekly_token_limit: Optional[int] = None
     monthly_token_limit: Optional[int] = None
     # Per-model in-flight caps: model name -> cap, 0 = explicit unlimited.
-    # Models absent from the map inherit the deployment
-    # ``gateway_rate_limit.default_concurrency``; admins are exempt from
-    # the cap entirely. Validated against the same bounds the gateway
+    # Models absent from the map inherit the deployment concurrency default
+    # (the editable ``gateway_rate_limit_settings`` row); admins are exempt
+    # from the cap entirely. Validated against the same bounds the gateway
     # plugin's ConcurrencySpec accepts, so a combo rendered from this map
     # is never refused at gateway config parse.
     model_concurrency_limits: Optional[Dict[str, int]] = None

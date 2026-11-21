@@ -103,6 +103,9 @@ from gpustack.schemas.resource_events import (  # noqa: F401  table registration
 from gpustack.schemas.gateway_rate_limit_resets import (  # noqa: F401  table registration
     GatewayRateLimitReset,
 )
+from gpustack.schemas.gateway_rate_limit_settings import (  # noqa: F401  table registration
+    GatewayRateLimitSettings,
+)
 from gpustack.schemas.common import PaginatedList
 from gpustack.schemas.benchmark import (
     ModelInstanceRuntimeInfo,
