@@ -45,7 +45,7 @@ Bu dağıtım şu varsayılanları kullanır:
 
 | Pencere   | Varsayılan                                                              |
 | --------- | ----------------------------------------------------------------------- |
-| RPM       | dakikada 3 istek                                                        |
+| RPM       | dakikada 10 istek                                                        |
 | TPM       | dakikada 768.000 token                                                  |
 | Gün       | API anahtarı başına günlük 10.000.000 token                             |
 | Ay        | kullanıcı başına aylık 100.000.000 token                                |

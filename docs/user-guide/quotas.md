@@ -65,7 +65,7 @@ This deployment ships the following defaults:
 
 | Window | Default                                 |
 | ------ | --------------------------------------- |
-| RPM    | 3 requests / minute                     |
+| RPM    | 10 requests / minute                    |
 | TPM    | 768,000 tokens / minute                 |
 | Day    | 10,000,000 tokens per API key           |
 | Month  | 100,000,000 tokens per user             |
