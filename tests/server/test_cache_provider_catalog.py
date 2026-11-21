@@ -92,10 +92,12 @@ def test_mooncake_launches_a_master_with_per_node_stores():
     assert localized_default(provider.description)
     assert provider.attach_locality == "cluster"
 
-    # one CPU build serves every node: the master and the stores are
-    # host-DRAM processes, the GPU work happens in the engines
-    assert list(provider.versions) == ["0.3.13.post1-cpu"]
-    assert provider.default_version == "0.3.13.post1-cpu"
+    # the master and the stores are host-DRAM processes; 0.3.14 rides
+    # the mirrored upstream image, the locally built -cpu wheel image
+    # stays as a fallback version
+    assert list(provider.versions) == ["0.3.14", "0.3.13.post1-cpu"]
+    assert provider.default_version == "0.3.14"
+    assert provider.versions["0.3.14"].image == "gpustack/mooncake:0.3.14"
     assert (
         provider.versions["0.3.13.post1-cpu"].image
         == "gpustack/mirrored-mooncake:0.3.13.post1-cpu"

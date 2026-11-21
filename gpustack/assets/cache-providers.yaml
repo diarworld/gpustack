@@ -623,11 +623,19 @@
   # one place and hands out segment locations wherever the stores run,
   # so an engine on any worker shares the same pool.
   attach_locality: cluster
-  # One CPU build serves every node: the master and the stores are pure
-  # host-DRAM processes — the GPU work happens in the engines attaching
-  # to them, which the integrations below scope per accelerator.
-  default_version: "0.3.13.post1-cpu"
+  # The master and the stores are pure host-DRAM processes - the GPU
+  # work happens in the engines attaching to them, which the
+  # integrations below scope per accelerator. The upstream image ships
+  # a CUDA-linked wheel but vendors stub driver libs, so it imports and
+  # runs fine without GPU access; the locally built -cpu wheel image
+  # stays as a fallback for when upstream stops publishing.
+  default_version: "0.3.14"
   versions:
+    0.3.14:
+      # Upstream kvcacheai/mooncake:0.3.14, mirrored: docker.io is not
+      # reachable from the cluster, the skopeo job that pulled it lives
+      # in the ops repo (mirror/mirror-mooncake-upstream.yaml).
+      image: gpustack/mooncake:0.3.14
     0.3.13.post1-cpu:
       image: gpustack/mirrored-mooncake:0.3.13.post1-cpu
   components:
