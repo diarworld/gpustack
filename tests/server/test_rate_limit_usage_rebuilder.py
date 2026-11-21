@@ -2,11 +2,11 @@
 
 The rebuilder must reproduce the plugin's own accounting closely enough to
 restore lost quotas: the right keys (user-level buckets on
-``gpustack-<id>``, key buckets on the full consumer identity), the right
-token totals per hour bucket, a startup warm-up that replaces whatever
-survived, and a hard rule that steady-state cycles never touch live
-counters. Resets (``gateway_rate_limit_resets``) forgive earlier spend, so
-a rebuilt weekly / monthly counter resumes from the reset.
+``gpustack-<id>``), the right token totals per hour bucket, a startup
+warm-up that replaces whatever survived, and a hard rule that steady-state
+cycles never touch live counters. Resets (``gateway_rate_limit_resets``)
+forgive earlier spend, so a rebuilt weekly / monthly counter resumes from
+the reset.
 """
 
 from datetime import datetime, timezone
@@ -19,7 +19,6 @@ from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.principals import Principal
 from gpustack.server import rate_limit_usage_rebuilder as rebuilder
 from gpustack.gateway.rate_limit_usage import (
-    key_windows,
     user_limit_windows,
     default_plan_windows,
 )
@@ -40,7 +39,6 @@ def _cfg(**overrides) -> GatewayRateLimitConfig:
         timezone="UTC",
         default_rpm=10,
         default_tpm=60_000,
-        default_daily_tokens=2_000_000,
         default_monthly_tokens=20_000_000,
     )
     fields.update(overrides)
@@ -58,14 +56,13 @@ def _user(id: int, *, weekly=None, monthly=None) -> Principal:
     )
 
 
-def _key(id: int, *, access_key="ak", user_id=7, daily_token_limit=None) -> ApiKey:
+def _key(id: int, *, access_key="ak", user_id=7) -> ApiKey:
     return ApiKey(
         id=id,
         name=f"key-{id}",
         user_id=user_id,
         access_key=access_key,
         hashed_secret_key=f"hash-{id}",
-        daily_token_limit=daily_token_limit,
     )
 
 
@@ -171,6 +168,19 @@ def _tokens(zset: dict) -> dict:
     return parsed
 
 
+def _long_windows(rlc, user) -> dict:
+    """The user-level long windows, keyed by period. The default plan's
+    month window is included: the fallback is where a user without their
+    own monthly budget gets its counter."""
+    windows = {}
+    for spec in user_limit_windows(rlc, user.id, user) + default_plan_windows(
+        rlc, user.id
+    ):
+        if spec.period != "60s":
+            windows.setdefault(spec.period, spec.redis_key)
+    return windows
+
+
 @pytest.fixture
 def frozen_now(monkeypatch):
     monkeypatch.setattr(rebuilder, "datetime", FrozenDateTime)
@@ -201,18 +211,18 @@ async def _run(monkeypatch, rlc, users, keys, rows, resets=(), existing=None):
 async def test_rebuild_restores_lost_counters_from_usage_details(
     frozen_now, monkeypatch
 ):
-    """Day / month / week counters reappear with per-hour members and the
-    right attribution: key windows count only their key's rows, user windows
-    count every row of the user, and UI traffic (keyless rows) rides the
-    user-level buckets only."""
+    """Week / month counters reappear with per-hour members and the right
+    attribution: every window is user-level, so keyed and keyless (UI) rows
+    of the user aggregate together, and another user's traffic never leaks
+    in."""
     rlc = _cfg()
     user7, user9 = _user(7, weekly=100_000), _user(9)
     key42 = _key(42, access_key="ak-abc", user_id=7)
     key43 = _key(43, access_key="ak-nine", user_id=9)
     rows = [
-        # Today: the key's own day quota and the user's shared windows.
+        # Today: the user's shared windows.
         _row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50),
-        # Keyless UI traffic: user-level windows only.
+        # Keyless UI traffic: rides the same user-level buckets.
         _row(7, None, datetime(2026, 11, 19, 10, 30), 10, 5),
         # Three days back: inside the rolling week, outside today.
         _row(7, 42, datetime(2026, 11, 16, 8, 0), 500, 0),
@@ -224,42 +234,29 @@ async def test_rebuild_restores_lost_counters_from_usage_details(
 
     client, _, _ = await _run(monkeypatch, rlc, [user7, user9], [key42, key43], rows)
 
-    # The key's day quota: only key-42's rows, today only.
-    day_key = key_windows(rlc, key42)[0].redis_key
-    day_members = _tokens(client.zsets[day_key])
-    assert day_members == {
-        f"rebuild-7-42-{hour_ts(datetime(2026, 11, 19, 9, 0))}|150": (
-            150,
-            hour_ts(datetime(2026, 11, 19, 9, 0)) + 1,
-        )
-    }
-
-    # The user's shared week: key + keyless rows, inside the rolling window.
-    week_windows = {w.redis_key: w for w in user_limit_windows(rlc, 7, user7)}
-    week_key = next(k for k, w in week_windows.items() if w.period == "604800s")
+    # The user's shared week: keyed + keyless rows, inside the rolling
+    # window.
+    week_key = _long_windows(rlc, user7)["604800s"]
     week_members = _tokens(client.zsets[week_key])
     assert sum(tokens for tokens, _ in week_members.values()) == 665
     assert len(week_members) == 3
 
     # The user's shared month: the pre-month row stays out.
-    month_key = next(k for k, w in week_windows.items() if w.period == "each_month")
+    month_key = _long_windows(rlc, user7)["each_month"]
     month_members = _tokens(client.zsets[month_key])
     assert sum(tokens for tokens, _ in month_members.values()) == 665
 
     # The default-plan fallback rides the same user-level aggregates.
-    plan_windows = {
-        w.redis_key: w for w in default_plan_windows(rlc, 7) if w.period != "60s"
-    }
-    plan_day = next(k for k, w in plan_windows.items() if w.period == "each_day")
-    assert sum(tokens for tokens, _ in _tokens(client.zsets[plan_day]).values()) == 165
-    plan_month = next(k for k, w in plan_windows.items() if w.period == "each_month")
+    plan_month = next(
+        w.redis_key for w in default_plan_windows(rlc, 7) if w.period == "each_month"
+    )
     assert (
         sum(tokens for tokens, _ in _tokens(client.zsets[plan_month]).values()) == 665
     )
 
-    # The other user's day quota carries only their own rows.
-    day43 = key_windows(rlc, key43)[0].redis_key
-    assert sum(tokens for tokens, _ in _tokens(client.zsets[day43]).values()) == 999
+    # The other user's month carries only their own rows.
+    user9_month = _tokens(client.zsets[_long_windows(rlc, user9)["each_month"]])
+    assert sum(tokens for tokens, _ in user9_month.values()) == 999
 
     # Minute windows are never rebuilt: no 60s key anywhere.
     assert not any("60s" in key for key in client.zsets)
@@ -273,7 +270,7 @@ async def test_warmup_replaces_a_stale_counter(frozen_now, monkeypatch):
     rlc = _cfg()
     user7 = _user(7)
     key42 = _key(42, access_key="ak-abc", user_id=7)
-    day_key = key_windows(rlc, key42)[0].redis_key
+    month_key = _long_windows(rlc, user7)["each_month"]
     rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
     shared = FakeAsyncSession([[user7], [key42], [], rows])
@@ -284,14 +281,14 @@ async def test_warmup_replaces_a_stale_counter(frozen_now, monkeypatch):
         lambda cfg: SimpleNamespace(client=FakeRedis()),
     )
     rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
-    client = FakeRedis(existing={day_key})
+    client = FakeRedis(existing={month_key})
     # The gateway's own live member: whatever the young counter counted.
-    client.zsets[day_key] = {"<uuid-of-live-request>|77": 5}
+    client.zsets[month_key] = {"<uuid-of-live-request>|77": 5}
 
     await rebuild._rebuild(rlc, client)
 
-    assert _tokens(client.zsets[day_key]) == {
-        f"rebuild-7-42-{hour_ts(datetime(2026, 11, 19, 9, 0))}|150": (
+    assert _tokens(client.zsets[month_key]) == {
+        f"rebuild-7-{hour_ts(datetime(2026, 11, 19, 9, 0))}|150": (
             150,
             hour_ts(datetime(2026, 11, 19, 9, 0)) + 1,
         )
@@ -333,25 +330,25 @@ async def test_missing_counter_is_rebuilt_in_steady_state(frozen_now, monkeypatc
 
     client, shared, rebuild = await _run(monkeypatch, rlc, [user7], [key42], rows)
     snapshot = {key: dict(zset) for key, zset in client.zsets.items()}
-    # Everything survives the failover except the key's day counter.
+    # Everything survives the failover except the user's month counter.
     client.existing.update(snapshot)
-    day_key = key_windows(rlc, key42)[0].redis_key
-    client.existing.discard(day_key)
-    client.zsets.pop(day_key, None)
+    month_key = _long_windows(rlc, user7)["each_month"]
+    client.existing.discard(month_key)
+    client.zsets.pop(month_key, None)
 
     await rebuild._rebuild(rlc, client)
 
-    assert client.zsets[day_key] == snapshot[day_key]
+    assert client.zsets[month_key] == snapshot[month_key]
     for key, zset in snapshot.items():
-        if key != day_key:
+        if key != month_key:
             assert client.zsets[key] == zset
 
 
 @pytest.mark.asyncio
 async def test_reset_cutoffs_keep_forgiven_spend_out(frozen_now, monkeypatch):
     """A reset forgives the spend before it: the weekly counter is rebuilt
-    from post-reset rows only, while the daily quota (no reset kind) keeps
-    every row inside its window."""
+    from post-reset rows only, while the monthly counter (whose reset
+    predates every row) keeps everything inside its window."""
     rlc = _cfg()
     user7 = _user(7, weekly=100_000, monthly=5_000_000)
     key42 = _key(42, access_key="ak-abc", user_id=7)
@@ -380,11 +377,6 @@ async def test_reset_cutoffs_keep_forgiven_spend_out(frozen_now, monkeypatch):
         if w.period == "each_month"
     )
     assert sum(tokens for tokens, _ in _tokens(client.zsets[month_key]).values()) == 850
-
-    # The daily quota has no reset kind, but the day window only spans the
-    # last 24 hours: the Nov 17 row is outside it on its own, reset or not.
-    day_key = key_windows(rlc, key42)[0].redis_key
-    assert sum(tokens for tokens, _ in _tokens(client.zsets[day_key]).values()) == 150
 
 
 @pytest.mark.asyncio
@@ -428,11 +420,11 @@ async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
     # merging into it.
     shared = FakeAsyncSession([[user7], [key42], [], rows])
     monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
-    day_key = key_windows(rlc, key42)[0].redis_key
-    client.existing.add(day_key)
+    month_key = _long_windows(rlc, user7)["each_month"]
+    client.existing.add(month_key)
     await rebuild._rebuild(rlc, client)
     assert rebuild._warmed is True
-    assert _tokens(client.zsets[day_key])
+    assert _tokens(client.zsets[month_key])
 
 
 @pytest.mark.asyncio
@@ -456,32 +448,34 @@ async def test_scan_covers_rows_dated_outside_the_utc_day(frozen_now, monkeypatc
     )
     assert "2026-11-20" in rows_statement
 
-    # And the row itself landed in the key's day counter.
-    day_key = key_windows(rlc, key42)[0].redis_key
-    assert sum(tokens for tokens, _ in _tokens(client.zsets[day_key]).values()) == 300
+    # And the row itself landed in the user's month counter.
+    month_key = _long_windows(rlc, user7)["each_month"]
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[month_key]).values()) == 300
 
 
 @pytest.mark.asyncio
-async def test_day_boundary_follows_the_deployment_timezone(frozen_now, monkeypatch):
+async def test_month_boundary_follows_the_deployment_timezone(frozen_now, monkeypatch):
     """Calendar windows anchor to the configured timezone: a row before the
-    local midnight is outside the day window even though its UTC stamp sits
-    inside a UTC day."""
+    local month start is outside the window even though a UTC-month filter
+    would treat it the same, and a row past the local start stays inside
+    even though its UTC date sits in the previous UTC month."""
     rlc = _cfg(timezone="Europe/Berlin")
     user7 = _user(7)
     key42 = _key(42, access_key="ak-abc", user_id=7)
     rows = [
-        # 20:00 UTC = 21:00 Berlin on Nov 18 -- before the Berlin day that
-        # starts at 23:00 UTC.
-        _row(7, 42, datetime(2026, 11, 18, 20, 0), 100, 0),
-        # 23:30 UTC = 00:30 Berlin on Nov 19 -- inside.
-        _row(7, 42, datetime(2026, 11, 18, 23, 30), 40, 10),
+        # Oct 31 22:30 UTC = 23:30 Berlin on Oct 31 -- before the Berlin
+        # month that starts Nov 1, 00:00 Berlin (Oct 31 23:00 UTC).
+        _row(7, 42, datetime(2026, 10, 31, 22, 30), 100, 0),
+        # Oct 31 23:30 UTC = Nov 1, 00:30 Berlin -- inside, though its UTC
+        # date is Oct 31.
+        _row(7, 42, datetime(2026, 10, 31, 23, 30), 40, 10),
     ]
 
     client, _, _ = await _run(monkeypatch, rlc, [user7], [key42], rows)
 
-    day_key = key_windows(rlc, key42)[0].redis_key
-    day_members = _tokens(client.zsets[day_key])
-    assert sum(tokens for tokens, _ in day_members.values()) == 50
-    (member,) = day_members
-    # The kept bucket is the 23:00 UTC hour of Nov 18.
-    assert member == f"rebuild-7-42-{hour_ts(datetime(2026, 11, 18, 23, 0))}|50"
+    month_key = _long_windows(rlc, user7)["each_month"]
+    month_members = _tokens(client.zsets[month_key])
+    assert sum(tokens for tokens, _ in month_members.values()) == 50
+    (member,) = month_members
+    # The kept bucket is the 23:00 UTC hour of Oct 31.
+    assert member == f"rebuild-7-{hour_ts(datetime(2026, 10, 31, 23, 0))}|50"

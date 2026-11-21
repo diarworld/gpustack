@@ -15,16 +15,11 @@ A key that is off by one byte reads an empty counter, so the golden strings
 in ``tests/gateway/test_rate_limit_usage.py`` pin the layout.
 
 Combo semantics mirror the reconciler
-(``gpustack.server.gateway_rate_limit_reconciler``), whose group rules decide
-which keys exist for a given request path:
-
-* a key with any explicit limit binds a non-fallback combo -- the fallback
-  group is suppressed for its requests, so only that combo's windows exist;
-  its unset fields inherit the deployment default and its owner's budgets
-  are folded in;
-* everyone else (no key, or a key without explicit limits) is bound by the
-  fallback group: the default plan plus, when set, the owner's budget combo,
-  both bucketed on the captured ``gpustack-<user_id>`` segment.
+(``gpustack.server.gateway_rate_limit_reconciler``): every limit is
+user-level -- the user limit combo is non-fallback and binds every request
+of a user with keys, so only the default-plan fallback windows exist for
+requests outside it, both bucketed on the captured ``gpustack-<user_id>``
+segment.
 
 Live reads sit on top of the specs: :class:`RateLimitUsageReader` totals the
 plugin's counters per window -- :meth:`~RateLimitUsageReader.read_window` is
@@ -44,7 +39,6 @@ import redis.asyncio as redis_asyncio
 
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS, rate_limit_plugin_name
-from gpustack.security import gateway_consumer_identity, is_legacy_token_access_key
 
 if TYPE_CHECKING:
     from gpustack.schemas.api_keys import ApiKey
@@ -153,17 +147,6 @@ def default_plan_windows(
                 rlc.default_tpm,
             )
         )
-    if rlc.default_daily_tokens:
-        windows.append(
-            _window(
-                "token_calendar",
-                combo,
-                identity,
-                DAY_PERIOD,
-                None,
-                rlc.default_daily_tokens,
-            )
-        )
     if rlc.default_monthly_tokens:
         windows.append(
             _window(
@@ -265,36 +248,6 @@ def user_limit_windows(
     return windows
 
 
-def key_windows(
-    rlc: GatewayRateLimitConfig, key: "ApiKey"
-) -> List[RateLimitWindowSpec]:
-    """The non-fallback combo for one key, mirroring the reconciler's
-    ``key_combination``: one calendar day quota -- the key's own
-    ``daily_token_limit`` or the deployment default. Every other window is
-    user-level and lives on the user limit combo; a combo cannot host two
-    windows of the same granularity, and the user's caps must AND with
-    every key's own."""
-    identity = gateway_consumer_identity(key.access_key, key.user_id)
-    combo = f"key-{key.id}"
-    daily = (
-        key.daily_token_limit
-        if key.daily_token_limit is not None
-        else rlc.default_daily_tokens
-    )
-    if not daily:
-        return []
-    return [
-        _window(
-            "token_calendar",
-            combo,
-            identity,
-            DAY_PERIOD,
-            None,
-            daily,
-        )
-    ]
-
-
 @dataclass
 class ModelConcurrencySpec:
     """One per-model in-flight cap: which slot counter it tracks."""
@@ -350,37 +303,17 @@ def expected_windows(
     for UI traffic -- and ``user`` the target user's row carrying the four
     user-level limit fields (``rpm_limit``, ``tpm_limit``,
     ``weekly_token_limit``, ``monthly_token_limit``). The user limit combo
-    governs every request; a non-legacy key adds its own day quota on top,
-    so the two AND together exactly as the plugin enforces them.
+    governs every request; ``key`` is accepted (and ignored) so callers can
+    pass the authenticated principal without branching.
 
-    Deployment-token rows (legacy access keys) count as keyless: the
-    reconciler never publishes a ``key-<id>`` combo for them, so only the
-    user combo applies.
+    Deployment-token rows (legacy access keys) count as keyless: only the
+    user combo governs their requests.
 
     Calendar windows carry ``window_seconds=None``: their length is not
     fixed, it follows the boundary in ``rlc.timezone`` (see
     :func:`calendar_window_seconds`).
     """
-    windows = user_limit_windows(rlc, user_id, user)
-    if key is not None and not is_legacy_token_access_key(key.access_key):
-        windows.extend(key_windows(rlc, key))
-    return windows
-
-
-def source_for(key: Optional["ApiKey"]) -> str:
-    """Which published combinations govern the key's requests: the user
-    limit combo plus the key's own day quota (``user+key``), or the user
-    limit combo alone (``user``).
-
-    Legacy deployment-token keys are an intentional divergence from
-    :func:`expected_windows`: the reconciler never publishes their
-    ``key-<id>`` combo, so only the user combo governs those requests, yet
-    this still reports ``user+key`` -- the field describes the key row's own
-    day quota, which is what the endpoint displays.
-    """
-    if key is not None:
-        return "user+key"
-    return "user"
+    return user_limit_windows(rlc, user_id, user)
 
 
 def _calendar_period_bounds(

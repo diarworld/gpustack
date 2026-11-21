@@ -155,17 +155,20 @@ class GatewayRateLimitConfig(BaseModel):
     # monthly numbers impossible to reason about.
     timezone: str = "UTC"
 
-    rejected_code: int = Field(default=429, ge=100, le=599)
-    # Rendered as an OpenAI-style error envelope; a JSON object literal is
-    # sent verbatim (see the plugin's rejection-response documentation).
-    rejected_msg: str = "Too many requests"
+    # Rejection code / message are deliberately absent by default: the
+    # plugin names the limit axis that tripped in the rejection body (and
+    # always answers 429), so an operator-set value here would override
+    # those per-limit texts. Rendered as an OpenAI-style error envelope; a
+    # JSON object literal is sent verbatim (see the plugin's
+    # rejection-response documentation).
+    rejected_code: Optional[int] = Field(default=None, ge=100, le=599)
+    rejected_msg: Optional[str] = None
 
     # Deployment-wide defaults, all optional: unset means no limit of that
     # kind. Requests and rolling tokens are sliding windows; token budgets
     # reset on the calendar boundary of ``timezone``.
     default_rpm: Optional[int] = Field(default=None, ge=1)
     default_tpm: Optional[int] = Field(default=None, ge=1)
-    default_daily_tokens: Optional[int] = Field(default=None, ge=1)
     default_monthly_tokens: Optional[int] = Field(default=None, ge=1)
 
     # Simultaneous in-flight requests one user may run against one model.

@@ -1,14 +1,13 @@
 """Live rate-limit windows as enforced by the gateway plugin.
 
 These models are the payload of ``GET /usage/rate-limits``: the limits the
-``gateway_rate_limit`` config, the API keys and the user token budgets
-publish, paired with the current window counters read from Redis at request
-time — a snapshot of what the ``gpustack-rate-limit`` plugin is enforcing
-right now, not a reconstruction from historical usage rows. The endpoint
-serves the response with ``response_model_exclude_none=True``, so an
-optional field that is ``None`` is omitted from the JSON instead of
-arriving as ``null``; clients must treat every optional field as
-absent-able.
+``gateway_rate_limit`` config and the user token budgets publish, paired
+with the current window counters read from Redis at request time — a
+snapshot of what the ``gpustack-rate-limit`` plugin is enforcing right
+now, not a reconstruction from historical usage rows. The endpoint serves
+the response with ``response_model_exclude_none=True``, so an optional
+field that is ``None`` is omitted from the JSON instead of arriving as
+``null``; clients must treat every optional field as absent-able.
 """
 
 from datetime import datetime
@@ -84,8 +83,7 @@ class UserRateLimits(BaseModel):
     it: requests and tokens per minute, the weekly rolling budget and the
     monthly calendar quota -- unset user fields inherited the deployment
     default at publish time. Every window buckets on the user, so its
-    counter is that user's own traffic across all their keys. Per-key day
-    quotas live on the ``api_keys`` entries.
+    counter is that user's own traffic across all their keys.
     """
 
     # From the ``users`` table; ``None`` = the user has no limit of that
@@ -95,6 +93,10 @@ class UserRateLimits(BaseModel):
     tpm_limit: Optional[int] = None
     weekly_limit: Optional[int] = None
     monthly_limit: Optional[int] = None
+    # The deployment-wide in-flight cap per model (``default_concurrency``);
+    # ``None`` = no default cap. Models named in ``model_concurrency_limits``
+    # carry their own override instead.
+    concurrency_default: Optional[int] = None
     windows: List[RateLimitWindowUsage] = Field(default_factory=list)
     # Per-model in-flight caps (``model_concurrency_limits``) with their
     # live slot counts; empty for admins (exempt) and users without
@@ -104,22 +106,6 @@ class UserRateLimits(BaseModel):
     # ``monthly``), only in redis mode -- in local mode there are no
     # counters a reset could clear.
     resets: Optional[Dict[str, RateLimitResetStatus]] = None
-
-
-class ApiKeyRateLimits(BaseModel):
-    """One API key's limits and the windows its requests are governed by."""
-
-    id: int
-    name: str
-    # The key's own daily token budget; ``None`` = it inherits the
-    # deployment default (and may be unset there too, leaving the axis
-    # unlimited). Rate and per-minute token caps are user-level.
-    daily_token_limit: Optional[int] = None
-    # Which published combinations govern the key's requests, mirroring
-    # ``source_for``: ``user+key`` (the user limit combo plus the key's own
-    # day quota) or ``user`` (the user limit combo alone).
-    source: str
-    windows: List[RateLimitWindowUsage] = Field(default_factory=list)
 
 
 class RateLimitResetCreate(BaseModel):
@@ -146,6 +132,3 @@ class RateLimitsResponse(BaseModel):
     # Short error string when the Redis read failed; ``None`` = healthy.
     usage_error: Optional[str] = None
     user: UserRateLimits
-    # Every key the user owns, so the UI renders the per-key view from one
-    # response instead of fanning out per key.
-    api_keys: List[ApiKeyRateLimits] = Field(default_factory=list)

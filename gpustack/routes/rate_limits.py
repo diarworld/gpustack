@@ -1,7 +1,7 @@
 """Live rate-limit windows for the Usage page (``GET /usage/rate-limits``).
 
-Pairs the limits the ``gateway_rate_limit`` config, the target user's token
-budgets and their API keys publish (via
+Pairs the limits the ``gateway_rate_limit`` config and the target user's
+token budgets publish (via
 :func:`gpustack.gateway.rate_limit_usage.expected_windows`) with the live
 counters the gateway's ``gpustack-rate-limit`` plugin keeps in Redis, read
 through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
@@ -25,18 +25,14 @@ from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowState,
     RateLimitWindowSpec,
     default_plan_windows,
-    key_windows,
     model_concurrency_specs,
     read_concurrency,
     read_windows,
     reader_from_config,
-    source_for,
     user_limit_windows,
 )
-from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
 from gpustack.schemas.rate_limits import (
-    ApiKeyRateLimits,
     ModelConcurrencyUsage,
     RateLimitResetCreate,
     RateLimitResetStatus,
@@ -45,7 +41,6 @@ from gpustack.schemas.rate_limits import (
     UserRateLimits,
 )
 from gpustack.schemas.users import User
-from gpustack.security import is_legacy_token_access_key
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
 
 router = APIRouter()
@@ -199,12 +194,9 @@ async def get_rate_limits(
     now = datetime.now(timezone.utc)
 
     if mode == "disabled":
-        # The UI hides the section entirely: no Redis dial, no budget read,
-        # not even the key listing — nothing here is meaningful when the
-        # plugin enforces nothing.
-        return RateLimitsResponse(
-            mode=mode, generated_at=now, user=UserRateLimits(), api_keys=[]
-        )
+        # The UI hides the section entirely: no Redis dial, no budget read
+        # — nothing here is meaningful when the plugin enforces nothing.
+        return RateLimitsResponse(mode=mode, generated_at=now, user=UserRateLimits())
 
     target = await _resolve_target(session, user, ctx, user_id)
 
@@ -215,26 +207,7 @@ async def get_rate_limits(
     # default). All bucket on ``gpustack-<id>`` -- the user's own traffic
     # across all their keys.
     user_specs = user_limit_windows(rlc, target.id, target)
-
-    # Every live key of the target adds its own day quota on top, skipping
-    # deployment-token rows. Soft-deleted keys no longer authenticate, so
-    # they enforce nothing and stay out of the per-key view. Legacy rows are
-    # skipped because the reconciler never publishes a ``key-<id>`` combo
-    # for them -- only the user combo governs their requests -- so they
-    # carry no per-key windows to show.
-    keys = (
-        await session.exec(
-            select(ApiKey)
-            .where(ApiKey.user_id == target.id, ApiKey.deleted_at.is_(None))
-            .order_by(ApiKey.id)
-        )
-    ).all()
-    live_keys = [key for key in keys if not is_legacy_token_access_key(key.access_key)]
-    key_specs = {key.id: key_windows(rlc, key) for key in live_keys}
-
     all_specs = list(user_specs)
-    for specs in key_specs.values():
-        all_specs.extend(specs)
 
     states: List[Optional[RateLimitWindowState]]
     usage_error = None
@@ -285,6 +258,7 @@ async def get_rate_limits(
             tpm_limit=target.tpm_limit,
             weekly_limit=target.weekly_token_limit,
             monthly_limit=target.monthly_token_limit,
+            concurrency_default=rlc.default_concurrency,
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
             ],
@@ -298,19 +272,6 @@ async def get_rate_limits(
             ],
             resets=resets,
         ),
-        api_keys=[
-            ApiKeyRateLimits(
-                id=key.id,
-                name=key.name,
-                daily_token_limit=key.daily_token_limit,
-                source=source_for(key),
-                windows=[
-                    _window_usage(spec, state_by_spec[id(spec)])
-                    for spec in key_specs[key.id]
-                ],
-            )
-            for key in live_keys
-        ],
     )
 
 

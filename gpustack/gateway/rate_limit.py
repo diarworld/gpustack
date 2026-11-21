@@ -92,8 +92,6 @@ def default_plan_combination(cfg: Config) -> Optional[Dict[str, Any]]:
     query_limits = {"per_minute": rlc.default_rpm} if rlc.default_rpm else None
     token_limits = {"per_minute": rlc.default_tpm} if rlc.default_tpm else None
     token_quota: Dict[str, int] = {}
-    if rlc.default_daily_tokens:
-        token_quota["each_day"] = rlc.default_daily_tokens
     if rlc.default_monthly_tokens:
         token_quota["each_month"] = rlc.default_monthly_tokens
     concurrency_limits = (
@@ -156,17 +154,23 @@ def rate_limit_base_config(cfg: Config) -> Dict[str, Any]:
     the plugin's redis client can address.
     """
     rlc = cfg.gateway_rate_limit
+    # rejected_code / rejected_msg stay absent unless the operator set them:
+    # the plugin's own rejection texts name the limit axis that tripped, and
+    # an explicit value here would override them.
     config: Dict[str, Any] = {
         "rule_name": rate_limit_plugin_name,
         "timezone": rlc.timezone,
-        "rejected_code": rlc.rejected_code,
-        "rejected_msg": rlc.rejected_msg,
         # The rejected response carries the triggering Redis key, which is
         # how an operator maps a 429 back to the user and window that
         # produced it.
         "show_limit_quota_header": True,
-        **rlc.plugin_config,
     }
+    if rlc.rejected_code is not None:
+        config["rejected_code"] = rlc.rejected_code
+    if rlc.rejected_msg:
+        config["rejected_msg"] = rlc.rejected_msg
+    # Operator pass-through fields apply last: they override the base.
+    config.update(rlc.plugin_config)
     if rlc.redis is not None:
         registry = rate_limit_redis_registry(cfg, cfg.gateway_namespace)
         config["redis"] = {

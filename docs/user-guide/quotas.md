@@ -22,18 +22,23 @@ The `?` icon on a card explains its window.
 
 When a limit is hit, further requests are rejected at the gateway with
 `429 Too Many Requests` — before any model instance is contacted — until the
-window frees up again.
+window frees up again. The rejection body names the limit that tripped (for
+example `Too many requests per minute`, `Monthly token quota limit reached,
+reset in usage overview` or `Too many concurrent requests for this model`), and
+rolling and calendar windows carry a `Retry-After` header with the seconds
+until the window frees up. RPM and TPM guard against short bursts; the weekly
+and monthly budgets cap sustained consumption. A request counts against every
+window it can touch: your API-key traffic and your UI sessions draw on the same
+user-level allowance.
 
-RPM and TPM guard against short bursts; the weekly and monthly budgets cap
-sustained consumption. A request counts against every window it can touch: your
-API-key traffic and your UI sessions draw on the same user-level allowance.
+## Concurrency by Model
 
-## Per-Key Daily Usage
-
-The table under the cards lists each of your API keys against its daily token
-quota — the key's own daily limit or the deployment default — with a spent /
-limit readout for the current day. The daily window is calendar-aligned and
-resets at midnight in the deployment timezone.
+The table under the cards lists the models you can reach against the
+deployment's in-flight cap: how many requests to each model are running right
+now, and the effective limit for that model — the administrator's per-model
+override if one is set, the deployment default otherwise. A model whose running
+count sits at its limit is the source of the `429 Too Many Concurrent
+Requests` rejections.
 
 ## Model Concurrency
 
@@ -42,7 +47,8 @@ Beyond the rate and budget windows, the gateway caps how many of your requests
 the same time. The deployment default is **1**: while one request to a model is
 still running, a second parallel request to the same model is rejected with
 `429 Too Many Requests` until the first one finishes. The slot frees up the
-moment a request completes — there is no window to wait out.
+moment a request completes — there is no window to wait out, so the rejection
+carries no `Retry-After` header.
 
 Each model is counted separately: a running request against one model does not
 block requests against other models. Administrators are not subject to this
@@ -55,11 +61,11 @@ and an override of `0` lifts the cap for that model entirely.
 ## Where the Numbers Come From
 
 - **Deployment defaults** — set by the administrator for everyone: RPM, TPM,
-  daily and monthly tokens. An unset default means that window is not limited.
+  monthly tokens and the per-model concurrency cap. An unset default means that
+  window is not limited.
 - **Per-user budgets** — weekly and monthly token budgets an administrator sets
-  on your account, shared across all of your keys and sessions.
-- **Per-key limits** — RPM, TPM and a daily token limit on an individual key.
-  Unset fields inherit the deployment defaults.
+  on your account, shared across all of your keys and sessions. RPM and TPM
+  limits set on your account are user-level the same way.
 
 This deployment ships the following defaults:
 
@@ -67,7 +73,6 @@ This deployment ships the following defaults:
 | ------ | --------------------------------------- |
 | RPM    | 10 requests / minute                    |
 | TPM    | 768,000 tokens / minute                 |
-| Day    | 10,000,000 tokens per API key           |
 | Month  | 100,000,000 tokens per user             |
 | Week   | no default — only accounts with an explicit weekly budget are capped |
 
@@ -87,7 +92,8 @@ when and why — so the audit trail shows how each budget came to restart.
 !!! note
 
     Resets apply to the weekly and monthly budgets only. RPM, TPM and the
-    per-key daily quotas are short windows that free up on their own.
+    model concurrency cap are short-lived: the counters free up on their own
+    as requests age out or complete.
 
 ### Reset Quota
 

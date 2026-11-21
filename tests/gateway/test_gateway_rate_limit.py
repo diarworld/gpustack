@@ -65,7 +65,6 @@ class TestRateLimitPlugin:
             enabled=True,
             default_rpm=60,
             default_tpm=100_000,
-            default_daily_tokens=500_000,
             default_monthly_tokens=5_000_000,
         )
 
@@ -92,10 +91,7 @@ class TestRateLimitPlugin:
 
         assert combo["query_limits"] == {"per_minute": 60}
         assert combo["token_limits"] == {"per_minute": 100_000}
-        assert combo["token_quota"] == {
-            "each_day": 500_000,
-            "each_month": 5_000_000,
-        }
+        assert combo["token_quota"] == {"each_month": 5_000_000}
 
     def test_unset_limits_do_not_declare_windows(self):
         _, spec = build(enabled=True, default_rpm=30)
@@ -183,14 +179,28 @@ class TestRateLimitRedisRegistry:
         assert rate_limit_redis_registry(cfg, "gpustack") is None
 
     def test_timezone_anchors_calendar_budgets(self):
-        _, spec = build(enabled=True, default_daily_tokens=1, timezone="Asia/Shanghai")
+        _, spec = build(
+            enabled=True, default_monthly_tokens=1, timezone="Asia/Shanghai"
+        )
         assert spec.defaultConfig["timezone"] == "Asia/Shanghai"
 
-    def test_rejection_defaults_are_openai_shaped(self):
+    def test_rejection_code_and_msg_stay_absent_by_default(self):
+        """The plugin's own rejection texts name the limit axis that tripped
+        and always answer 429; an operator-set value here would override
+        them, so the generated config carries neither field by default."""
         _, spec = build(enabled=True)
-        assert spec.defaultConfig["rejected_code"] == 429
-        assert spec.defaultConfig["rejected_msg"] == "Too many requests"
+        assert "rejected_code" not in spec.defaultConfig
+        assert "rejected_msg" not in spec.defaultConfig
         assert spec.defaultConfig["show_limit_quota_header"] is True
+
+    def test_operator_pinned_rejection_fields_reach_the_config(self):
+        _, spec = build(
+            enabled=True,
+            rejected_code=503,
+            rejected_msg="Back off",
+        )
+        assert spec.defaultConfig["rejected_code"] == 503
+        assert spec.defaultConfig["rejected_msg"] == "Back off"
 
     def test_module_url_resolves_from_the_plugin_manifest(self):
         from gpustack.gateway.plugins import (
@@ -241,7 +251,6 @@ class TestGatewayRateLimitConfigValidation:
         for field in (
             "default_rpm",
             "default_tpm",
-            "default_daily_tokens",
             "default_monthly_tokens",
         ):
             with pytest.raises(ValidationError):

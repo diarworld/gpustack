@@ -21,18 +21,8 @@ fallback) decide the layout:
   default), and the per-model in-flight caps (the deployment
   ``default_concurrency`` restated as the block default plus the user's
   per-model overrides; admins carry no concurrency block at all, which is
-  what exempts them). Non-fallback so it ANDs with the key combos below: a
-  user cap must bind every key, explicitly-limited or not.
-* **Key combos (non-fallback).** The per-key day quotas -- the key's own
-  ``daily_token_limit`` or the deployment default. Unset fields inherit
-  rather than omit, because the fallback default plan is suppressed for
-  every request these combos match; inheriting keeps a key without an
-  explicit daily limit under the deployment default instead of unbounded.
-  Keys of one user that share an effective day quota collapse into a single
-  ``regexp:`` match over that user's API-key consumers (no capture group,
-  so every key keeps its own quota bucket); a mix of explicit quotas falls
-  back to one exact combo per key (see
-  :func:`key_combinations_for_user`).
+  what exempts them). Non-fallback so it ANDs with the default plan
+  fallback below: a user cap must bind every request they send.
 * **The default plan** from the config file, unchanged: the fallback safety
   net for requests whose combos were left out under byte pressure or whose
   consumer no longer matches a live user.
@@ -65,7 +55,6 @@ from gpustack.gateway.utils import ensure_wasm_plugin
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.schemas.principals import Principal, PrincipalType
-from gpustack.security import gateway_consumer_identity, is_legacy_token_access_key
 from gpustack.server.bus import EventType
 from gpustack.server.db import async_session
 
@@ -77,47 +66,16 @@ _WATCH_RETRY_MIN_SECONDS = 1
 _WATCH_RETRY_MAX_SECONDS = 30
 
 
-def key_combination(key: ApiKey, cfg: Config) -> Optional[Dict[str, Any]]:
-    """The per-key combo: one calendar day quota from the key's own setting
-    or the deployment default, or None if it renders to nothing.
-
-    Rate limits (requests and tokens per minute) and the weekly / monthly
-    token budgets are user-level limits, carried by
-    :func:`user_limits_combination` -- a combo cannot host two windows of
-    the same granularity, and the user's caps must AND with every key's
-    own, so they live in a separate combination that matches the same
-    requests. The daily quota is the one window that is per-key by design.
-    """
-    rlc = cfg.gateway_rate_limit
-    daily = (
-        key.daily_token_limit
-        if key.daily_token_limit is not None
-        else rlc.default_daily_tokens
-    )
-    if not daily:
-        return None
-    return {
-        "name": f"key-{key.id}",
-        "match": [
-            {
-                "source": "consumer",
-                "value": gateway_consumer_identity(key.access_key, key.user_id),
-            }
-        ],
-        "token_quota": {"each_day": daily},
-    }
-
-
 def user_limits_combination(user: Principal, cfg: Config) -> Optional[Dict[str, Any]]:
     """The per-user combo: every limit that caps the user's keys together.
 
     Non-fallback on purpose: non-fallback combos AND, so this binds every
-    request of the user alongside their keys' own day quotas. The match
+    request of the user alongside the default plan fallback. The match
     captures the user suffix, merging the API-key and UI consumer shapes
     into one shared bucket. Unset fields inherit the deployment defaults
     from ``gateway_rate_limit`` -- every active user with keys gets the
-    deployment plan even when an admin has set nothing, because the key
-    combos these requests also match suppress the fallback default plan.
+    deployment plan even when an admin has set nothing, because the user
+    combos these requests match suppress the fallback default plan.
     """
     rlc = cfg.gateway_rate_limit
     combo: Dict[str, Any] = {
@@ -156,54 +114,6 @@ def user_limits_combination(user: Principal, cfg: Config) -> Optional[Dict[str, 
     return combo
 
 
-def key_combinations_for_user(
-    user_id: int, keys: List[ApiKey], cfg: Config
-) -> List[Dict[str, Any]]:
-    """One user's per-key day quotas, collapsed to as few combinations as
-    the semantics allow.
-
-    Keys sharing one effective day quota -- the common case, every key
-    inheriting the deployment default -- collapse into a single ``regexp:``
-    consumer match over ``<access-key>.gpustack-<uid>``. No capture group:
-    the whole consumer string stays the quota bucket, so every matched key
-    keeps its own day quota, and the bare ``gpustack-<uid>`` UI consumer
-    (no dot before the suffix) does not match, exactly as it drew no key
-    combo before. Users mixing explicit per-key quotas fall back to one
-    exact combo per key: matches must stay disjoint, and RE2 has no
-    negative lookahead to carve explicitly limited keys out of the shared
-    regexp -- an overlap would AND the two quotas down to the smaller one.
-    """
-    rlc = cfg.gateway_rate_limit
-
-    def effective_daily(key: ApiKey) -> Optional[int]:
-        return (
-            key.daily_token_limit
-            if key.daily_token_limit is not None
-            else rlc.default_daily_tokens
-        )
-
-    quotas = {effective_daily(key) for key in keys}
-    quotas.discard(None)
-    quotas.discard(0)  # an explicit 0 is "no day quota", like unset everywhere
-    if not quotas:
-        return []
-    if len(quotas) == 1:
-        (daily,) = quotas
-        return [
-            {
-                "name": f"keys-{user_id}",
-                "match": [
-                    {
-                        "source": "consumer",
-                        "value": f"regexp:^[^.]+\\.gpustack-{user_id}$",
-                    }
-                ],
-                "token_quota": {"each_day": daily},
-            }
-        ]
-    return [combo for key in keys if (combo := key_combination(key, cfg)) is not None]
-
-
 def fit_combinations(
     combinations: List[Dict[str, Any]], budget: int
 ) -> List[Dict[str, Any]]:
@@ -211,17 +121,11 @@ def fit_combinations(
 
     The default plan is not part of the input and never competes for the
     budget: ``reconcile_spec_diff`` prepends it after this fitting, so byte
-    pressure can only drop database-driven combinations. User limit combos
-    are served before key combos: a dropped user combo leaves the user's
-    rate caps, budgets and concurrency unenforced on every request they
-    send, while a dropped key combo costs one key its day quota -- the
-    narrower blast radius.
+    pressure can only drop database-driven combinations.
     """
     kept: List[Dict[str, Any]] = []
     used = 0
-    for combo in sorted(
-        combinations, key=lambda c: 0 if c["name"].startswith("user-") else 1
-    ):
+    for combo in combinations:
         size = len(json.dumps(combo)) + 8
         if used + size > budget:
             continue
@@ -262,7 +166,7 @@ def reconcile_spec_diff(
 
 
 class GatewayRateLimitReconciler:
-    """Writes the per-key and per-user combinations into the rate-limit CR."""
+    """Writes the per-user combinations into the rate-limit CR."""
 
     def __init__(self, cfg: Config):
         self._config = cfg
@@ -374,14 +278,4 @@ class GatewayRateLimitReconciler:
             combo = user_limits_combination(user, self._config)
             if combo is not None:
                 combinations.append(combo)
-        for user_id, user_keys in keys_by_user.items():
-            # Deployment tokens are not user-facing inference keys, and their
-            # consumer string carries no access key -- matching on it would
-            # also catch that user's UI traffic.
-            keys = [
-                key
-                for key in user_keys
-                if not is_legacy_token_access_key(key.access_key)
-            ]
-            combinations.extend(key_combinations_for_user(user_id, keys, self._config))
         return fit_combinations(combinations, self._budget)

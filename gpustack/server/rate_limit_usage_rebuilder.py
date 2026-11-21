@@ -49,7 +49,6 @@ from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowSpec,
     calendar_elapsed_seconds,
     default_plan_windows,
-    key_windows,
     reader_from_config,
     user_limit_windows,
 )
@@ -57,17 +56,15 @@ from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
 from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.principals import Principal, PrincipalType
-from gpustack.security import is_legacy_token_access_key
 from gpustack.server.db import async_session
 
 logger = logging.getLogger(__name__)
 
 # The long token window periods the rebuild covers, mapped to the reset
-# kind that forgives them ('plain' = no reset kind exists for the window).
+# kind that forgives them.
 _PERIOD_KINDS = {
     "604800s": "weekly",
     "each_month": "monthly",
-    "each_day": "plain",
 }
 
 # How often the counters are probed for loss. The probe itself is one
@@ -92,18 +89,12 @@ def _window_start_ts(
     return now_ts - calendar_elapsed_seconds(spec.period, now, timezone_name)
 
 
-def _hours_for(
-    source: Dict[Tuple, Dict[int, int]], user_id: int, api_key_id: Optional[int]
-) -> Dict[int, int]:
-    """Token totals per hour for one window owner.
+def _hours_for(source: Dict[Tuple, Dict[int, int]], user_id: int) -> Dict[int, int]:
+    """Token totals per hour for one user-level window owner.
 
-    Key windows read their own (user, key) bucket. User-level windows
-    (``api_key_id`` None) aggregate every bucket of the user -- their
-    keys' traffic and keyless UI traffic alike, mirroring the combo the
-    reconciler publishes.
+    Aggregates every bucket of the user -- their keys' traffic and keyless
+    UI traffic alike, mirroring the combo the reconciler publishes.
     """
-    if api_key_id is not None:
-        return source.get((user_id, api_key_id), {})
     merged: Dict[int, int] = {}
     for (bucket_user, _bucket_key), per_hours in source.items():
         if bucket_user != user_id:
@@ -153,9 +144,7 @@ class RateLimitUsageRebuilder:
             # database picture, which also corrects a counter that survived
             # but lost history. Minute windows are not in the specs at all.
             targets = [
-                key
-                for key, (spec, _, _) in specs.items()
-                if spec.period in _PERIOD_KINDS
+                key for key, (spec, _) in specs.items() if spec.period in _PERIOD_KINDS
             ]
         else:
             targets = await self._missing_keys(client, list(specs))
@@ -163,7 +152,7 @@ class RateLimitUsageRebuilder:
                 return
         starts = {
             redis_key: _window_start_ts(spec, now, rlc.timezone)
-            for redis_key, (spec, _, _) in specs.items()
+            for redis_key, (spec, _) in specs.items()
         }
         plain, forgiven, cutoffs = await self._load_usage_buckets(
             min(starts.values()), now
@@ -183,11 +172,11 @@ class RateLimitUsageRebuilder:
 
     async def _target_specs(
         self, rlc: GatewayRateLimitConfig
-    ) -> Dict[str, Tuple[RateLimitWindowSpec, int, Optional[int]]]:
+    ) -> Dict[str, Tuple[RateLimitWindowSpec, int]]:
         """Every long-window counter the plugin would enforce, mapped to its
-        owner: redis_key -> (spec, user_id, api_key_id or None). User-level
-        windows (the user limit combo and the default-plan fallback) bucket
-        on the user across all their keys; key windows on the exact key."""
+        owner: redis_key -> (spec, user_id). Every window is user-level (the
+        user limit combo and the default-plan fallback), bucketed on the user
+        across all their keys."""
         async with async_session() as session:
             users = (
                 await session.exec(
@@ -203,7 +192,7 @@ class RateLimitUsageRebuilder:
         for key in keys:
             keys_by_user.setdefault(key.user_id, []).append(key)
 
-        specs: Dict[str, Tuple[RateLimitWindowSpec, int, Optional[int]]] = {}
+        specs: Dict[str, Tuple[RateLimitWindowSpec, int]] = {}
         for user in users:
             # Mirror the reconciler: a user without keys never sends
             # inference requests, so no combo is published for them.
@@ -216,16 +205,7 @@ class RateLimitUsageRebuilder:
                     # Minute windows age out before a rebuild can matter;
                     # unknown periods are not understood, so not rebuilt.
                     continue
-                specs[spec.redis_key] = (spec, user.id, None)
-        for key in keys:
-            # Deployment tokens carry no published combo (their consumer
-            # string would also catch the user's UI traffic).
-            if is_legacy_token_access_key(key.access_key):
-                continue
-            for spec in key_windows(rlc, key):
-                if spec.period not in _PERIOD_KINDS:
-                    continue
-                specs[spec.redis_key] = (spec, key.user_id, key.id)
+                specs[spec.redis_key] = (spec, user.id)
         return specs
 
     async def _load_usage_buckets(
@@ -234,7 +214,7 @@ class RateLimitUsageRebuilder:
         """Per (user_id, api_key_id, hour) token sums from the details table.
 
         Returns the row maps and the cutoffs behind them: ``plain`` holds
-        every row for windows without a reset kind (the day quotas);
+        every row (windows without a recorded reset read it whole);
         ``forgiven`` holds only rows recorded after the user's latest
         reset of the kind -- a reset forgives the spend before it, and a
         rebuilt weekly / monthly counter must resume from the reset rather
@@ -333,16 +313,16 @@ class RateLimitUsageRebuilder:
         """
         commands: List[Tuple[str, Dict[str, int]]] = []
         for redis_key in targets:
-            spec, user_id, api_key_id = specs[redis_key]
+            spec, user_id = specs[redis_key]
             start_ts = starts[redis_key]
             kind = _PERIOD_KINDS[spec.period]
-            if kind == "plain" or (user_id, kind) not in cutoffs:
-                # No reset kind for the window, or no reset ever recorded:
-                # every row in the window counts.
-                per_hours = _hours_for(plain, user_id, api_key_id)
-            elif api_key_id is None:
+            if (user_id, kind) not in cutoffs:
+                # No reset ever recorded for the window: every row in the
+                # window counts.
+                per_hours = _hours_for(plain, user_id)
+            else:
                 # Reset recorded: only the spend at or after it counts, so
-                # the user-level window merges the post-reset buckets.
+                # the window merges the post-reset buckets.
                 merged: Dict[int, int] = {}
                 for (bucket_kind, bucket_user, _bucket_key), hours in forgiven.items():
                     if bucket_kind != kind or bucket_user != user_id:
@@ -350,10 +330,6 @@ class RateLimitUsageRebuilder:
                     for hour_ts, total in hours.items():
                         merged[hour_ts] = merged.get(hour_ts, 0) + total
                 per_hours = merged
-            else:
-                # Key window with a reset: its own post-reset bucket. No
-                # entry means nothing was consumed since the reset.
-                per_hours = forgiven.get((kind, user_id, api_key_id), {})
             members: Dict[str, int] = {}
             for hour_ts, total in per_hours.items():
                 if hour_ts < start_ts:
@@ -364,7 +340,7 @@ class RateLimitUsageRebuilder:
                 # window start. The name carries the bucket identity so
                 # two sources feeding the same hour stay distinct
                 # members instead of overwriting each other.
-                member = f"rebuild-{user_id}-{api_key_id or 0}-{hour_ts}|{total}"
+                member = f"rebuild-{user_id}-{hour_ts}|{total}"
                 members[member] = hour_ts + 1
             if not members and not replace:
                 # Nothing to restore for a missing counter.

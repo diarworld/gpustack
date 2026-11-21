@@ -1,29 +1,33 @@
 # Rate Limiting
 
-GPUStack can enforce request-rate and token-consumption limits per API key and
-per user, at the API gateway, before traffic reaches a model instance. Limits
-are enforced by the `gpustack-rate-limit` plugin running on the Higress
-gateway, with counters kept in Redis so they hold across every gateway
-replica.
+GPUStack can enforce request-rate and token-consumption limits per user, at the
+API gateway, before traffic reaches a model instance. Limits are enforced by
+the `gpustack-rate-limit` plugin running on the Higress gateway, with counters
+kept in Redis so they hold across every gateway replica.
 
 ## How It Works
 
 - **Request rate (RPM)** — a sliding per-minute window counted in requests.
 - **Token rate (TPM)** — a sliding per-minute window counted in the tokens
   each request consumes.
-- **Daily / monthly token budgets** — calendar-aligned allowances that reset
-  at midnight on the deployment timezone (daily) and on the 1st of the month
-  (monthly).
-- **Weekly token budgets** — a rolling 7-day window.
+- **Monthly token budget** — a calendar-aligned allowance that resets on the
+  1st of the month, in the deployment timezone.
+- **Weekly token budget** — a rolling 7-day window.
 - **Concurrent requests per model** — a cap on how many of a user's requests
   may run against one model at the same time; a slot is taken while a request
   runs and freed when its stream ends.
 
 A request that exceeds a limit is rejected at the gateway with
 `429 Too Many Requests` in the OpenAI error format, before any model instance
-is contacted. The rejected response carries an `x-ratelimit-limited-key`
-header naming the Redis key that triggered the rejection, which maps a 429
-back to the user and window that produced it.
+is contacted. The rejection body names the limit that tripped —
+`Too many requests per minute`, `Weekly token quota limit reached, reset in
+usage overview`, `Too many concurrent requests for this model` — and rolling
+and calendar windows carry a `Retry-After` header with the seconds until the
+window frees up (concurrency rejections carry none: a slot frees when a
+running request completes, not at a fixed time). The rejected response also
+carries an `x-ratelimit-limited-key` header naming the Redis key that
+triggered the rejection, which maps a 429 back to the user and window that
+produced it.
 
 Limits are bucketed **per user**: a user's API-key traffic and their UI
 traffic draw on the same allowance. A request is subject to rate limiting only
@@ -48,7 +52,6 @@ gateway_rate_limit:
   timezone: UTC
   default_rpm: 3
   default_tpm: 768000
-  default_daily_tokens: 10000000
   default_monthly_tokens: 100000000
   default_concurrency: 1
 ```
@@ -58,27 +61,25 @@ field means no limit of that kind. `default_concurrency` defaults to **1** —
 one in-flight request per model per user — because a runaway batch client
 holding dozens of parallel streams is the failure mode the cap exists for; set
 it to `0` to turn the concurrency cap off deployment-wide. Every other field
-stays a passthrough until configured.
+stays a passthrough until configured. `rejected_code` / `rejected_msg` are
+absent by default so the plugin's per-limit rejection texts apply; an explicit
+value overrides them.
 
 Redis must be reachable from the gateway pods. Declare it in the McpBridge
 that serves the gateway (or point `service_name` at a Kubernetes Service
 after setting `global.onlyPushRouteCluster: false` in the Higress
 configuration).
 
-## Per-Key and Per-User Limits
+## Per-User Limits
 
-Explicit limits override the deployment defaults:
-
-- **Per API key** — `rpm_limit`, `tpm_limit` and `daily_token_limit`, set on
-  the key. Unset fields on a limited key inherit the deployment defaults:
-  capping only a key's TPM does not remove its default RPM guard.
-- **Per user** — `weekly_token_limit` and `monthly_token_limit`, set on the
-  user account. These are shared across all of the user's API keys and their
-  UI sessions.
+Explicit limits override the deployment defaults. They are set on the user
+account — `rpm_limit`, `tpm_limit`, `weekly_token_limit` and
+`monthly_token_limit` — and are shared across all of the user's API keys and
+their UI sessions.
 
 The weekly budget has no deployment-wide default: only accounts with an
-explicit weekly budget are capped on it. Users without explicit budgets and
-keys without explicit limits are governed by the deployment defaults alone.
+explicit weekly budget are capped on it. Users without explicit limits are
+governed by the deployment defaults alone.
 
 ### Per-Model Concurrency
 
@@ -120,7 +121,7 @@ Changes take effect within one reconcile interval (30 seconds by default, see
 
 !!! note
 
-    Per-key rate limits are enforced at the gateway, so they apply to traffic
+    Rate limits are enforced at the gateway, so they apply to traffic
     that arrives through it. Inference calls made directly to the server's
     API port are not rate limited.
 
@@ -149,11 +150,8 @@ The response carries:
   in-flight caps set on the account (`model_concurrency_limits`), each with
   its live `running` slot count. Only explicitly named models are itemized;
   admins (exempt) and users without overrides get an empty list.
-- `api_keys` — one entry per live API key: its explicit `rpm_limit`,
-  `tpm_limit` and `daily_token_limit` (unset fields are omitted — they
-  inherit the deployment defaults), which limit `source` governs it (`key`,
-  `user+default` or `default`), and every window its requests draw on — RPM,
-  TPM, day, week and month — each with `used`, `limit` and `reset_seconds`.
+  `concurrency_default` carries the deployment-wide cap the other models
+  inherit (`null` when the cap is off).
 - `generated_at` — the instant every window was read at.
 - `usage_error` — set only when the Redis read failed, and carrying just the
   exception class name, never its message (which can contain hostnames).
@@ -163,8 +161,8 @@ or whenever Redis is unreachable, a window simply has no `used`. The read
 fails open — the limits are always returned. The Usage page's Summary tab
 renders this response as its **Rate limits** section.
 
-For a deployment with defaults of 3 RPM, 768000 TPM, 10000000 daily and
-100000000 monthly tokens, and a user with a 100000 weekly budget:
+For a deployment with defaults of 3 RPM, 768000 TPM and 100000000 monthly
+tokens, and a user with a 100000 weekly budget:
 
 ```json
 {
@@ -172,31 +170,22 @@ For a deployment with defaults of 3 RPM, 768000 TPM, 10000000 daily and
   "generated_at": "2026-11-19T10:30:00Z",
   "user": {
     "weekly_limit": 100000,
+    "concurrency_default": 1,
     "windows": [
+      {"kind": "query", "period": "60s", "window_seconds": 60, "limit": 3, "used": 2, "reset_seconds": 41},
+      {"kind": "token_rolling", "period": "60s", "window_seconds": 60, "limit": 768000, "used": 4820, "reset_seconds": 27},
+      {"kind": "token_calendar", "period": "each_month", "limit": 100000000, "used": 210000, "reset_seconds": 999000},
       {"kind": "token_rolling", "period": "604800s", "window_seconds": 604800, "limit": 100000, "used": 37215, "reset_seconds": 172800}
-    ]
-  },
-  "api_keys": [
-    {
-      "id": 6,
-      "name": "ci-runner",
-      "source": "user+default",
-      "windows": [
-        {"kind": "query", "period": "60s", "window_seconds": 60, "limit": 3, "used": 2, "reset_seconds": 41},
-        {"kind": "token_rolling", "period": "60s", "window_seconds": 60, "limit": 768000, "used": 4820, "reset_seconds": 27},
-        {"kind": "token_calendar", "period": "each_day", "limit": 10000000, "used": 18450, "reset_seconds": 48600},
-        {"kind": "token_calendar", "period": "each_month", "limit": 100000000, "used": 210000, "reset_seconds": 999000},
-        {"kind": "token_rolling", "period": "604800s", "window_seconds": 604800, "limit": 100000, "used": 37215, "reset_seconds": 172800}
-      ]
-    }
-  ]
+    ],
+    "model_concurrency": []
+  }
 }
 ```
 
-The weekly window appears under both the user and the key: API-key traffic and
-UI traffic draw on the same allowance, so both read the same counter. Calendar
-windows have no `window_seconds` — their length follows the calendar, and
-their `reset_seconds` counts down to the boundary in the deployment timezone.
+Every window buckets on the user: API-key traffic and UI traffic draw on the
+same allowance, so both read the same counter. Calendar windows have no
+`window_seconds` — their length follows the calendar, and their
+`reset_seconds` counts down to the boundary in the deployment timezone.
 
 ### Counter Recovery
 

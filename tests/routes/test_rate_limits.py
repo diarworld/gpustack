@@ -22,7 +22,6 @@ from gpustack.config.config import GatewayRateLimitConfig, GatewayRateLimitRedis
 from gpustack.gateway.rate_limit import rate_limit_plugin_name
 from gpustack.gateway.rate_limit_usage import RateLimitUsageReader, RateLimitWindowState
 from gpustack.routes import rate_limits
-from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.rate_limits import RateLimitResetCreate
 from gpustack.schemas.users import User
 
@@ -38,7 +37,6 @@ def _cfg(**overrides) -> GatewayRateLimitConfig:
         timezone="UTC",
         default_rpm=10,
         default_tpm=60_000,
-        default_daily_tokens=2_000_000,
         default_monthly_tokens=20_000_000,
     )
     fields.update(overrides)
@@ -90,20 +88,6 @@ def _user(
     )
 
 
-def _key(id, *, access_key="ak", daily=None) -> ApiKey:
-    stamp = FIXED_NOW.replace(tzinfo=None)
-    return ApiKey(
-        id=id,
-        name=f"key-{id}",
-        user_id=7,
-        access_key=access_key,
-        hashed_secret_key=f"hash-{id}",
-        daily_token_limit=daily,
-        created_at=stamp,
-        updated_at=stamp,
-    )
-
-
 def _shapes(windows):
     """(kind, period, limit) per window — the identity the UI renders."""
     return [(w.kind, w.period, w.limit) for w in windows]
@@ -111,14 +95,12 @@ def _shapes(windows):
 
 class FakeSession:
     """Stand-in for the async session the endpoint uses: admin user loads
-    resolve through ``session.get`` (what ``one_by_id`` calls), the api-keys
-    listing through ``session.exec``, and reset-quota reads through the
-    ``gateway_rate_limit_resets`` statements. Writes are recorded, not
-    persisted."""
+    resolve through ``session.get`` (what ``one_by_id`` calls), and
+    reset-quota reads through the ``gateway_rate_limit_resets`` statements.
+    Writes are recorded, not persisted."""
 
-    def __init__(self, users=(), keys=(), resets=()):
+    def __init__(self, users=(), resets=()):
         self._users = {u.id: u for u in users}
-        self._keys = list(keys)
         self._resets = sorted(resets, key=lambda r: r.reset_at)
         self.get_calls = []
         self.statements = []
@@ -148,7 +130,7 @@ class FakeSession:
         text = self._compiled(statement)
         if "gateway_rate_limit_resets" in text:
             return SimpleNamespace(all=lambda: self._matching_resets(text))
-        return SimpleNamespace(all=lambda: list(self._keys))
+        return SimpleNamespace(all=lambda: [])
 
     @staticmethod
     def _compiled(statement) -> str:
@@ -314,7 +296,7 @@ def frozen_now(monkeypatch):
 
 
 def _all_windows(response):
-    return response.user.windows + [w for key in response.api_keys for w in key.windows]
+    return response.user.windows
 
 
 @pytest.mark.asyncio
@@ -324,7 +306,7 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     lookup ever runs)."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -345,11 +327,11 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
-    assert response.api_keys[0].source == "user+key"
-    # The listing is scoped to the target's live keys.
-    sql = str(session.statements[0])
-    assert "api_keys.user_id" in sql
-    assert "api_keys.deleted_at IS NULL" in sql
+    # The deployment concurrency cap rides along for the UI's per-model
+    # table; the per-key view is gone, so no api_keys statement ever runs.
+    assert response.user.concurrency_default == 1
+    assert session.statements
+    assert all("gateway_rate_limit_resets" in str(s) for s in session.statements)
 
 
 @pytest.mark.asyncio
@@ -359,7 +341,7 @@ async def test_admin_reads_another_user(frozen_now, monkeypatch):
     cfg = _redis_cfg()
     admin = _user(1, is_admin=True)
     target = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[admin, target], keys=[_key(2, access_key="ak-2")])
+    session = FakeSession(users=[admin, target])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -375,7 +357,6 @@ async def test_admin_reads_another_user(frozen_now, monkeypatch):
         ("token_rolling", "604800s", 100_000),
         ("token_calendar", "each_month", 200_000),
     ]
-    assert [k.id for k in response.api_keys] == [2]
     # Every read ran for the target user's combos.
     assert all("gpustack-7" in spec.redis_key for spec in reader.specs)
 
@@ -404,7 +385,7 @@ async def test_model_concurrency_reports_overrides_with_running_counts(
     layout under the user limit combo."""
     cfg = _redis_cfg()
     user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
-    session = FakeSession(users=[user], keys=[])
+    session = FakeSession(users=[user])
     reader = FakeReader(
         concurrency={
             "gpustack-rate-limit|user-7|consumer=gpustack-7|c:glm-5.3-flash": 2,
@@ -461,7 +442,7 @@ async def test_model_concurrency_failure_fails_open(frozen_now, monkeypatch):
     channel the window reads use."""
     cfg = _redis_cfg()
     user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4})
-    session = FakeSession(users=[user], keys=[])
+    session = FakeSession(users=[user])
     reader = FakeReader(concurrency_error=ConnectionError("down"))
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -485,7 +466,7 @@ async def test_org_pinned_admin_foreign_user_id_degrades_to_self(
     cfg = _redis_cfg()
     admin = _user(1, is_admin=True, weekly=111)
     foreign = _user(7, weekly=222)
-    session = FakeSession(users=[admin, foreign], keys=[])
+    session = FakeSession(users=[admin, foreign])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -501,7 +482,6 @@ async def test_org_pinned_admin_foreign_user_id_degrades_to_self(
         ("token_rolling", "604800s", 111),
         ("token_calendar", "each_month", 20_000_000),
     ]
-    assert response.api_keys == []
 
 
 @pytest.mark.asyncio
@@ -516,7 +496,7 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
 
     monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
 
     response = await rate_limits.get_rate_limits(
         session=session, user=user, ctx=_ctx(10), request=_request(_local_cfg())
@@ -539,7 +519,6 @@ async def test_local_mode_omits_counters_without_touching_the_reader(
         assert window.limit is not None
     dumped = response.model_dump(exclude_none=True)
     assert "used" not in dumped["user"]["windows"][0]
-    assert "used" not in dumped["api_keys"][0]["windows"][0]
 
 
 @pytest.mark.asyncio
@@ -549,7 +528,7 @@ async def test_reader_failure_blanks_all_counters(frozen_now, monkeypatch):
     exception's class name surfaces (messages can carry hostnames)."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
     reader = FakeReader(error=RuntimeError("dial tcp: redis-host:6379"))
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -568,56 +547,19 @@ async def test_reader_failure_blanks_all_counters(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_legacy_key_hidden_and_sources(frozen_now, monkeypatch):
-    """Deployment-token rows carry no per-key view (the reconciler publishes
-    no combo for them); every live key binds its own day quota on top of the
-    user's shared combo."""
-    cfg = _redis_cfg()
-    user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(
-        users=[user],
-        keys=[
-            # Legacy deployment token: it must not appear in the per-key view.
-            _key(1, access_key=""),
-            _key(2, access_key="ak-explicit", daily=500_000),
-            _key(3, access_key="ak-shared"),
-        ],
-    )
-    reader = FakeReader()
-    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
-
-    response = await rate_limits.get_rate_limits(
-        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
-    )
-
-    by_id = {k.id: k for k in response.api_keys}
-    assert set(by_id) == {2, 3}
-    # The explicit daily limit wins over the deployment default.
-    assert by_id[2].source == "user+key"
-    assert _shapes(by_id[2].windows) == [
-        ("token_calendar", "each_day", 500_000),
-    ]
-    assert by_id[3].source == "user+key"
-    # An unset daily limit inherits the deployment default.
-    assert _shapes(by_id[3].windows) == [
-        ("token_calendar", "each_day", 2_000_000),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkeypatch):
-    """Round trip through the real reader: the daily counter is bounded by
-    the elapsed part of the day, so a member older than the day start but
-    inside the last 24h stays out of ``used``."""
+async def test_calendar_month_read_is_bounded_by_elapsed_period(
+    frozen_now, monkeypatch
+):
+    """Round trip through the real reader: the monthly counter is bounded
+    by the elapsed part of the calendar month, so a member older than the
+    month start but inside the last 30 days stays out of ``used``."""
     now_ts = int(FIXED_NOW.timestamp())
-    daily_key = (
-        f"{rate_limit_plugin_name}|key-3|consumer=ak-shared.gpustack-7|t:each_day"
-    )
+    month_key = f"{rate_limit_plugin_name}|user-7|consumer=gpustack-7|t:each_month"
     client = FakeRedis(
         {
-            daily_key: [
-                # 13.9h old: inside the last 24h, but before 00:00Z.
-                (now_ts - 50_000, "before-day-start|7"),
+            month_key: [
+                # ~29 days old: inside the last 30 days, but before Nov 1.
+                (now_ts - 2_500_000, "before-month-start|7"),
                 (now_ts - 1_000, "a|2"),
                 (now_ts - 5, "b|3"),
             ]
@@ -629,27 +571,27 @@ async def test_calendar_day_read_is_bounded_by_elapsed_period(frozen_now, monkey
         lambda cfg: RateLimitUsageReader(client),
     )
     user = _user(7)
-    session = FakeSession(users=[user], keys=[_key(3, access_key="ak-shared")])
+    session = FakeSession(users=[user])
 
     response = await rate_limits.get_rate_limits(
         session=session, user=user, ctx=_ctx(10), request=_request(_redis_cfg())
     )
 
-    daily = next(w for w in response.api_keys[0].windows if w.period == "each_day")
+    monthly = next(w for w in response.user.windows if w.period == "each_month")
     # Only the elapsed-period members count...
-    assert daily.used == 5
+    assert monthly.used == 5
     # ...and the reset is the calendar boundary, not member aging.
-    assert daily.reset_seconds == 43_200
-    # The user block rides the user combo: minute caps and the monthly
-    # quota inherit the deployment defaults (unseeded buckets read zero).
+    assert monthly.reset_seconds == 993_600
+    # The minute windows inherit the deployment defaults (unseeded buckets
+    # read zero).
     assert _shapes(response.user.windows) == [
         ("query", "60s", 10),
         ("token_rolling", "60s", 60_000),
         ("token_calendar", "each_month", 20_000_000),
     ]
-    user_monthly = next(w for w in response.user.windows if w.period == "each_month")
-    assert user_monthly.used == 0
-    assert user_monthly.reset_seconds is not None
+    user_query = next(w for w in response.user.windows if w.kind == "query")
+    assert user_query.used == 0
+    assert user_query.reset_seconds is not None
 
 
 @pytest.mark.asyncio
@@ -662,7 +604,7 @@ async def test_disabled_mode_returns_empty_structures(frozen_now, monkeypatch):
 
     monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
 
     response = await rate_limits.get_rate_limits(
         session=session,
@@ -675,7 +617,6 @@ async def test_disabled_mode_returns_empty_structures(frozen_now, monkeypatch):
     assert response.mode == "disabled"
     assert response.user.windows == []
     assert response.user.weekly_limit is None
-    assert response.api_keys == []
     assert session.statements == []
     assert session.get_calls == []
 
@@ -687,7 +628,7 @@ async def test_reader_is_cached_on_app_state_across_requests(frozen_now, monkeyp
     factory exactly once."""
     cfg = _redis_cfg()
     user = _user(7)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
     request = _request(cfg)
     calls = []
 
@@ -716,10 +657,12 @@ async def test_mixed_reader_failure_discards_the_successful_reads_too(
     mixes fresh counters with stale ones."""
     cfg = _redis_cfg()
     user = _user(7)
-    session = FakeSession(users=[user], keys=[_key(3, access_key="ak-shared")])
-    daily_key = f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_day"
+    session = FakeSession(users=[user])
+    month_key = (
+        f"{rate_limit_plugin_name}|default-plan|consumer=gpustack-7|t:each_month"
+    )
     reader = FakeReader(
-        states={daily_key: RateLimitWindowState(used=5, reset_seconds=43_200)},
+        states={month_key: RateLimitWindowState(used=5, reset_seconds=993_600)},
         error=TimeoutError("read timed out"),
     )
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
@@ -747,7 +690,7 @@ async def test_reader_failure_surfaces_only_the_class_name(
     class name reaches the payload, never its message."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000)
-    session = FakeSession(users=[user], keys=[_key(1, access_key="ak-1")])
+    session = FakeSession(users=[user])
     reader = FakeReader(error=error_type("dial tcp: internal-host:6379"))
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -780,7 +723,7 @@ async def test_get_reports_floating_reset_quota(frozen_now, monkeypatch):
         # An admin reset on the user's behalf never consumes their quota.
         _reset(7, "monthly", FIXED_NOW - timedelta(days=3), by=1),
     ]
-    session = FakeSession(users=[user], keys=[], resets=resets)
+    session = FakeSession(users=[user], resets=resets)
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -805,7 +748,7 @@ async def test_reset_records_row_and_clears_counters(frozen_now, monkeypatch):
     and answers with the decremented quota."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
-    session = FakeSession(users=[user], keys=[])
+    session = FakeSession(users=[user])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -841,7 +784,7 @@ async def test_reset_quota_exhausted_rejects(frozen_now, monkeypatch):
         _reset(7, "weekly", FIXED_NOW - timedelta(days=6)),
         _reset(7, "weekly", FIXED_NOW - timedelta(days=1)),
     ]
-    session = FakeSession(users=[user], keys=[], resets=resets)
+    session = FakeSession(users=[user], resets=resets)
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -868,7 +811,7 @@ async def test_admin_reset_bypasses_quota(frozen_now, monkeypatch):
         _reset(7, "weekly", FIXED_NOW - timedelta(days=1)),
         _reset(7, "weekly", FIXED_NOW - timedelta(days=2)),
     ]
-    session = FakeSession(users=[admin, target], keys=[], resets=resets)
+    session = FakeSession(users=[admin, target], resets=resets)
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -893,7 +836,7 @@ async def test_reset_validations(frozen_now, monkeypatch):
     are rejected before anything is written or deleted."""
     cfg = _redis_cfg()
     user = _user(7, monthly=200_000)
-    session = FakeSession(users=[user], keys=[])
+    session = FakeSession(users=[user])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 

@@ -19,17 +19,17 @@ Her kartta kullanılan / limit değeri, bir ilerleme çubuğu ve sıfırlama ger
 | **Hafta** | 7 günlük kayan penceredeki token'lar — tüm API anahtarlarınız ve arayüz oturumlarınız tarafından paylaşılır. | Bir haftalık kullanım pencereden çıkarken sürekli. |
 | **Ay**    | Takvim ayındaki token'lar.                                                                  | Dağıtım saat diliminde ay sınırında.              |
 
-Limite ulaşıldığında, sonraki istekler herhangi bir model örneğine ulaşmadan önce ağ geçidinde `429 Too Many Requests` ile reddedilir — pencerede yer açılana kadar.
+Limite ulaşıldığında, sonraki istekler herhangi bir model örneğine ulaşmadan önce ağ geçidinde `429 Too Many Requests` ile reddedilir — pencerede yer açılana kadar. Reddedilme gövdesi hangi limitin tetiklendiğini adıyla belirtir (örneğin `Too many requests per minute`, `Monthly token quota limit reached, reset in usage overview` veya `Too many concurrent requests for this model`) ve kayan ile takvim pencereleri, pencerenin boşalmasına kalan saniyeyi taşıyan bir `Retry-After` başlığı içerir.
 
 RPM ve TPM kısa patlamalara karşı korur; haftalık ve aylık bütçeler sürekli tüketimi sınırlar. Bir istek, dokunabileceği her pencereye sayılır: API anahtar trafiğiniz ve arayüz oturumlarınız aynı kullanıcı düzeyi hakkı kullanır.
 
-## Anahtar Başına Günlük Kullanım { #per-key-daily-usage }
+## Modellere Göre Eşzamanlılık { #concurrency-by-model }
 
-Kartların altındaki tablo, API anahtarlarınızın her birini günlük token hakkına karşı gösterir — anahtarın kendi günlük limiti veya dağıtım varsayılanı — gün için kullanılan / limit değeriyle birlikte. Günlük pencere takvime hizalıdır ve dağıtım saat diliminde gece yarısı sıfırlanır.
+Kartların altındaki tablo, ulaşabildiğiniz modelleri dağıtımın eşzamanlı istek sınırıyla karşılaştırır: her model için şu an kaç isteğin çalıştığı ve o modelin etkin limiti — ayarlanmışsa yöneticinin model bazlı geçersiz kırması, aksi hâlde dağıtım varsayılanı. Çalışma sayısı limite dayanmış bir model, `429 Too Many Concurrent Requests` reddedilmelerinin kaynağıdır.
 
 ## Model Başına Eşzamanlı İstek { #model-concurrency }
 
-Hız ve bütçe pencerelerinin ötesinde, ağ geçidi isteklerinizin — tüm API anahtarlarınız ve oturumlarınız genelinde — tek bir model üzerinde aynı anda çalışabileceği sayıyı sınırlar. Dağıtım varsayılanı **1**'dir: bir modele yönelik bir istek hâlâ çalışırken, aynı modele yönelik ikinci paralel istek, ilki bitene kadar `429 Too Many Requests` ile reddedilir. Slot, istek tamamlanır tamamlanmaz serbest kalır — pencere beklenmez.
+Hız ve bütçe pencerelerinin ötesinde, ağ geçidi isteklerinizin — tüm API anahtarlarınız ve oturumlarınız genelinde — tek bir model üzerinde aynı anda çalışabileceği sayıyı sınırlar. Dağıtım varsayılanı **1**'dir: bir modele yönelik bir istek hâlâ çalışırken, aynı modele yönelik ikinci paralel istek, ilki bitene kadar `429 Too Many Requests` ile reddedilir. Slot, istek tamamlanır tamamlanmaz serbest kalır — pencere beklenmez; bu yüzden bu reddedilmeler `Retry-After` başlığı taşımaz.
 
 Her model ayrı sayılır: bir modeldeki devam eden istek, diğer modellere yapılan istekleri engellemez. Yöneticiler bu sınıra tabi değildir.
 
@@ -37,9 +37,8 @@ Varsayılan ve model başına geçersiz kılmalar, yönetici tarafından hesabı
 
 ## Sayılar Nereden Geliyor { #where-the-numbers-come-from }
 
-- **Dağıtım varsayılanları** — yönetici tarafından herkes için ayarlanır: RPM, TPM, günlük ve aylık token'lar. Ayarlanmamış bir varsayılan, o pencerenin sınırlandırılmadığı anlamına gelir.
-- **Kullanıcı bütçeleri** — yöneticinin hesabınıza ayarladığı haftalık ve aylık token bütçeleri; tüm anahtarlarınız ve oturumlarınız tarafından paylaşılır.
-- **Anahtar limitleri** — tek bir anahtar üzerinde RPM, TPM ve günlük token limiti. Ayarlanmamış alanlar dağıtım varsayılanlarını devralır.
+- **Dağıtım varsayılanları** — yönetici tarafından herkes için ayarlanır: RPM, TPM, aylık token'lar ve model başına eşzamanlılık sınırı. Ayarlanmamış bir varsayılan, o pencerenin sınırlandırılmadığı anlamına gelir.
+- **Kullanıcı düzeyi limitler** — yöneticinin hesabınıza ayarladığı haftalık ve aylık token bütçeleri ile RPM ve TPM; tüm anahtarlarınız ve oturumlarınız tarafından paylaşılır.
 
 Bu dağıtım şu varsayılanları kullanır:
 
@@ -47,7 +46,6 @@ Bu dağıtım şu varsayılanları kullanır:
 | --------- | ----------------------------------------------------------------------- |
 | RPM       | dakikada 10 istek                                                        |
 | TPM       | dakikada 768.000 token                                                  |
-| Gün       | API anahtarı başına günlük 10.000.000 token                             |
 | Ay        | kullanıcı başına aylık 100.000.000 token                                |
 | Hafta     | varsayılan yok — yalnızca açık haftalık bütçesi olan hesaplar sınırlanır |
 
@@ -61,7 +59,7 @@ Sıfırlama bir gerekçe gerektirir. Not, basışla birlikte kaydedilir — kim,
 
 !!! note
 
-    Sıfırlama yalnızca haftalık ve aylık bütçeler için geçerlidir. RPM, TPM ve anahtar başına günlük kotalar kendi kendine boşalan kısa pencerelerdir.
+    Sıfırlama yalnızca haftalık ve aylık bütçeler için geçerlidir. RPM, TPM ve model başına eşzamanlılık sınırı kısa ömürlüdür: istekler pencereden çıktığında ya da tamamlandığında sayaçlar kendiliğinden boşalır.
 
 ### Sıfırlama Kotası { #reset-quota }
 

@@ -83,9 +83,8 @@ async def test_org_member_lists_only_own_api_keys_in_current_org(monkeypatch):
 
 
 def test_to_public_carries_the_rate_limit_fields():
-    """The edit dialog pre-fills from this projection: leaving the gateway
-    daily token budget out renders a limit that is set in the database as an
-    empty field, and a save then looks like a reset to whoever trusts it."""
+    """Rate limits are user-level: the key projection carries no per-key
+    limit fields at all, so a stale client cannot set one."""
     api_key = ApiKey(
         id=5,
         name="team-key",
@@ -95,12 +94,11 @@ def test_to_public_carries_the_rate_limit_fields():
         hashed_secret_key="secret",
         created_at=datetime(2026, 1, 1),
         updated_at=datetime(2026, 1, 1),
-        daily_token_limit=500_000,
     )
 
     public = api_keys._api_key_to_public(api_key)
 
-    assert public.daily_token_limit == 500_000
+    assert not hasattr(public, "daily_token_limit")
     assert not hasattr(public, "rpm_limit")
     assert not hasattr(public, "tpm_limit")
 

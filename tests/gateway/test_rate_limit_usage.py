@@ -26,11 +26,8 @@ from gpustack.gateway.rate_limit_usage import (
     read_concurrency,
     read_windows,
     reader_from_config,
-    source_for,
     user_limit_combo,
-    user_limit_windows,
 )
-from gpustack.security import gateway_consumer_identity
 
 
 def _cfg(**overrides) -> GatewayRateLimitConfig:
@@ -40,7 +37,6 @@ def _cfg(**overrides) -> GatewayRateLimitConfig:
         timezone="UTC",
         default_rpm=10,
         default_tpm=60_000,
-        default_daily_tokens=2_000_000,
         default_monthly_tokens=20_000_000,
     )
     fields.update(overrides)
@@ -54,7 +50,6 @@ class _KeyStub:
     id: int
     access_key: Optional[str]
     user_id: int
-    daily_token_limit: Optional[int] = None
 
 
 @dataclass
@@ -161,7 +156,6 @@ def test_default_plan_windows_are_the_fallback_set():
     assert _shapes(windows) == [
         ("query", "60s", 60, 10, f"{prefix}|q:60s"),
         ("token_rolling", "60s", 60, 60_000, f"{prefix}|t:60s"),
-        ("token_calendar", "each_day", None, 2_000_000, f"{prefix}|t:each_day"),
         ("token_calendar", "each_month", None, 20_000_000, f"{prefix}|t:each_month"),
     ]
 
@@ -202,46 +196,16 @@ def test_user_windows_override_defaults_and_add_weekly():
     ]
 
 
-def test_key_adds_its_own_day_quota_on_top():
-    """The user combo ANDs with the key combo: the shared caps bind every
-    key, and the key's day quota buckets on its full consumer string."""
+def test_key_adds_no_windows_of_its_own():
+    """Every token limit is user-level: passing the authenticated key to
+    ``expected_windows`` must not add a per-key window on top of the user
+    combo -- the key's consumer string exists only in ext-auth, not in any
+    published combination."""
     key = _KeyStub(id=42, access_key="ak-abc123", user_id=6)
     user = _UserStub(weekly_token_limit=100_000)
     windows = expected_windows(_cfg(), 6, key, user)
-    identity = gateway_consumer_identity("ak-abc123", 6)
-    # Pin the documented identity format: the consumer string ext-auth
-    # injects for an API-key request is <access_key>.gpustack-<user_id>.
-    assert identity == "ak-abc123.gpustack-6"
-    user_prefix = f"{rate_limit_plugin_name}|user-6|consumer=gpustack-6"
-    key_prefix = f"{rate_limit_plugin_name}|key-42|consumer={identity}"
-    assert _shapes(windows) == [
-        ("query", "60s", 60, 10, f"{user_prefix}|q:60s"),
-        ("token_rolling", "60s", 60, 60_000, f"{user_prefix}|t:60s"),
-        (
-            "token_rolling",
-            "604800s",
-            WEEK_IN_SECONDS,
-            100_000,
-            f"{user_prefix}|t:604800s",
-        ),
-        (
-            "token_calendar",
-            "each_month",
-            None,
-            20_000_000,
-            f"{user_prefix}|t:each_month",
-        ),
-        # The key's own day quota inherits the deployment default.
-        ("token_calendar", "each_day", None, 2_000_000, f"{key_prefix}|t:each_day"),
-    ]
-
-
-def test_key_daily_limit_overrides_default():
-    key = _KeyStub(id=7, access_key="ak-x", user_id=6, daily_token_limit=1_000)
-    windows = expected_windows(_cfg(), 6, key, None)
-    key_windows = [w for w in windows if w.redis_key.split("|")[1] == "key-7"]
-    assert [(w.kind, w.period, w.limit) for w in key_windows] == [
-        ("token_calendar", "each_day", 1_000)
+    assert [w.redis_key for w in windows] == [
+        w.redis_key for w in expected_windows(_cfg(), 6, None, user)
     ]
 
 
@@ -256,14 +220,6 @@ def test_legacy_token_key_governs_user_windows_only():
     assert [w.redis_key for w in windows] == [
         w.redis_key for w in expected_windows(_cfg(), 6, None, None)
     ]
-
-
-def test_source_for():
-    key = _KeyStub(id=1, access_key="ak-1", user_id=6)
-    legacy = _KeyStub(id=2, access_key="", user_id=6)
-    assert source_for(key) == "user+key"
-    assert source_for(legacy) == "user+key"
-    assert source_for(None) == "user"
 
 
 def test_model_concurrency_specs_key_layout():
@@ -401,14 +357,13 @@ def test_no_windows_when_nothing_configured():
     rlc = _cfg(
         default_rpm=None,
         default_tpm=None,
-        default_daily_tokens=None,
         default_monthly_tokens=None,
     )
     assert expected_windows(rlc, 6, None, None) == []
 
 
 def test_unset_defaults_skip_their_windows():
-    rlc = _cfg(default_tpm=None, default_daily_tokens=None, default_monthly_tokens=None)
+    rlc = _cfg(default_tpm=None, default_monthly_tokens=None)
     windows = expected_windows(rlc, 6, None, None)
     assert [(w.kind, w.period) for w in windows] == [("query", "60s")]
 
