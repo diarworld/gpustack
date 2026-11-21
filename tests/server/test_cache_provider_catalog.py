@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -48,6 +49,28 @@ def test_catalog_asset_loads():
     assert providers, "bundled cache-providers.yaml should yield at least one provider"
 
 
+def test_declared_provider_dashboards_are_shipped():
+    """A provider naming its own Grafana dashboard must have that dashboard
+    in the provisioned bundle, with the uid the declaration claims —
+    otherwise a service page links into a dashboard that does not exist."""
+    dashboards_dir = (
+        Path(__file__).resolve().parents[2]
+        / "docker-compose"
+        / "grafana"
+        / "grafana_dashboards"
+    )
+    declared = [provider for provider in asset_providers() if provider.dashboard_uid]
+    assert declared, "at least the mooncake provider declares its own dashboard"
+    for provider in declared:
+        path = dashboards_dir / f"{provider.dashboard_uid}.json"
+        assert path.exists(), (
+            f"{provider.name} declares dashboard_uid "
+            f"{provider.dashboard_uid}, but {path.name} is not provisioned"
+        )
+        dashboard = json.loads(path.read_text(encoding="utf-8"))
+        assert dashboard.get("uid") == provider.dashboard_uid
+
+
 def test_malformed_entry_costs_only_its_own_provider(monkeypatch):
     """A declaration the model rejects — including one that is not a
     mapping at all — is skipped on its own; the rest of the catalog still
@@ -91,6 +114,7 @@ def test_mooncake_launches_a_master_with_per_node_stores():
     assert provider.unavailable_reason is None
     assert localized_default(provider.description)
     assert provider.attach_locality == "cluster"
+    assert provider.dashboard_uid == "gpustack-cache-service-mooncake"
 
     # the master and the stores are host-DRAM processes; 0.3.14 rides
     # the mirrored upstream image, the locally built -cpu wheel image
@@ -121,6 +145,10 @@ def test_mooncake_launches_a_master_with_per_node_stores():
     # the form never submits a hidden field; the mode's own default
     # decides what an unset one would launch
     assert provider.component_enabled("store", None) is True
+    # the store's client HTTP server serves /metrics on the metrics port;
+    # naming it is what puts store instances on the Prometheus scrape list
+    assert store.metrics_port == "metrics"
+    assert provider.metrics_port_name("store") == "metrics"
 
     # the engine config reads the master's metadata listener by name and
     # sizes the engine's own contribution through the gated field

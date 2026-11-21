@@ -619,6 +619,11 @@
     - label: { default: Documentation, zh-CN: 文档 }
       url: "https://kvcache-ai.github.io/Mooncake/"
     - { label: GitHub, url: "https://github.com/kvcache-ai/Mooncake" }
+  # Mooncake's master and stores expose their own metric families, so the
+  # services' Grafana entries land on the dedicated dashboard provisioned
+  # alongside the generic cache-service one
+  # (docker-compose/grafana/grafana_dashboards/gpustack-cache-service-mooncake.json).
+  dashboard_uid: gpustack-cache-service-mooncake
   # Engines attach cluster-wide: the master coordinates the pool from
   # one place and hands out segment locations wherever the stores run,
   # so an engine on any worker shares the same pool.
@@ -694,6 +699,12 @@
       enabled_by: mode
       enabled_when: standalone-store
       gpu_access: false
+      # The client HTTP server (MOONCAKE_CLIENT_HTTP_PORT, served on the
+      # metrics port) also exposes /metrics — the store client's RPC
+      # counters and latencies plus the master heartbeat the dashboard's
+      # store row reads. Naming it here is what puts store instances on
+      # the Prometheus scrape list; the run command needs no flag for it.
+      metrics_port: metrics
       ports: [port, metrics]
       resource_profile:
         ram_gib: "{{ram_size}}"
