@@ -29,6 +29,36 @@
 
 各インスタンスは、接続したキャッシュサービスと最近のヒット率を報告します。Worker 上にキャッシュインスタンスがないなどの理由でキャッシュなしで起動したインスタンスは、失敗するのではなく、共有 KV キャッシュが有効でないことを報告します。
 
+## Mooncake でクラスター全体のプールを実行する { #running-a-cluster-wide-pool-with-mooncake }
+
+Mooncake Store は、クラスターの Worker が持つ CPU DRAM を、TCP または RDMA でエンジンが読み書きする 1 つの共有 KV キャッシュへプールします。サービスは 2 種類のインスタンスを実行します。
+
+- **master** が 1 つ — エンジンが接続するコーディネーターです。キーのインデックスを保持し、セグメントの場所を割り当て、エンジンが初期登録に使うメタデータ Server を提供します。1 台の Worker 上で動作します。プールの中核を特定のハードウェアの近くに置きたい場合は、サービスの Worker 配置設定で固定してください。
+- Worker ごとに **store** が 1 つ — 各 store は、そのノードの DRAM のセグメントをプールにマウントします。エンジンが store に直接接続することはなく、場所は master が割り当てます。
+
+[Mooncake のドキュメント](https://kvcache-ai.github.io/Mooncake/) では、master のフラグ、store の設定、転送エンジンのトランスポートについて説明しています。
+
+### モードの選択 { #choosing-the-mode }
+
+- **Standalone Store**（既定）: ノードごとの専用 store コンテナがプールを保持し、その容量は `Store RAM Size (GiB)` で指定します。エンジンは自身のメモリを提供せず、プールの容量はモデル配置の際に予約されます。
+- **Embedded**: store コンテナはなく、各エンジンが `Engine Segment Size (GiB)` で指定した自身のメモリをプールへ提供します。実行コストは低くなりますが、そのメモリは予約されないため、負荷の高いエンジンはプールを縮めます。
+
+どちらのモードも同じ接続契約を提供します。サービスのモードを切り替えると、そのインスタンスは再作成されます。
+
+### エンジンとテナント { #engines-and-tenants }
+
+デプロイの接続は[デプロイの接続](#attach-a-deployment)と同じ手順で行われます。エンジンは、master の RPC アドレスとメタデータ Server を指す設定ファイルを受け取り、プールに参加します。vLLM は CUDA（vLLM 0.29.0 以降）および CANN（0.23.0 以降）の Worker でサポートされます。
+
+複数のキャッシュサービスが 1 つの master を共有し、それぞれの使用量を別々に計上したい場合は `Tenant ID` を設定します。クォータの強制は master 側の要件です。master の `Parameters` に `--tenant_quota_connector_type` と `--tenant_quota_connector_uri` を追加し、それらが指すクォータソースを管理してください。
+
+### メトリクス { #metrics }
+
+サービスのグラフには、プールのヒット率、使用メモリ、使用率が表示されます。これらは master の Prometheus エクスポジションから読み取られます。
+
+### PD 分離 { #pd-disaggregation }
+
+`vllm-mooncake` と `vllm-ascend-mooncake` の prefill/decode レシピは、転送コネクターの背後にある共有ストアとして Mooncake キャッシュサービスを利用できます。レシピのキャッシュサービス設定でそのサービスを選択してください。
+
 ## LMCache でハイブリッド Attention モデルを実行する { #running-hybrid-attention-models-with-lmcache }
 
 ハイブリッドモデルは、Mamba や Gated-DeltaNet（GDN）線形 Attention などの再帰層と、完全 Attention 層を交互に配置します。Qwen3.5 と Qwen3.6 シリーズ、Qwen3-Next、Kimi-Linear、Kimi K3 はいずれもこの種類のモデルです。

@@ -1740,8 +1740,8 @@ def validate_injection_templates(provider: "CacheProvider") -> List[str]:
     Enforced at load time because the failure mode is silent at runtime:
     a placeholder that nothing resolves renders literally into connector
     config, corrupting it. Every referenced placeholder must be a
-    reserved platform placeholder, a declared field, or a key present in
-    every locality bucket.
+    reserved platform placeholder, a port the attach component declares,
+    a declared field, or a key present in every locality bucket.
     """
     errors: List[str] = []
     declared = {field.name for field in provider.fields}
@@ -1767,13 +1767,24 @@ def validate_injection_templates(provider: "CacheProvider") -> List[str]:
             for template in templates
             for match in _TEMPLATE_PATTERN.finditer(template)
         }
+        # The attach instance's own listeners by name: the resolver feeds
+        # them to the templates beside the reserved keys, and only names
+        # the attach component declared can ever arrive — anything else
+        # would render empty and drop with its flag anyway, so rejecting
+        # it here names the typo while the document is still open.
+        port_refs = {
+            f"ports.{port_name}"
+            for port_name in provider.declared_port_names(provider.attach_component())
+        }
         prefix = f"'{provider.name}' integration '{integration.backend}'"
-        allowed = RESERVED_INJECTION_PLACEHOLDERS | declared | locality_common
+        allowed = (
+            RESERVED_INJECTION_PLACEHOLDERS | declared | locality_common | port_refs
+        )
         for name in sorted(referenced - allowed):
             errors.append(
                 f"{prefix} references placeholder '{name}', which is not a "
-                "reserved placeholder, a declared field, or a key present "
-                "in every locality bucket"
+                "reserved placeholder, a declared attach-component port, a "
+                "declared field, or a key present in every locality bucket"
             )
     return errors
 

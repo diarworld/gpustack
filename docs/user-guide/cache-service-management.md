@@ -29,6 +29,36 @@ Cache services attach to the built-in vLLM and SGLang backends only, and a deplo
 
 Each instance reports the cache service it attached to and its recent hit rate. An instance that started without the cache — because no cache instance was available on its worker, for example — reports the shared KV cache as not active rather than failing.
 
+## Running a Cluster-Wide Pool with Mooncake
+
+Mooncake Store pools the CPU DRAM of the cluster's workers into one shared KV cache the engines read and write over TCP or RDMA. A service runs two kinds of instances:
+
+- one **master** — the coordinator engines attach to. It holds the key index, hands out segment locations, and serves the metadata server the engines bootstrap through. It runs on a single worker; pin it with the service's worker placement if the pool's brain should live next to specific hardware.
+- one **store per worker** — each mounts a segment of its node's DRAM into the pool. Engines never dial a store directly; the master hands out the locations.
+
+The [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/) covers the master's flags, the store settings, and the transfer engine's transports.
+
+### Choosing the mode
+
+- **Standalone Store** (default): dedicated per-node store containers own the pool, sized by `Store RAM Size (GiB)`. Engines contribute no memory of their own, and the pool's capacity is reserved from model placement.
+- **Embedded**: no store containers; each engine contributes `Engine Segment Size (GiB)` of its own memory to the pool. Cheaper to run, but nothing reserves that memory — a busy engine shrinks the pool.
+
+Both modes serve the same attach contract; switching a service's mode re-creates its instances.
+
+### Engines and tenants
+
+Attaching a deployment works as in [Attach a Deployment](#attach-a-deployment): the engine gets a config file pointing at the master's RPC address and metadata server and joins the pool. vLLM is supported on CUDA (vLLM 0.29.0 and newer) and CANN (0.23.0 and newer) workers.
+
+Set `Tenant ID` when several cache services share one master and their usage should be accounted separately. Quota enforcement is a master-side concern — add `--tenant_quota_connector_type` and `--tenant_quota_connector_uri` to the master's `Parameters` and manage the quota source it names.
+
+### Metrics
+
+The service's charts report the pool's hit rate, used memory and usage ratio, read from the master's Prometheus exposition.
+
+### PD disaggregation
+
+The `vllm-mooncake` and `vllm-ascend-mooncake` prefill/decode recipes can use a Mooncake cache service as the shared store behind their transfer connectors — select the service in the recipe's cache service setting.
+
 ## Running Hybrid Attention Models with LMCache
 
 A hybrid model interleaves recurrent layers — Mamba, or Gated-DeltaNet (GDN) linear attention — with full-attention layers. The Qwen3.5 and Qwen3.6 series, Qwen3-Next, Kimi-Linear and Kimi K3 are all of this kind.

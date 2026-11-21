@@ -619,16 +619,323 @@
     - label: { default: Documentation, zh-CN: 文档 }
       url: "https://kvcache-ai.github.io/Mooncake/"
     - { label: GitHub, url: "https://github.com/kvcache-ai/Mooncake" }
-  # The accelerators the card claims. A declaration that launches
-  # something states them through the images it publishes per
-  # accelerator; this one has no images, so it names what its engine
-  # integrations are scoped to — the same claim, and the same card.
+  # Engines attach cluster-wide: the master coordinates the pool from
+  # one place and hands out segment locations wherever the stores run,
+  # so an engine on any worker shares the same pool.
+  attach_locality: cluster
+  # One CPU build serves every node: the master and the stores are pure
+  # host-DRAM processes — the GPU work happens in the engines attaching
+  # to them, which the integrations below scope per accelerator.
+  default_version: "0.3.13.post1-cpu"
+  versions:
+    0.3.13.post1-cpu:
+      image: gpustack/mirrored-mooncake:0.3.13.post1-cpu
+  components:
+    # The pool's coordinator: it holds the key index and the capacity
+    # map, hands segments out, and serves the HTTP metadata server the
+    # transfer engines bootstrap through. Exactly one; every port it
+    # listens on is platform-allocated, and none is guessable from
+    # another (the metadata URL is not the RPC address).
+    master:
+      topology: replicas
+      replicas: 1
+      attach_endpoint: true
+      gpu_access: false
+      address_port: rpc
+      metrics_port: metrics
+      ports: [rpc, metadata, metrics]
+      resource_profile:
+        ram_gib: "2"
+        cpu: 2
+      # The flag set the wheel's own master runs with: the metadata
+      # server must be on (engines bootstrap through it), multi-tenancy
+      # on (engines may carry a tenant_id), and the rest are the knobs
+      # promoted to fields below. Quota connectors stay a hand-written
+      # flag — an operator wiring one owns the file it reads.
+      run_command: >-
+        mooncake_master --rpc_port {{port}}
+        --enable_http_metadata_server=true --http_metadata_server_host 0.0.0.0
+        --http_metadata_server_port {{ports.metadata}}
+        --metrics_port {{metrics_port}}
+        --default_kv_lease_ttl {{kv_lease_ttl_ms}}
+        --eviction_high_watermark_ratio {{eviction_high_watermark_ratio}}
+        --eviction_ratio {{eviction_ratio}}
+        --enable_multi_tenants=true --logtostderr
+      common_parameters:
+        - --rpc_thread_num
+        - --default_kv_soft_pin_ttl
+        - --max_kv_soft_pin_ttl
+        - --client_active_ttl_sec
+        - --tenant_quota_connector_type
+        - --tenant_quota_connector_uri
+      health_check:
+        scheme: http
+        path: /health
+        target: metrics
+    # The pool's holders, one per cluster worker: each mounts a segment
+    # of its node's DRAM into the master's capacity map. Engines never
+    # dial a store directly — the master hands out segment locations —
+    # so the REST port is management-only and the metrics listener is
+    # the client HTTP server (/health for the probe).
+    store:
+      topology: per_node
+      depends_on: master
+      enabled_by: mode
+      enabled_when: standalone-store
+      gpu_access: false
+      ports: [port, metrics]
+      resource_profile:
+        ram_gib: "{{ram_size}}"
+        cpu: 2
+      run_command: >-
+        python3 -m mooncake.mooncake_store_service --port {{port}}
+      # Env, not a config file: the store service reads the same
+      # settings from MOONCAKE_* when no --config is passed. The
+      # metadata URL is the master's second listener — its host and
+      # ports are what the platform stamps for dependents.
+      env:
+        MOONCAKE_MASTER: "{{component.master.address}}"
+        MOONCAKE_TE_META_DATA_SERVER: "http://{{component.master.host}}:{{component.master.ports.metadata}}/metadata"
+        MOONCAKE_LOCAL_HOSTNAME: "{{worker_ip}}"
+        MOONCAKE_GLOBAL_SEGMENT_SIZE: "{{ram_size}}GB"
+        MOONCAKE_LOCAL_BUFFER_SIZE: "{{local_buffer_size}}GB"
+        MOONCAKE_PROTOCOL: "{{protocol}}"
+        MOONCAKE_DEVICE: "{{device_name}}"
+        MOONCAKE_ENABLE_CLIENT_HTTP_SERVER: "true"
+        MOONCAKE_CLIENT_HTTP_PORT: "{{ports.metrics}}"
+      common_parameters:
+        - -D
+        - --max-wait-time
+      health_check:
+        scheme: http
+        path: /health
+        target: metrics
+  fields:
+    - name: mode
+      label: { default: Mode, zh-CN: 模式 }
+      description:
+        default: >-
+          How the pool's DRAM is held. A standalone store runs dedicated
+          per-node store containers that own the pool; embedded has every
+          engine contribute a segment of its own memory instead.
+        zh-CN: >-
+          缓存池内存的持有方式。独立 Store 模式由每节点专属的 Store
+          容器持有缓存池；内嵌模式由每个引擎贡献自身的一段内存。
+      type: string
+      required: true
+      default: standalone-store
+      options:
+        - value: standalone-store
+          label: { default: Standalone Store, zh-CN: 独立 Store }
+          description:
+            default: >-
+              Dedicated per-node store containers hold the pool; engines
+              contribute no memory of their own.
+            zh-CN: >-
+              每节点专属的 Store 容器持有缓存池，引擎自身不贡献内存。
+        - value: embedded
+          label: { default: Embedded, zh-CN: 内嵌 }
+          description:
+            default: >-
+              No store containers; each engine contributes its configured
+              segment size to the pool.
+            zh-CN: >-
+              无 Store 容器，每个引擎按配置的段大小向缓存池贡献内存。
+    - name: ram_size
+      label: { default: Store RAM Size (GiB), zh-CN: Store 内存容量（GiB） }
+      description:
+        default: DRAM each per-node store container contributes to the pool.
+        zh-CN: 每个节点的 Store 容器向缓存池贡献的内存容量。
+      type: number
+      required: true
+      default: 50
+      min: 1
+      step: 1
+      visible_by: mode
+      visible_when: standalone-store
+      gated_default: 0
+    - name: engine_segment_size
+      label: { default: Engine Segment Size (GiB), zh-CN: 引擎段大小（GiB） }
+      description:
+        default: DRAM each engine contributes to the pool from its own memory.
+        zh-CN: 每个引擎从自身内存向缓存池贡献的容量。
+      type: number
+      required: true
+      default: 16
+      min: 1
+      step: 1
+      visible_by: mode
+      visible_when: embedded
+      # Hidden under a standalone store, the contribution must render 0:
+      # the engine config requires global_segment_size == 0 there, and
+      # "0GB" is that zero.
+      gated_default: 0
+    - name: local_buffer_size
+      label: { default: Local Buffer Size (GiB), zh-CN: 本地缓冲区大小（GiB） }
+      description:
+        default: >-
+          Per-engine staging buffer for batching writes before they land
+          in the pool.
+        zh-CN: 每个引擎在写入缓存池前用于批量暂存的本地缓冲区大小。
+      type: number
+      required: true
+      default: 4
+      min: 1
+      step: 1
+    - name: protocol
+      label: { default: Transfer Protocol, zh-CN: 传输协议 }
+      description:
+        default: >-
+          Transport the engines and stores move KV bytes over. rdma
+          needs RDMA-capable NICs on every node holding or reading the
+          pool.
+        zh-CN: >-
+          引擎与 Store 之间搬运 KV 数据的传输协议。rdma 需要持有或读取
+          缓存池的每个节点都具备 RDMA 网卡。
+      type: string
+      required: true
+      default: tcp
+      options: [tcp, rdma]
+    - name: device_name
+      label: { default: RDMA Device, zh-CN: RDMA 设备 }
+      description:
+        default: >-
+          RDMA NIC to use (e.g. mlx5_0); empty lets the transfer engine
+          discover one. Only read when the protocol is rdma.
+        zh-CN: >-
+          使用的 RDMA 网卡（如 mlx5_0）；留空由传输引擎自动发现。仅在
+          协议为 rdma 时生效。
+      type: string
+      default: ""
+      visible_by: protocol
+      visible_when: rdma
+      gated_default: ""
+    - name: tenant_id
+      label: { default: Tenant ID, zh-CN: 租户 ID }
+      description:
+        default: >-
+          Tenant the attaching engines account their usage under at the
+          master. Same value for every engine of the service; "default"
+          when quotas are not in play.
+        zh-CN: >-
+          引擎在 master 处记账所用租户。服务内所有引擎使用同一取值；
+          未启用配额时使用 "default"。
+      type: string
+      default: default
+    - name: kv_lease_ttl_ms
+      label: { default: KV Lease TTL (ms), zh-CN: KV 租约时长（毫秒） }
+      description:
+        default: >-
+          How long a KV entry stays leased after its last access before
+          the master may reclaim it.
+        zh-CN: KV 条目在最后一次访问后被 master 回收前保留的租约时长。
+      type: number
+      default: 30000
+      min: 0
+      step: 1000
+    - name: eviction_high_watermark_ratio
+      label:
+        { default: Eviction High Watermark, zh-CN: 淘汰高水位 }
+      description:
+        default: >-
+          Pool occupancy fraction that starts eviction; below it, full.
+        zh-CN: 触发淘汰的缓存池占用比例；低于该水位视为未满。
+      type: number
+      default: 0.95
+      min: 0
+      max: 1
+      step: 0.05
+    - name: eviction_ratio
+      label: { default: Eviction Ratio, zh-CN: 淘汰比例 }
+      description:
+        default: Fraction of the pool evicted once the watermark trips.
+        zh-CN: 触发高水位后单次淘汰的缓存池比例。
+      type: number
+      default: 0.05
+      min: 0
+      max: 1
+      step: 0.05
+  # Metric names read off a running master's /metrics (v0.3.13.post1).
+  # The stores' own exposition carries no pool-level numbers, so the
+  # mappings only name master families; the platform vocabulary calls
+  # the memory tier L1.
+  default_metrics:
+    path: /metrics
+    mappings:
+      hit_rate:
+        ratio:
+          numerator: mem_cache_hit_nums_
+          denominator: total_get_nums_
+      l1_usage_bytes:
+        gauge: master_allocated_bytes
+      l1_usage_ratio:
+        gauge_ratio:
+          numerator: master_allocated_bytes
+          denominator: master_total_capacity_bytes
   inference_backend_integrations:
-    - { backend: vLLM, frameworks: [cuda] }
-    - { backend: vLLM, frameworks: [cann] }
-  unavailable_reason:
-    default: Available in GPUStack Enterprise
-    zh-CN: GPUStack 企业版可用
+    # Engines attach through vLLM's MooncakeStoreConnector, pointed at
+    # the master by a JSON config file the injection writes and an env
+    # var naming it. PYTHONHASHSEED pins the block hasher: engines
+    # hashing the same chunks differently would store keys no other
+    # engine would ever look up. The connector extra config follows the
+    # deployment-validated baseline (async lookup with a bounded
+    # prefetch window).
+    - backend: vLLM
+      frameworks: [cuda]
+      # The line the in-house PD baseline validated against (the
+      # vllm-mooncake recipe below asks the same of its cache service).
+      versions: ">=0.29.0"
+      injection:
+        env:
+          # A fixed path: the serving script writes the file inside the
+          # engine's own container before the engine starts, so the same
+          # name in two deployments never meets.
+          MOONCAKE_CONFIG_PATH: /tmp/gpustack-mooncake.json
+          PYTHONHASHSEED: "0"
+        files:
+          /tmp/gpustack-mooncake.json: |
+            {
+              "mode": "{{mode}}",
+              "metadata_server": "http://{{host}}:{{ports.metadata}}/metadata",
+              "master_server_address": "{{master_server_address}}",
+              "global_segment_size": "{{engine_segment_size}}GB",
+              "local_buffer_size": "{{local_buffer_size}}GB",
+              "protocol": "{{protocol}}",
+              "device_name": "{{device_name}}",
+              "tenant_id": "{{tenant_id}}"
+            }
+        kv_transfer_config:
+          kv_connector: MooncakeStoreConnector
+          kv_role: kv_both
+          kv_connector_extra_config:
+            lookup_async: true
+            lookup_prefetch_limit: 32
+    - backend: vLLM
+      frameworks: [cann]
+      # The line the vllm-ascend-mooncake PD baseline validated against.
+      versions: ">=0.23.0"
+      injection:
+        env:
+          MOONCAKE_CONFIG_PATH: /tmp/gpustack-mooncake.json
+          PYTHONHASHSEED: "0"
+        files:
+          /tmp/gpustack-mooncake.json: |
+            {
+              "mode": "{{mode}}",
+              "metadata_server": "http://{{host}}:{{ports.metadata}}/metadata",
+              "master_server_address": "{{master_server_address}}",
+              "global_segment_size": "{{engine_segment_size}}GB",
+              "local_buffer_size": "{{local_buffer_size}}GB",
+              "protocol": "{{protocol}}",
+              "device_name": "{{device_name}}",
+              "tenant_id": "{{tenant_id}}"
+            }
+        kv_transfer_config:
+          kv_connector: MooncakeStoreConnector
+          kv_role: kv_both
+          kv_connector_extra_config:
+            lookup_async: true
+            lookup_prefetch_limit: 32
 # PLACEHOLDER. Change as needed.
 - name: XSKY MeshFusion
   display_name: XSKY MeshFusion

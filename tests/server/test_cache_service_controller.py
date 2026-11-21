@@ -103,6 +103,7 @@ def _instance(**overrides):
         cluster_id=1,
         component="",
         component_addresses=None,
+        ports=None,
         state=CacheServiceStateEnum.PENDING,
         spec_digest=None,
         computed_resource_claim=None,
@@ -1022,6 +1023,54 @@ async def test_the_dependency_address_does_not_depend_on_row_order(monkeypatch):
     assert first == second
     # The lowest worker id, whichever order the rows came back in.
     assert "10.0.0.5" in first["master"]
+
+
+@pytest.mark.asyncio
+async def test_the_dependency_address_carries_the_host_and_named_ports(monkeypatch):
+    """A dependent may need more of the master than its RPC address: the
+    stamp carries the host alone and every port the component declared,
+    by name, so a store renders the master's metadata URL without
+    guessing it off the RPC port. A port the launch did not allocate
+    stamps nothing — its template resolves empty and drops."""
+    from gpustack.schemas.cache_providers import CacheProviderComponent
+
+    provider = _pool_provider()
+    provider.components["master"] = CacheProviderComponent(
+        run_command="pool-master --port {{port}}",
+        gpu_access=False,
+        ports=["rpc", "metadata", "metrics"],
+        address_port="rpc",
+    )
+    provider.components["store"] = CacheProviderComponent(
+        topology="per_node",
+        depends_on="master",
+        attach_endpoint=True,
+        run_command="pool-store --port {{port}}",
+        gpu_access=False,
+    )
+    master = _instance(
+        id=61,
+        worker_id=5,
+        state=CacheServiceStateEnum.RUNNING,
+        component="master",
+        port=41000,
+        ports={"rpc": 41000, "metadata": 41092},
+    )
+
+    controller = CacheServiceController(MagicMock())
+    monkeypatch.setattr(
+        "gpustack.server.controllers.Worker.one_by_id",
+        AsyncMock(side_effect=lambda _s, worker_id: _worker(worker_id)),
+    )
+
+    stamped = await controller._component_addresses(MagicMock(), provider, [master], {})
+
+    assert stamped["master"] == "10.0.0.5:41000"
+    assert stamped["master.host"] == "10.0.0.5"
+    assert stamped["master.rpc"] == "41000"
+    assert stamped["master.metadata"] == "41092"
+    # a declared port the launch never allocated leaves no stamp
+    assert "master.metrics" not in stamped
 
 
 @pytest.mark.asyncio

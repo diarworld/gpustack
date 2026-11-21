@@ -1553,6 +1553,17 @@ class CacheServiceController:
             if worker is None or not worker.ip:
                 continue
             addresses[name] = f"{worker.ip}:{instance.port}"
+            # The same instance's identity and other listeners by the
+            # names its component declared: a dependent that reaches a
+            # second listener (a metadata server beside the coordination
+            # port) renders it by name rather than guessing. A port the
+            # launch did not allocate stamps nothing, so the template
+            # carrying it resolves empty and its flag drops.
+            addresses[f"{name}.host"] = worker.ip
+            for port_name in provider.declared_port_names(name):
+                port_value = (instance.ports or {}).get(port_name)
+                if port_value:
+                    addresses[f"{name}.{port_name}"] = str(port_value)
         return addresses
 
     async def _desired_component_workers(

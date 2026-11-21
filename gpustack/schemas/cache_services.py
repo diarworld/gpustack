@@ -59,6 +59,13 @@ class CacheServiceEndpoint(BaseModel):
     url: Optional[str] = None
     """Alternative to host+port for providers addressed by URL."""
 
+    ports: Dict[str, int] = {}
+    """The resolved instance's ports by the names the attach component
+    gave them. A component's {{ports.<name>}} templates read here — an
+    address is one port, and an attach that also exposes a second
+    listener (a metadata server beside a coordination port) is only
+    reachable by name."""
+
     params: Dict[str, Any] = {}
     """Facts about the resolved placement the provider's injection
     templates read, in the platform's own vocabulary (e.g. locality)."""

@@ -33,6 +33,36 @@ translation_status: translated
 
 Her örnek bağlandığı önbellek hizmetini ve son isabet oranını bildirir. Örneğin, çalışanında kullanılabilir bir önbellek örneği bulunmadığı için önbelleksiz başlayan bir örnek hata vermek yerine paylaşılan KV önbelleğinin etkin olmadığını bildirir.
 
+## Mooncake ile Küme Çapında Bir Havuz Çalıştırma { #running-a-cluster-wide-pool-with-mooncake }
+
+Mooncake Store, kümenin çalışanlarının CPU DRAM'ini, motorların TCP veya RDMA üzerinden okuyup yazdığı tek bir paylaşılan KV önbelleğinde toplar. Hizmet iki tür örnek çalıştırır:
+
+- bir **master** — motorların bağlandığı koordinatör. Anahtar indeksini tutar, segment konumlarını dağıtır ve motorların ilk bağlantıyı kurduğu metadata sunucusunu servis eder. Tek bir çalışanda çalışır; havuzun beyni belirli donanımın yanında kalsın istiyorsanız hizmetin çalışan yerleşimiyle sabitleyin.
+- çalışan başına bir **store** — her biri, bulunduğu düğümün DRAM'inden bir segmenti havuza ekler. Motorlar hiçbir zaman doğrudan store'a bağlanmaz; konumları master dağıtır.
+
+[Mooncake belgeleri](https://kvcache-ai.github.io/Mooncake/) master'ın bayraklarını, store ayarlarını ve aktarım motorunun taşımalarını kapsar.
+
+### Mod seçimi { #choosing-the-mode }
+
+- **Standalone Store** (varsayılan): düğüm başına özel store konteynerleri havuzun sahibidir; kapasiteyi `Store RAM Size (GiB)` belirler. Motorlar kendi belleğinden katkı vermez ve havuzun kapasitesi model yerleşiminde ayrılır.
+- **Embedded**: store konteyneri yoktur; her motor `Engine Segment Size (GiB)` ile kendi belleğinin bir bölümünü havuza katar. Çalıştırmak daha ucuzdur, ancak bu bellek ayrılmaz — yoğun bir motor havuzu küçültür.
+
+Her iki mod da aynı ekleme sözleşmesini sunar; hizmetin modunu değiştirmek örneklerini yeniden oluşturur.
+
+### Motorlar ve kiracılar { #engines-and-tenants }
+
+Dağıtım eklemek [Bir Dağıtım Ekleme](#attach-a-deployment) bölümündeki gibi çalışır: motor, master'ın RPC adresini ve metadata sunucusunu gösteren bir yapılandırma dosyası alır ve havuza katılır. vLLM, CUDA (vLLM 0.29.0 ve üzeri) ve CANN (0.23.0 ve üzeri) çalışanlarında desteklenir.
+
+Birden fazla önbellek hizmeti tek bir master'ı paylaşıyor ve kullanımların ayrı ayrı hesaplanması gerekiyorsa `Tenant ID` ayarlayın. Kota zorunluluğu master tarafının işidir — master'ın `Parameters`'ine `--tenant_quota_connector_type` ve `--tenant_quota_connector_uri` ekleyin ve adlandırdığı kota kaynağını yönetin.
+
+### Metrikler { #metrics }
+
+Hizmetin grafikleri havuzun isabet oranını, kullanılan belleği ve kullanım oranını raporlar; bunlar master'ın Prometheus gösteriminden okunur.
+
+### PD ayrıştırma { #pd-disaggregation }
+
+`vllm-mooncake` ve `vllm-ascend-mooncake` prefill/decode tarifleri, aktarım bağlayıcılarının arkasındaki paylaşılan depo olarak bir Mooncake önbellek hizmeti kullanabilir — tarifin önbellek hizmeti ayarında hizmeti seçin.
+
 ## LMCache ile Hibrit Dikkat Modellerini Çalıştırma { #running-hybrid-attention-models-with-lmcache }
 
 Hibrit bir model, tekrarlayan katmanları (Mamba veya Gated-DeltaNet (GDN) doğrusal dikkat) tam dikkat katmanlarıyla birleştirir. Qwen3.5 ve Qwen3.6 serileri, Qwen3-Next, Kimi-Linear ve Kimi K3 bu türdendir.

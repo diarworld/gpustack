@@ -351,9 +351,11 @@ class CacheServiceManager:
             # declared component gets a key either way: an unstamped one
             # resolves empty rather than leaving its placeholder in the
             # command, so the flag holding it drops instead.
-            stamped = instance.component_addresses or {}
-            for name in provider.components:
-                params[f"component.{name}.address"] = stamped.get(name)
+            params.update(
+                self._dependency_template_params(
+                    provider, instance.component_addresses or {}
+                )
+            )
 
             argv, overrides_entrypoint = self._build_launch_argv(
                 cache_service, version_config, component_spec, component, params
@@ -767,6 +769,28 @@ class CacheServiceManager:
                 os.makedirs(path, exist_ok=True)
             except OSError as e:
                 raise ValueError(f"Failed to create data directory '{path}': {e}")
+
+    @staticmethod
+    def _dependency_template_params(
+        provider: CacheProvider, stamped: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """The template namespace for the dependency addresses the
+        controller stamped at creation: every declared component gets its
+        address, host and declared ports either way — an unstamped one
+        resolves empty rather than leaving its placeholder in the
+        command, so the flag holding it drops instead. The host and
+        named ports are what lets a dependent reach a second listener of
+        the dependency (a store building the master's metadata URL) —
+        the address alone is the RPC port, not the whole story."""
+        params: Dict[str, Any] = {}
+        for name in provider.components:
+            params[f"component.{name}.address"] = stamped.get(name)
+            params[f"component.{name}.host"] = stamped.get(f"{name}.host")
+            for port_name in provider.declared_port_names(name):
+                params[f"component.{name}.ports.{port_name}"] = stamped.get(
+                    f"{name}.{port_name}"
+                )
+        return params
 
     @staticmethod
     def _build_env(

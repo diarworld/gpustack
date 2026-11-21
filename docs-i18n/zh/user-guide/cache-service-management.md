@@ -33,6 +33,36 @@ translation_status: translated
 
 每个实例都会报告其接入的缓存服务及近期命中率。如果实例启动时没有接入缓存，例如其所在 Worker 上没有可用缓存实例，它会报告共享 KV 缓存未激活，而不会因此失败。
 
+## 使用 Mooncake 运行集群级缓存池 { #running-a-cluster-wide-pool-with-mooncake }
+
+Mooncake Store 将集群各 Worker 的 CPU DRAM 汇聚为一个共享 KV 缓存池，引擎通过 TCP 或 RDMA 对其进行读写。一个服务会运行两类实例：
+
+- 一个 **master** —— 引擎接入的协调器。它保存键索引、分发段位置，并提供引擎引导接入所需的元数据服务器。它运行在单个 Worker 上；如果希望缓存池的中枢靠近特定硬件，可以通过服务的 Worker 放置设置将其固定。
+- 每个 Worker 一个 **store** —— 每个实例将其所在节点的部分 DRAM 挂载进缓存池。引擎从不直接访问 store，段位置由 master 分发。
+
+[Mooncake 文档](https://kvcache-ai.github.io/Mooncake/) 涵盖 master 的参数、store 的设置以及传输引擎支持的传输方式。
+
+### 选择模式 { #choosing-the-mode }
+
+- **Standalone Store**（默认）：由每个节点专属的 store 容器持有缓存池，容量由 `Store RAM Size (GiB)` 指定。引擎不贡献自身内存，缓存池容量会在模型放置时预留。
+- **Embedded**：不运行 store 容器；每个引擎将 `Engine Segment Size (GiB)` 指定的自身内存贡献给缓存池。运行成本更低，但这部分内存不会预留——繁忙的引擎会缩小缓存池。
+
+两种模式提供相同的接入契约；切换服务的模式会重新创建其实例。
+
+### 引擎与租户 { #engines-and-tenants }
+
+接入部署的方式与[接入部署](#attach-a-deployment)相同：引擎会获得一个指向 master RPC 地址和元数据服务器的配置文件，并加入缓存池。vLLM 在 CUDA（vLLM 0.29.0 及以上）和 CANN（0.23.0 及以上）Worker 上受支持。
+
+当多个缓存服务共享同一个 master 且需要分别统计用量时，请设置 `Tenant ID`。配额限制由 master 侧负责——在 master 的 `Parameters` 中添加 `--tenant_quota_connector_type` 和 `--tenant_quota_connector_uri`，并管理其指向的配额来源。
+
+### 指标 { #metrics }
+
+服务图表会显示缓存池的命中率、已用内存和使用率，数据读取自 master 的 Prometheus 指标端点。
+
+### PD 分离 { #pd-disaggregation }
+
+`vllm-mooncake` 和 `vllm-ascend-mooncake` prefill/decode 部署方案可以将 Mooncake 缓存服务用作其传输连接器背后的共享存储——在方案的缓存服务设置中选择该服务即可。
+
 ## 使用 LMCache 运行混合注意力模型 { #running-hybrid-attention-models-with-lmcache }
 
 混合模型将循环层（Mamba 或 Gated-DeltaNet（GDN）线性注意力）与全注意力层交错排列。Qwen3.5 和 Qwen3.6 系列、Qwen3-Next、Kimi-Linear 及 Kimi K3 都属于此类模型。

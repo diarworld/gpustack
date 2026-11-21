@@ -683,6 +683,104 @@ def test_user_parameters_reach_the_component_they_are_filed_under():
     assert store_env["MC_TCP_ENABLE_CONNECTION_POOL"] == "1"
 
 
+def test_component_env_reaches_the_dependency_listeners_by_name():
+    """The store's env builds the master's metadata URL from the stamped
+    host and named ports: the metadata listener is a different port from
+    the RPC one the component address carries, and guessing it would
+    dial nothing."""
+    manager, clientset = _build_manager(worker_id=1)
+    cache_service = _new_cache_service(
+        config=CacheServiceConfig(fields={"ram_size": 8})
+    )
+    provider = _new_provider(
+        components={
+            "master": CacheProviderComponent(
+                topology="replicas",
+                attach_endpoint=True,
+                address_port="rpc",
+                ports=["rpc", "metadata", "metrics"],
+                run_command="mooncake_master --rpc_port {{port}}",
+            ),
+            "store": CacheProviderComponent(
+                topology="replicas",
+                depends_on="master",
+                run_command="python3 -m mooncake.mooncake_store_service",
+                env={
+                    "MOONCAKE_MASTER": "{{component.master.address}}",
+                    "MOONCAKE_TE_META_DATA_SERVER": (
+                        "http://{{component.master.host}}:"
+                        "{{component.master.ports.metadata}}/metadata"
+                    ),
+                    "MOONCAKE_LOCAL_HOSTNAME": "{{worker_ip}}",
+                },
+            ),
+        }
+    )
+
+    create, _ = _run_start(
+        manager,
+        clientset,
+        cache_service,
+        provider,
+        instance=_new_instance(
+            component="store",
+            component_addresses={
+                "master": "10.0.0.7:40001",
+                "master.host": "10.0.0.7",
+                "master.rpc": "40001",
+                "master.metadata": "40092",
+            },
+        ),
+    )
+    store_env = {e.name: e.value for e in create.call_args[0][0].containers[0].envs}
+    assert store_env["MOONCAKE_MASTER"] == "10.0.0.7:40001"
+    assert store_env["MOONCAKE_TE_META_DATA_SERVER"] == "http://10.0.0.7:40092/metadata"
+    assert store_env["MOONCAKE_LOCAL_HOSTNAME"] == "10.0.0.1"
+
+
+def test_a_missing_dependency_port_stamp_renders_the_env_away():
+    """The controller stamps only ports the master actually allocated: a
+    template asking for one it did not resolves empty, and the env var
+    carrying it drops instead of holding a half-built URL."""
+    manager, clientset = _build_manager(worker_id=1)
+    cache_service = _new_cache_service(
+        config=CacheServiceConfig(fields={"ram_size": 8})
+    )
+    provider = _new_provider(
+        components={
+            "master": CacheProviderComponent(
+                topology="replicas",
+                attach_endpoint=True,
+                run_command="mooncake_master --rpc_port {{port}}",
+            ),
+            "store": CacheProviderComponent(
+                topology="replicas",
+                depends_on="master",
+                run_command="python3 -m mooncake.mooncake_store_service",
+                env={
+                    "MOONCAKE_TE_META_DATA_SERVER": (
+                        "http://{{component.master.host}}:"
+                        "{{component.master.ports.metadata}}/metadata"
+                    ),
+                },
+            ),
+        }
+    )
+
+    create, _ = _run_start(
+        manager,
+        clientset,
+        cache_service,
+        provider,
+        instance=_new_instance(
+            component="store",
+            component_addresses={"master": "10.0.0.7:40001"},
+        ),
+    )
+    store_env = {e.name: e.value for e in create.call_args[0][0].containers[0].envs}
+    assert "MOONCAKE_TE_META_DATA_SERVER" not in store_env
+
+
 def test_l2_storage_reaches_only_the_attach_component():
     """The L2 tiers belong to the component holding the cache. A
     dependent component runs a different binary that rejects the adapter

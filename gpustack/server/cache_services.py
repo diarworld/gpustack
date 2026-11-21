@@ -114,6 +114,11 @@ async def _resolve_managed_endpoint(
         CacheServiceEndpoint(
             host=service_worker.ip,
             port=target.port,
+            # The same instance's ports by the names the attach component
+            # declared them: an attach that reads a second listener (a
+            # metadata server beside the coordination port) reaches it by
+            # name, not by guessing the port.
+            ports=dict(target.ports or {}),
             params={"locality": "node_local" if node_local else "remote"},
         ),
         None,
@@ -325,6 +330,14 @@ async def resolve_instance_cache_config(
             )
         ),
     }
+    # The attach instance's ports by the names its component declared
+    # them: an attach that reads a second listener (a metadata server
+    # beside the coordination port) renders it by name. One the launch
+    # did not allocate resolves None, so a template carrying it drops
+    # rather than emitting a half-built URL.
+    attach_component = provider.attach_component()
+    for port_name in provider.declared_port_names(attach_component):
+        render_params[f"ports.{port_name}"] = (endpoint.ports or {}).get(port_name)
     # External-mode connection fields feed additional placeholders declared
     # by the provider; they never override the well-known keys above.
     # Declared field defaults backstop unset fields inside render_injection.

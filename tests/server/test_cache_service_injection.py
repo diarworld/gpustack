@@ -8,6 +8,8 @@ import pytest
 from gpustack.server.cache_provider_catalog import asset_providers
 from gpustack.schemas.cache_providers import (
     CacheProvider,
+    CacheProviderComponent,
+    CacheProviderField,
     CacheProviderHealthCheck,
     CacheProviderIntegration,
     CacheProviderInjection,
@@ -847,6 +849,79 @@ async def test_mooncake_store_role_follows_mode_recipe(mode, engine, role, store
         provider.integration_for("vLLM").injection.kv_transfer_config.kv_role
         == "kv_both"
     )
+
+
+@pytest.mark.asyncio
+async def test_injection_renders_the_attach_instance_ports_by_name():
+    """An attach whose config needs a second listener of the instance it
+    attaches to (a metadata server beside the coordination RPC port)
+    renders it by its declared port name — the resolver feeds every port
+    the attach component declared, not just the one it is addressed by."""
+    provider = CacheProvider(
+        name="Mooncake",
+        custom_version=True,
+        components={
+            "master": CacheProviderComponent(
+                attach_endpoint=True,
+                ports=["rpc", "metadata", "metrics"],
+                address_port="rpc",
+            ),
+            "store": CacheProviderComponent(
+                topology="per_node",
+                depends_on="master",
+                enabled_by="mode",
+                enabled_when="standalone-store",
+            ),
+        },
+        fields=[
+            CacheProviderField(
+                name="mode",
+                type="string",
+                default="standalone-store",
+            )
+        ],
+        inference_backend_integrations=[
+            CacheProviderIntegration(
+                backend="vLLM",
+                injection=CacheProviderInjection(
+                    env={"MOONCAKE_CONFIG_PATH": "/tmp/gpustack-mooncake.json"},
+                    files={
+                        "/tmp/gpustack-mooncake.json": (
+                            '{"metadata_server":'
+                            ' "http://{{host}}:{{ports.metadata}}/metadata",'
+                            ' "master_server_address": "{{master_server_address}}"}'
+                        )
+                    },
+                ),
+            )
+        ],
+    )
+    model = shared_cache_model()
+    with (
+        patch_lookups(
+            managed_cache_service(provider_name="Mooncake"),
+            instances=[
+                cache_service_instance(
+                    component="master",
+                    port=50051,
+                    ports={"rpc": 50051, "metadata": 8092, "metrics": 9003},
+                )
+            ],
+        ),
+        patch(
+            "gpustack.server.cache_services.get_cache_provider",
+            AsyncMock(return_value=provider),
+        ),
+    ):
+        snapshot = await resolve_instance_cache_config(
+            MagicMock(),
+            model,
+            worker=SimpleNamespace(id=2, ip="10.0.0.5", deleted_at=None),
+        )
+    assert snapshot.injected, snapshot.reason
+    body = snapshot.files["/tmp/gpustack-mooncake.json"]
+    assert '"metadata_server": "http://10.0.0.5:8092/metadata"' in body
+    assert '"master_server_address": "10.0.0.5:50051"' in body
 
 
 @pytest.mark.parametrize("has_integration", [False, True])

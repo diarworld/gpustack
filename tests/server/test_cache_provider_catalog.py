@@ -80,25 +80,62 @@ def test_malformed_entry_costs_only_its_own_provider(monkeypatch):
         monkeypatch.undo()
 
 
-def test_a_placeholder_provider_is_listed_with_nothing_to_launch():
-    """A provider this installation does not carry still has a card that
-    reads like any other — what it is, what it attaches to, where to read
-    about it — and nothing behind it: no version, no image, no component.
-    A declaration that launches nothing is held to none of the rules
-    about the two."""
+def test_mooncake_launches_a_master_with_per_node_stores():
+    """Mooncake's card is a working declaration: one fixed master the
+    engines attach to cluster-wide, and per-node stores that only a
+    standalone-store configuration keeps. The engine config reaches the
+    master's metadata listener by name — a declared attach port, not a
+    guess off the RPC address — and the engine's own contribution to the
+    pool collapses to zero while a store owns the capacity."""
     provider = _asset_provider("Mooncake")
-    assert localized_default(provider.unavailable_reason)
+    assert provider.unavailable_reason is None
     assert localized_default(provider.description)
-    # the card's accelerator tags: with no images to read them off, the
-    # scope of its engine integrations is the claim
-    assert [
-        integration.frameworks
-        for integration in provider.inference_backend_integrations
-    ] == [["cuda"], ["cann"]]
+    assert provider.attach_locality == "cluster"
 
-    assert provider.versions == {}
-    assert provider.custom_version is False
-    assert provider.components == {}
+    # one CPU build serves every node: the master and the stores are
+    # host-DRAM processes, the GPU work happens in the engines
+    assert list(provider.versions) == ["0.3.13.post1-cpu"]
+    assert provider.default_version == "0.3.13.post1-cpu"
+    assert (
+        provider.versions["0.3.13.post1-cpu"].image
+        == "gpustack/mirrored-mooncake:0.3.13.post1-cpu"
+    )
+
+    assert provider.attach_component() == "master"
+    master = provider.components["master"]
+    assert master.attach_endpoint is True
+    assert master.topology == "replicas" and master.replicas == 1
+    assert master.gpu_access is False
+    assert provider.declared_port_names("master") == ["rpc", "metadata", "metrics"]
+    assert provider.address_port_name("master") == "rpc"
+    assert provider.metrics_port_name("master") == "metrics"
+
+    store = provider.components["store"]
+    assert store.topology == "per_node"
+    assert store.depends_on == "master"
+    assert (store.enabled_by, store.enabled_when) == ("mode", "standalone-store")
+    assert provider.component_enabled("store", {"mode": "standalone-store"}) is True
+    assert provider.component_enabled("store", {"mode": "embedded"}) is False
+    # the form never submits a hidden field; the mode's own default
+    # decides what an unset one would launch
+    assert provider.component_enabled("store", None) is True
+
+    # the engine config reads the master's metadata listener by name and
+    # sizes the engine's own contribution through the gated field
+    integration = provider.integration_for("vLLM")
+    body = integration.injection.files["/tmp/gpustack-mooncake.json"]
+    assert '"metadata_server": "http://{{host}}:{{ports.metadata}}/metadata"' in body
+    assert '"master_server_address": "{{master_server_address}}"' in body
+    assert '"global_segment_size": "{{engine_segment_size}}GB"' in body
+    assert '"mode": "{{mode}}"' in body
+    assert '"tenant_id": "{{tenant_id}}"' in body
+    standalone = resolved_field_values(provider.fields, {"mode": "standalone-store"})
+    assert standalone["engine_segment_size"] == 0
+    assert standalone["ram_size"] == 50
+    embedded = resolved_field_values(provider.fields, {"mode": "embedded"})
+    assert embedded["engine_segment_size"] == 16
+    # the store's own size is hidden in embedded mode; nothing reads it
+    assert embedded["ram_size"] == 0
 
 
 def test_a_plugin_asset_replaces_the_placeholder_in_place(monkeypatch):
