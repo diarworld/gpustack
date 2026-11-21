@@ -33,12 +33,11 @@ user-level allowance.
 
 ## Concurrency by Model
 
-The table under the cards lists the models you can reach against the
-deployment's in-flight cap: how many requests to each model are running right
-now, and the effective limit for that model — the administrator's per-model
-override if one is set, the deployment default otherwise. A model whose running
-count sits at its limit is the source of the `429 Too Many Concurrent
-Requests` rejections.
+The table under the cards lists the ready models you can reach, busiest first:
+how many of your own requests to each model are running right now, and the
+effective limit for that model — the administrator's per-model override if one
+is set, the deployment default otherwise. A model whose running count sits at
+its limit is the source of the `429 Too Many Concurrent Requests` rejections.
 
 ## Model Concurrency
 

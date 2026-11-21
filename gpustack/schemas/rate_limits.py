@@ -62,12 +62,12 @@ class RateLimitResetStatus(BaseModel):
 class ModelConcurrencyUsage(BaseModel):
     """One per-model in-flight cap and where it stands.
 
-    Only models the user's row names explicitly are itemized; every other
-    model inherits the deployment ``default_concurrency`` and has no
-    itemized counter. ``running`` is the live slot count (one member per
-    in-flight request), ``None`` when it could not be read (Redis
-    unavailable, or local mode where the plugin keeps no server-readable
-    counters).
+    Itemized over the ready models the user can reach: the limit is their
+    named override, or the deployment ``default_concurrency`` for models
+    without one (rows drop out entirely when no cap resolves). ``running``
+    is the user's own live slot count (one member per in-flight request),
+    ``None`` when it could not be read (Redis unavailable, or local mode
+    where the plugin keeps no server-readable counters).
     """
 
     model: str

@@ -25,7 +25,7 @@ RPM ve TPM kısa patlamalara karşı korur; haftalık ve aylık bütçeler süre
 
 ## Modellere Göre Eşzamanlılık { #concurrency-by-model }
 
-Kartların altındaki tablo, ulaşabildiğiniz modelleri dağıtımın eşzamanlı istek sınırıyla karşılaştırır: her model için şu an kaç isteğin çalıştığı ve o modelin etkin limiti — ayarlanmışsa yöneticinin model bazlı geçersiz kırması, aksi hâlde dağıtım varsayılanı. Çalışma sayısı limite dayanmış bir model, `429 Too Many Concurrent Requests` reddedilmelerinin kaynağıdır.
+Kartların altındaki tablo, ulaşabildiğiniz hazır (ready) modelleri yoğunluk sırasına göre listeler: her model için şu an çalışan kendi isteklerinizin sayısı ve o modelin etkin limiti — ayarlanmışsa yöneticinin model bazlı geçersiz kırması, aksi hâlde dağıtım varsayılanı. Çalışma sayısı limite dayanmış bir model, `429 Too Many Concurrent Requests` reddedilmelerinin kaynağıdır.
 
 ## Model Başına Eşzamanlı İstek { #model-concurrency }
 

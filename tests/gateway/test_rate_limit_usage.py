@@ -227,7 +227,7 @@ def test_model_concurrency_specs_key_layout():
     writes: the user limit combo, the captured user segment, and the
     ``c:<model>`` suffix the slot ZSET lives under."""
     user = _UserStub(model_concurrency_limits={"glm-5.3-flash": 4})
-    specs = model_concurrency_specs(_cfg(), 42, user)
+    specs = model_concurrency_specs(_cfg(), 42, user, ["glm-5.3-flash"])
     assert len(specs) == 1
     assert specs[0].model == "glm-5.3-flash"
     assert specs[0].limit == 4
@@ -236,30 +236,37 @@ def test_model_concurrency_specs_key_layout():
     )
 
 
-def test_model_concurrency_specs_are_sorted_and_override_only():
-    """Deterministic order for the wire payload, and only the models the
-    row names: every other model inherits the deployment default and has
-    no itemized counter to read."""
-    user = _UserStub(
-        model_concurrency_limits={"qwen3.8-27b": 2, "glm-5.3-flash": 4, "free": 0}
-    )
-    specs = model_concurrency_specs(_cfg(), 42, user)
+def test_model_concurrency_specs_itemize_ready_models():
+    """Every ready model resolves to a cap -- the named override when the
+    row carries one, the deployment default otherwise -- in the caller's
+    order; a stored 0 stays an explicit unlimited."""
+    user = _UserStub(model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
+    cfg = _cfg(default_concurrency=2)
+    specs = model_concurrency_specs(cfg, 42, user, ["glm-5.3-flash", "other", "free"])
     assert [(s.model, s.limit) for s in specs] == [
-        ("free", 0),
         ("glm-5.3-flash", 4),
-        ("qwen3.8-27b", 2),
+        ("other", 2),
+        ("free", 0),
     ]
+
+
+def test_model_concurrency_specs_drop_models_without_a_cap():
+    """With the deployment cap off, models the row does not name resolve
+    to nothing and are not itemized -- there is no counter to read."""
+    specs = model_concurrency_specs(
+        _cfg(default_concurrency=0),
+        42,
+        _UserStub(model_concurrency_limits={"glm": 4}),
+        ["glm", "other"],
+    )
+    assert [(s.model, s.limit) for s in specs] == [("glm", 4)]
 
 
 def test_model_concurrency_specs_admin_reports_nothing():
     """Admins are exempt from the cap, so their row reports no enforced
     per-model limits regardless of what its map holds."""
     user = _UserStub(is_admin=True, model_concurrency_limits={"glm": 4})
-    assert model_concurrency_specs(_cfg(), 42, user) == []
-
-
-def test_model_concurrency_specs_without_overrides_is_empty():
-    assert model_concurrency_specs(_cfg(), 42, _UserStub()) == []
+    assert model_concurrency_specs(_cfg(), 42, user, ["glm"]) == []
 
 
 @pytest.mark.asyncio

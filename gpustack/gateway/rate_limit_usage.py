@@ -259,35 +259,52 @@ class ModelConcurrencySpec:
 
 
 def model_concurrency_specs(
-    rlc: GatewayRateLimitConfig, user_id: int, user: Optional["Principal"]
+    rlc: GatewayRateLimitConfig,
+    user_id: int,
+    user: Optional["Principal"],
+    models: List[str],
 ) -> List[ModelConcurrencySpec]:
-    """The per-model in-flight caps enforced for one user, mirroring the
-    reconciler's combo layout: the user limit combo carries the
-    ``concurrency_limits`` block, and the plugin keys one ZSET per (combo,
-    model) with the ``c:<model>`` suffix and the same consumer dimension
-    fragment as every other user-level window.
+    """The per-model in-flight caps enforced for one user, over the ready
+    route names ``models``, mirroring the reconciler's combo layout: the
+    user limit combo carries the ``concurrency_limits`` block, and the
+    plugin keys one ZSET per (combo, model) with the ``c:<model>`` suffix
+    and the same consumer dimension fragment as every other user-level
+    window.
 
-    Only the models the user's row names in ``model_concurrency_limits``
-    are itemized -- the deployment ``default_concurrency`` applies to
-    every other model but has no single counter to read. Admins are
-    exempt from the cap (their combo omits the block), so an admin row
-    reports nothing regardless of what its map holds.
+    The block restates the deployment ``default_concurrency`` as its
+    ``default``, so every model resolves to a cap -- the user's explicit
+    override when named, the deployment default otherwise -- and the
+    plugin keeps a slot counter for every model with a non-zero resolved
+    quota, whether or not the user's row names an override. A model with
+    no cap left to report (no override on a deployment with the cap off)
+    is dropped rather than itemized.
+
+    Admins are exempt from the cap: their combo omits the block, so no
+    counter exists for their requests and an admin row itemizes nothing.
     """
     if getattr(user, "is_admin", False):
         return []
     overrides = getattr(user, "model_concurrency_limits", None) or {}
     identity = f"{USER_IDENTITY_PREFIX}{user_id}"
     combo = user_limit_combo(user_id)
-    return [
-        ModelConcurrencySpec(
-            model=model,
-            limit=overrides[model],
-            redis_key=(
-                f"{RULE_NAME}|{combo}|{CONSUMER_DIM_PREFIX}{identity}|c:{model}"
-            ),
+    specs = []
+    for model in models:
+        if model in overrides:
+            limit = overrides[model]
+        elif rlc.default_concurrency:
+            limit = rlc.default_concurrency
+        else:
+            continue
+        specs.append(
+            ModelConcurrencySpec(
+                model=model,
+                limit=limit,
+                redis_key=(
+                    f"{RULE_NAME}|{combo}|{CONSUMER_DIM_PREFIX}{identity}|c:{model}"
+                ),
+            )
         )
-        for model in sorted(overrides)
-    ]
+    return specs
 
 
 def expected_windows(

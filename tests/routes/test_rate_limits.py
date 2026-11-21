@@ -43,10 +43,10 @@ def _cfg(**overrides) -> GatewayRateLimitConfig:
     return GatewayRateLimitConfig(**fields)
 
 
-def _redis_cfg() -> SimpleNamespace:
+def _redis_cfg(**overrides) -> SimpleNamespace:
     """Top-level config stand-in: the endpoint only reads
     ``gateway_rate_limit`` off it."""
-    return SimpleNamespace(gateway_rate_limit=_cfg())
+    return SimpleNamespace(gateway_rate_limit=_cfg(**overrides))
 
 
 def _local_cfg() -> SimpleNamespace:
@@ -99,9 +99,11 @@ class FakeSession:
     reset-quota reads through the ``gateway_rate_limit_resets`` statements.
     Writes are recorded, not persisted."""
 
-    def __init__(self, users=(), resets=()):
+    def __init__(self, users=(), resets=(), models=()):
         self._users = {u.id: u for u in users}
         self._resets = sorted(resets, key=lambda r: r.reset_at)
+        # Ready route names the non_admin_user_models view yields.
+        self._models = list(models)
         self.get_calls = []
         self.statements = []
         self.added = []
@@ -130,6 +132,8 @@ class FakeSession:
         text = self._compiled(statement)
         if "gateway_rate_limit_resets" in text:
             return SimpleNamespace(all=lambda: self._matching_resets(text))
+        if "non_admin_user_models" in text:
+            return SimpleNamespace(all=lambda: list(self._models))
         return SimpleNamespace(all=lambda: [])
 
     @staticmethod
@@ -331,7 +335,12 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     # table; the per-key view is gone, so no api_keys statement ever runs.
     assert response.user.concurrency_default == 1
     assert session.statements
-    assert all("gateway_rate_limit_resets" in str(s) for s in session.statements)
+    # Every statement is either the reset-quota read or the ready-models
+    # view; no api_keys statement ever runs.
+    assert all(
+        "gateway_rate_limit_resets" in str(s) or "non_admin_user_models" in str(s)
+        for s in session.statements
+    )
 
 
 @pytest.mark.asyncio
@@ -380,12 +389,12 @@ async def test_admin_unknown_user_is_404(frozen_now):
 async def test_model_concurrency_reports_overrides_with_running_counts(
     frozen_now, monkeypatch
 ):
-    """The per-model block mirrors the user's ``model_concurrency_limits``
-    with live slot counts; the keys read are the plugin's concurrency
-    layout under the user limit combo."""
-    cfg = _redis_cfg()
+    """The per-model block itemizes the ready models with live personal
+    slot counts; the keys read are the plugin's concurrency layout under
+    the user limit combo, and the busiest model leads."""
+    cfg = _redis_cfg(default_concurrency=0)
     user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4, "free": 0})
-    session = FakeSession(users=[user])
+    session = FakeSession(users=[user], models=["free", "glm-5.3-flash", "other"])
     reader = FakeReader(
         concurrency={
             "gpustack-rate-limit|user-7|consumer=gpustack-7|c:glm-5.3-flash": 2,
@@ -398,9 +407,11 @@ async def test_model_concurrency_reports_overrides_with_running_counts(
         session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=None
     )
 
+    # "other" is ready but resolves to no cap (no override, deployment
+    # default off), so it is not itemized; rows sort by running desc.
     assert [(m.model, m.limit, m.running) for m in response.user.model_concurrency] == [
-        ("free", 0, 0),
         ("glm-5.3-flash", 4, 2),
+        ("free", 0, 0),
     ]
     assert sorted(reader.concurrency_keys) == [
         "gpustack-rate-limit|user-7|consumer=gpustack-7|c:free",
@@ -410,16 +421,46 @@ async def test_model_concurrency_reports_overrides_with_running_counts(
 
 
 @pytest.mark.asyncio
-async def test_model_concurrency_admin_and_no_overrides_get_nothing(
+async def test_model_concurrency_resolves_the_default_and_sorts_by_running(
     frozen_now, monkeypatch
 ):
-    """Admins are exempt (nothing enforced), and a user without overrides
-    has no itemized per-model caps: both get an empty block and no
-    concurrency reads at all."""
-    cfg = _redis_cfg()
+    """A user without overrides gets every ready model at the deployment
+    default cap, ordered busiest-first with the name as tiebreaker."""
+    cfg = _redis_cfg(default_concurrency=2)
+    user = _user(7)
+    session = FakeSession(users=[user], models=["beta", "alpha", "gamma"])
+    reader = FakeReader(
+        concurrency={
+            "gpustack-rate-limit|user-7|consumer=gpustack-7|c:alpha": 1,
+            "gpustack-rate-limit|user-7|consumer=gpustack-7|c:beta": 0,
+            "gpustack-rate-limit|user-7|consumer=gpustack-7|c:gamma": 2,
+        }
+    )
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+
+    assert [(m.model, m.limit, m.running) for m in response.user.model_concurrency] == [
+        ("gamma", 2, 2),
+        ("alpha", 2, 1),
+        ("beta", 2, 0),
+    ]
+    assert response.user.concurrency_default == 2
+
+
+@pytest.mark.asyncio
+async def test_model_concurrency_admin_and_capless_users_get_nothing(
+    frozen_now, monkeypatch
+):
+    """Admins are exempt (no query, nothing enforced), and with the
+    deployment cap off a user without overrides itemizes nothing even with
+    ready models: both get an empty block and no concurrency reads."""
+    cfg = _redis_cfg(default_concurrency=0)
     admin = _user(1, is_admin=True, model_concurrency_limits={"glm": 4})
     plain = _user(7)
-    session = FakeSession(users=[admin, plain])
+    session = FakeSession(users=[admin, plain], models=["glm"])
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 
@@ -442,7 +483,7 @@ async def test_model_concurrency_failure_fails_open(frozen_now, monkeypatch):
     channel the window reads use."""
     cfg = _redis_cfg()
     user = _user(7, model_concurrency_limits={"glm-5.3-flash": 4})
-    session = FakeSession(users=[user])
+    session = FakeSession(users=[user], models=["glm-5.3-flash"])
     reader = FakeReader(concurrency_error=ConnectionError("down"))
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
 

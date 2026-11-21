@@ -32,6 +32,7 @@ from gpustack.gateway.rate_limit_usage import (
     user_limit_windows,
 )
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
+from gpustack.schemas.model_routes import MyModel
 from gpustack.schemas.rate_limits import (
     ModelConcurrencyUsage,
     RateLimitResetCreate,
@@ -116,6 +117,29 @@ def _reader(request: Request, cfg: Config):
         # process (see reader_from_config: one pool, reused connections).
         request.app.state.rate_limit_usage_reader = reader
     return reader
+
+
+async def _ready_model_names(session, target: User) -> List[str]:
+    """The ready routes the target can reach, by name.
+
+    A non-admin's reachable set is the ``non_admin_user_models`` view: its
+    ``user_id`` rows encode the visibility grants, and ``ready_targets > 0``
+    mirrors the READY filter the models page uses. These are the model
+    names the gateway's routing header carries for this user's traffic --
+    the fragments the plugin's concurrency counters key on. Admins are
+    exempt from the concurrency cap (their combo omits the block, no
+    counter exists), so there is nothing to itemize for them and no query
+    is spent.
+    """
+    if target.is_admin:
+        return []
+    stmt = select(MyModel.name).where(
+        MyModel.deleted_at.is_(None),
+        MyModel.ready_targets > 0,
+        MyModel.user_id == target.id,
+    )
+    rows = (await session.exec(stmt)).all()
+    return sorted(set(rows))
 
 
 async def _reset_status(
@@ -220,12 +244,16 @@ async def get_rate_limits(
         # Local mode keeps no counters: windows render with limits only.
         states = [None] * len(all_specs)
 
-    # Per-model in-flight caps with their live slot counts. The specs come
-    # from the user's own ``model_concurrency_limits`` (empty for admins --
-    # exempt -- and users without overrides); local mode has no
-    # server-readable counters, so ``running`` stays unset there too.
-    concurrency_specs = model_concurrency_specs(rlc, target.id, target)
+    # Per-model in-flight caps with their live slot counts, over the ready
+    # models the target can reach. Each row is personal: ``running`` is the
+    # user's own slot count from the plugin's per-user counter, and the
+    # limit is their override or the deployment default. Local mode has no
+    # server-readable counters, so ``running`` stays unset there; admins
+    # are exempt and itemize nothing.
+    ready_models = await _ready_model_names(session, target)
+    concurrency_specs = model_concurrency_specs(rlc, target.id, target, ready_models)
     concurrency_running: List[Optional[int]] = [None] * len(concurrency_specs)
+    concurrency_error = None
     if concurrency_specs and mode == "redis":
         reader = _reader(request, cfg)
         counts, concurrency_error = await read_concurrency(
@@ -235,6 +263,16 @@ async def get_rate_limits(
             usage_error = usage_error or concurrency_error
         else:
             concurrency_running = list(counts)
+
+    # Display order the Usage page renders: busiest model first (a row the
+    # read could not fill in sorts last), name as the tiebreaker.
+    model_usage = [
+        ModelConcurrencyUsage(model=spec.model, limit=spec.limit, running=running)
+        for spec, running in zip(concurrency_specs, concurrency_running)
+    ]
+    model_usage.sort(
+        key=lambda row: (row.running is None, -(row.running or 0), row.model)
+    )
 
     # Reset-button state only exists where there are counters to clear;
     # in local mode the plugin keeps nothing a reset could forgive.
@@ -262,14 +300,7 @@ async def get_rate_limits(
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
             ],
-            model_concurrency=[
-                ModelConcurrencyUsage(
-                    model=spec.model,
-                    limit=spec.limit,
-                    running=running,
-                )
-                for spec, running in zip(concurrency_specs, concurrency_running)
-            ],
+            model_concurrency=model_usage,
             resets=resets,
         ),
     )
