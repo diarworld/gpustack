@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -6,6 +8,7 @@ from gpustack.gateway.rate_limit import WEEK_IN_SECONDS
 from gpustack.server.gateway_rate_limit_reconciler import (
     fit_combinations,
     key_combination,
+    key_combinations_for_user,
     reconcile_spec_diff,
     user_limits_combination,
 )
@@ -79,6 +82,85 @@ class TestKeyCombination:
 
     def test_no_daily_anywhere_renders_nothing(self):
         assert key_combination(make_key(), make_cfg()) is None
+
+
+class TestKeyCombinationsForUser:
+    def test_shared_quota_collapses_into_one_regexp_combo(self):
+        """Keys of one user sharing an effective day quota -- the common
+        case, all inheriting the deployment default -- collapse into one
+        regexp combo covering every API-key consumer of the user. No
+        capture group: the whole consumer string stays the quota bucket,
+        so each key keeps its own day quota instead of the keys fusing
+        into one user-wide bucket."""
+        combos = key_combinations_for_user(
+            42,
+            [make_key(id=1), make_key(id=2, access_key="ak999")],
+            make_cfg(default_daily_tokens=500_000),
+        )
+        (combo,) = combos
+        assert combo["name"] == "keys-42"
+        assert combo["token_quota"] == {"each_day": 500_000}
+        (match,) = combo["match"]
+        assert match["source"] == "consumer"
+        expression = match["value"].removeprefix("regexp:")
+        assert re.fullmatch(expression, "ak123.gpustack-42")
+        assert re.fullmatch(expression, "ak999.gpustack-42")
+        # The bare UI consumer has no key and drew no key combo before.
+        assert re.fullmatch(expression, "gpustack-42") is None
+        # Another user's keys stay out.
+        assert re.fullmatch(expression, "ak123.gpustack-43") is None
+
+    def test_explicit_uniform_quota_uses_the_explicit_value(self):
+        combos = key_combinations_for_user(
+            42,
+            [
+                make_key(id=1, daily_token_limit=1_000),
+                make_key(id=2, access_key="ak999", daily_token_limit=1_000),
+            ],
+            make_cfg(default_daily_tokens=500_000),
+        )
+        (combo,) = combos
+        assert combo["token_quota"] == {"each_day": 1_000}
+
+    def test_mixed_quotas_fall_back_to_exact_per_key_combos(self):
+        """RE2 has no negative lookahead, so a shared regexp would overlap
+        the explicit keys' matches and AND the quotas down to the smaller
+        one. A user mixing explicit per-key quotas keeps one exact combo
+        per key, with disjoint matches."""
+        combos = key_combinations_for_user(
+            42,
+            [
+                make_key(id=1, daily_token_limit=1_000),
+                make_key(id=2, access_key="ak999"),
+            ],
+            make_cfg(default_daily_tokens=500_000),
+        )
+        assert [combo["name"] for combo in combos] == ["key-1", "key-2"]
+        assert combos[0]["match"][0]["value"] == "ak123.gpustack-42"
+        assert combos[0]["token_quota"] == {"each_day": 1_000}
+        assert combos[1]["match"][0]["value"] == "ak999.gpustack-42"
+        assert combos[1]["token_quota"] == {"each_day": 500_000}
+
+    def test_no_daily_anywhere_renders_nothing(self):
+        assert key_combinations_for_user(42, [make_key()], make_cfg()) == []
+
+    def test_explicit_zero_is_no_quota(self):
+        """An explicit 0 disables the day quota for that key -- the same
+        rendering an unset daily limit gets when no default exists."""
+        assert (
+            key_combinations_for_user(
+                42,
+                [make_key(daily_token_limit=0)],
+                make_cfg(default_daily_tokens=500_000),
+            )
+            == []
+        )
+
+    def test_no_keys_render_nothing(self):
+        assert (
+            key_combinations_for_user(42, [], make_cfg(default_daily_tokens=500_000))
+            == []
+        )
 
 
 class TestUserLimitsCombination:
@@ -186,19 +268,25 @@ class TestUserLimitsCombination:
 
 
 class TestFitCombinations:
-    def test_key_combos_are_served_before_user_budgets(self):
+    def test_user_budgets_are_served_before_key_combos(self):
+        """A dropped user combo unenforces the user's rate caps, budgets
+        and concurrency on every request they send; a dropped key combo
+        costs one key its day quota. Byte pressure must eat the narrower
+        blast radius first."""
         key_combo = {"name": "key-1", "match": []}
         user_combo = {"name": "user-2", "is_fallback": True, "match": []}
-        # A budget that fits only one of the two: the key combo must win.
-        kept = fit_combinations([user_combo, key_combo], budget=json_small(key_combo))
-        assert kept == [key_combo]
+        # A budget that fits only one of the two: the user combo must win.
+        kept = fit_combinations([key_combo, user_combo], budget=json_small(user_combo))
+        assert kept == [user_combo]
 
     def test_everything_is_kept_when_it_fits(self):
-        combos = [
-            {"name": "key-1", "match": [{"source": "consumer", "value": "x"}]},
-            {"name": "user-2", "is_fallback": True, "match": []},
+        user_combo = {"name": "user-2", "is_fallback": True, "match": []}
+        key_combo = {"name": "key-1", "match": [{"source": "consumer", "value": "x"}]}
+        # The kept list comes back in serving order: user combos lead.
+        assert fit_combinations([key_combo, user_combo], budget=10_000) == [
+            user_combo,
+            key_combo,
         ]
-        assert fit_combinations(combos, budget=10_000) == combos
 
     def test_zero_budget_keeps_nothing(self):
         assert fit_combinations([{"name": "key-1", "match": []}], budget=0) == []
