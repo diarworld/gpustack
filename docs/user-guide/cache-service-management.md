@@ -49,7 +49,7 @@ Both modes serve the same attach contract; switching a service's mode re-creates
 
 Attaching a deployment works as in [Attach a Deployment](#attach-a-deployment): the engine gets a config file pointing at the master's RPC address and metadata server and joins the pool. vLLM is supported on CUDA (vLLM 0.29.0 and newer) and CANN (0.23.0 and newer) workers.
 
-Set `Tenant ID` when several cache services share one master and their usage should be accounted separately. Quota enforcement is a master-side concern — add `--tenant_quota_connector_type` and `--tenant_quota_connector_uri` to the master's `Parameters` and manage the quota source it names.
+Set `Tenant ID` when several cache services share one master and their usage should be accounted separately. Quota enforcement is a master-side concern: multi-tenancy is off by default because a master started with it requires a tenant quota connector and refuses to start without one. To turn it on, add `--enable_multi_tenants=true`, `--tenant_quota_connector_type` and `--tenant_quota_connector_uri` to the master's `Parameters` and manage the quota source they name.
 
 ### Metrics
 

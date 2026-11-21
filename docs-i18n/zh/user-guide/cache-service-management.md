@@ -53,7 +53,7 @@ Mooncake Store 将集群各 Worker 的 CPU DRAM 汇聚为一个共享 KV 缓存�
 
 接入部署的方式与[接入部署](#attach-a-deployment)相同：引擎会获得一个指向 master RPC 地址和元数据服务器的配置文件，并加入缓存池。vLLM 在 CUDA（vLLM 0.29.0 及以上）和 CANN（0.23.0 及以上）Worker 上受支持。
 
-当多个缓存服务共享同一个 master 且需要分别统计用量时，请设置 `Tenant ID`。配额限制由 master 侧负责——在 master 的 `Parameters` 中添加 `--tenant_quota_connector_type` 和 `--tenant_quota_connector_uri`，并管理其指向的配额来源。
+当多个缓存服务共享同一个 master 且需要分别统计用量时，请设置 `Tenant ID`。配额限制由 master 侧负责：多租户默认关闭，因为启用后的 master 需要租户配额连接器，否则拒绝启动。要启用它，请在 master 的 `Parameters` 中添加 `--enable_multi_tenants=true`、`--tenant_quota_connector_type` 和 `--tenant_quota_connector_uri`，并管理其指向的配额来源。
 
 ### 指标 { #metrics }
 

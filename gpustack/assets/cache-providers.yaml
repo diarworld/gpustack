@@ -648,10 +648,13 @@
         ram_gib: "2"
         cpu: 2
       # The flag set the wheel's own master runs with: the metadata
-      # server must be on (engines bootstrap through it), multi-tenancy
-      # on (engines may carry a tenant_id), and the rest are the knobs
-      # promoted to fields below. Quota connectors stay a hand-written
-      # flag — an operator wiring one owns the file it reads.
+      # server must be on (engines bootstrap through it) and the rest
+      # are the knobs promoted to fields below. Multi-tenancy stays
+      # off by default because it is all-or-nothing there: a master
+      # started with it requires a tenant quota connector (a YAML
+      # file or etcd) and refuses to start without one.
+      # Operators who want it add --enable_multi_tenants and the
+      # connector flags in Parameters beside a quota file they own.
       run_command: >-
         mooncake_master --rpc_port {{port}}
         --enable_http_metadata_server=true --http_metadata_server_host 0.0.0.0
@@ -660,7 +663,7 @@
         --default_kv_lease_ttl {{kv_lease_ttl_ms}}
         --eviction_high_watermark_ratio {{eviction_high_watermark_ratio}}
         --eviction_ratio {{eviction_ratio}}
-        --enable_multi_tenants=true --logtostderr
+        --logtostderr
       common_parameters:
         - --rpc_thread_num
         - --default_kv_soft_pin_ttl

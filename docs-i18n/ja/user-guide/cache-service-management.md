@@ -49,7 +49,7 @@ Mooncake Store は、クラスターの Worker が持つ CPU DRAM を、TCP ま�
 
 デプロイの接続は[デプロイの接続](#attach-a-deployment)と同じ手順で行われます。エンジンは、master の RPC アドレスとメタデータ Server を指す設定ファイルを受け取り、プールに参加します。vLLM は CUDA（vLLM 0.29.0 以降）および CANN（0.23.0 以降）の Worker でサポートされます。
 
-複数のキャッシュサービスが 1 つの master を共有し、それぞれの使用量を別々に計上したい場合は `Tenant ID` を設定します。クォータの強制は master 側の要件です。master の `Parameters` に `--tenant_quota_connector_type` と `--tenant_quota_connector_uri` を追加し、それらが指すクォータソースを管理してください。
+複数のキャッシュサービスが 1 つの master を共有し、それぞれの使用量を別々に計上したい場合は `Tenant ID` を設定します。クォータの強制は master 側の要件です。マルチテナントはデフォルトで無効です。有効にした master はテナントクォータコネクタを要求し、なければ起動しません。有効にするには、master の `Parameters` に `--enable_multi_tenants=true`、`--tenant_quota_connector_type`、`--tenant_quota_connector_uri` を追加し、それらが指すクォータソースを管理してください。
 
 ### メトリクス { #metrics }
 

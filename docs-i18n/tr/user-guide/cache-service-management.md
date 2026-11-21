@@ -53,7 +53,7 @@ Her iki mod da aynı ekleme sözleşmesini sunar; hizmetin modunu değiştirmek 
 
 Dağıtım eklemek [Bir Dağıtım Ekleme](#attach-a-deployment) bölümündeki gibi çalışır: motor, master'ın RPC adresini ve metadata sunucusunu gösteren bir yapılandırma dosyası alır ve havuza katılır. vLLM, CUDA (vLLM 0.29.0 ve üzeri) ve CANN (0.23.0 ve üzeri) çalışanlarında desteklenir.
 
-Birden fazla önbellek hizmeti tek bir master'ı paylaşıyor ve kullanımların ayrı ayrı hesaplanması gerekiyorsa `Tenant ID` ayarlayın. Kota zorunluluğu master tarafının işidir — master'ın `Parameters`'ine `--tenant_quota_connector_type` ve `--tenant_quota_connector_uri` ekleyin ve adlandırdığı kota kaynağını yönetin.
+Birden fazla önbellek hizmeti tek bir master'ı paylaşıyor ve kullanımların ayrı ayrı hesaplanması gerekiyorsa `Tenant ID` ayarlayın. Kota zorunluluğu master tarafının işidir: çok kiracılılık varsayılan olarak kapalıdır, çünkü bu modda başlatılan master bir kiracı kota bağlayıcısı ister ve olmadan başlamaz. Etkinleştirmek için master'ın `Parameters`'ine `--enable_multi_tenants=true`, `--tenant_quota_connector_type` ve `--tenant_quota_connector_uri` ekleyin ve adlandırdıkları kota kaynağını yönetin.
 
 ### Metrikler { #metrics }
 
