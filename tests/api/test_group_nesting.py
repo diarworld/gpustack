@@ -10,6 +10,7 @@ against actual rows.
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
@@ -20,11 +21,18 @@ from gpustack.api.exceptions import (
 from gpustack.api.tenant import _user_group_principal_ids
 from gpustack.routes.user_groups import (
     GroupMembershipCreate,
+    _bulk_transitive_member_counts,
     add_group_members,
+    get_group,
     list_group_members,
+    list_groups,
     remove_group_member,
 )
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
+from gpustack.schemas.user_groups import (
+    UserGroupListParams,
+    resolve_group_type,
+)
 from gpustack.schemas.users import AuthProviderEnum
 
 
@@ -251,3 +259,200 @@ async def test_direct_only_membership_unchanged(session):
 
     ids = await _user_group_principal_ids(session, 5)
     assert set(ids) == {30}
+
+
+# ---- transitive member counts ------------------------------------------------
+
+
+async def _edge(session, parent: int, member: int) -> None:
+    session.add(
+        PrincipalMembership(parent_principal_id=parent, member_principal_id=member)
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_transitive_count_counts_users_through_nesting(session):
+    await _seed_group(session, 10, "top")
+    await _seed_group(session, 20, "mid")
+    await _seed_user(session, 5, "dev@example.com")
+    # user 5 -> mid (20) -> top (10): top's size is 1, not 0 (its direct
+    # rows hold only a subgroup edge).
+    await _edge(session, 20, 5)
+    await _edge(session, 10, 20)
+
+    counts = await _bulk_transitive_member_counts(session, [10, 20])
+    assert counts == {10: 1, 20: 1}
+
+
+@pytest.mark.asyncio
+async def test_transitive_count_deduplicates_diamond(session):
+    await _seed_group(session, 10, "root")
+    await _seed_group(session, 20, "left")
+    await _seed_group(session, 30, "right")
+    await _seed_user(session, 5, "dev@example.com")
+    await _seed_user(session, 6, "qa@example.com")
+    # dev is reachable through BOTH branches; the root counts him once.
+    await _edge(session, 20, 5)
+    await _edge(session, 30, 5)
+    await _edge(session, 30, 6)
+    await _edge(session, 10, 20)
+    await _edge(session, 10, 30)
+
+    counts = await _bulk_transitive_member_counts(session, [10, 20, 30])
+    assert counts[10] == 2
+    assert counts[20] == 1
+    assert counts[30] == 2
+
+
+@pytest.mark.asyncio
+async def test_transitive_count_ignores_soft_deleted_edges(session):
+    await _seed_group(session, 10, "top")
+    await _seed_group(session, 20, "mid")
+    await _seed_user(session, 5, "dev@example.com")
+    await _edge(session, 20, 5)
+    await _edge(session, 10, 20)
+
+    edge = (
+        await session.exec(
+            select(PrincipalMembership).where(
+                PrincipalMembership.parent_principal_id == 10
+            )
+        )
+    ).first()
+    edge.deleted_at = edge.updated_at
+    session.add(edge)
+    await session.commit()
+
+    counts = await _bulk_transitive_member_counts(session, [10])
+    assert counts == {}
+
+
+@pytest.mark.asyncio
+async def test_transitive_count_group_members_are_not_people(session):
+    await _seed_group(session, 10, "top")
+    await _seed_group(session, 20, "mid")
+    # An empty subgroup edge: without the user-kind filter this edge
+    # would inflate the count to 2.
+    await _edge(session, 10, 20)
+
+    counts = await _bulk_transitive_member_counts(session, [10])
+    assert counts == {}
+
+
+# ---- group type --------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_group_type_tokens(session):
+    title_group = Principal(
+        id=60,
+        kind=PrincipalType.GROUP,
+        name="title/разработчик",
+        source="oidc-attrs",
+    )
+    dept_group = Principal(
+        id=61, kind=PrincipalType.GROUP, name="dept/713", source="oidc-attrs"
+    )
+    store_group = Principal(
+        id=62,
+        kind=PrincipalType.GROUP,
+        name="store/Магазин Уфа 2",
+        source="oidc-attrs",
+    )
+    local_group = Principal(
+        id=63, kind=PrincipalType.GROUP, name="SDLC users", source="Local"
+    )
+    # A manually created group that borrowed the attribute naming must
+    # stay Local: the type may not flip when the admin renames it.
+    local_prefixed = Principal(
+        id=64, kind=PrincipalType.GROUP, name="title/ impostor", source="Local"
+    )
+    claim_group = Principal(
+        id=65, kind=PrincipalType.GROUP, name="platform-team", source="OIDC"
+    )
+    for group in (
+        title_group,
+        dept_group,
+        store_group,
+        local_group,
+        local_prefixed,
+        claim_group,
+    ):
+        assert (
+            resolve_group_type(group)
+            == {
+                60: "profession",
+                61: "department",
+                62: "business-unit",
+                63: "local",
+                64: "local",
+                65: "idp",
+            }[group.id]
+        )
+
+
+# ---- list ordering -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_default_sorts_by_member_count_desc(session):
+    await _seed_group(session, 10, "small")
+    await _seed_group(session, 20, "big")
+    await _seed_group(session, 30, "mid")
+    for uid in (5, 6, 7):
+        await _seed_user(session, uid, f"u{uid}@example.com")
+    await _edge(session, 30, 5)
+    await _edge(session, 20, 6)
+    await _edge(session, 20, 7)
+    # small stays empty.
+
+    page = await list_groups(session, None, UserGroupListParams())
+    assert [g.name for g in page.items] == ["big", "mid", "small"]
+    assert [g.member_count for g in page.items] == [2, 1, 0]
+    assert page.pagination.total == 3
+
+
+@pytest.mark.asyncio
+async def test_list_explicit_member_count_sort(session):
+    big = await _seed_group(session, 20, "big")
+    await _seed_group(session, 10, "small")
+    await _seed_user(session, 5, "u5@example.com")
+    await _seed_user(session, 6, "u6@example.com")
+    await _edge(session, 20, 5)
+    await _edge(session, 20, 6)
+
+    page = await list_groups(
+        session, None, UserGroupListParams(sort_by="-member_count")
+    )
+    assert [g.name for g in page.items] == ["big", "small"]
+    # Ascending flips the order.
+    page = await list_groups(session, None, UserGroupListParams(sort_by="member_count"))
+    assert [g.name for g in page.items] == ["small", big.name]
+    assert [g.member_count for g in page.items] == [0, 2]
+
+
+@pytest.mark.asyncio
+async def test_list_name_sort_stays_on_sql_path(session):
+    await _seed_group(session, 10, "beta")
+    await _seed_group(session, 20, "alpha")
+    await _seed_user(session, 5, "u5@example.com")
+    await _edge(session, 10, 5)
+
+    page = await list_groups(session, None, UserGroupListParams(sort_by="name"))
+    assert [g.name for g in page.items] == ["alpha", "beta"]
+    assert page.items[0].member_count == 0
+    assert page.items[1].member_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_group_reports_transitive_count(session):
+    await _seed_group(session, 10, "top")
+    await _seed_group(session, 20, "mid")
+    await _seed_user(session, 5, "dev@example.com")
+    await _edge(session, 20, 5)
+    await _edge(session, 10, 20)
+
+    group = await get_group(session, None, 10)
+    assert group.member_count == 1
+    assert group.group_type == "local"

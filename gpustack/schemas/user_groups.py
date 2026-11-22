@@ -26,6 +26,38 @@ class UserGroupUpdate(SQLModel):
     description: Optional[str] = Field(default=None, nullable=True)
 
 
+# Stable type tokens for the UI's Type column. Derived, never stored: the
+# three attribute kinds are recognized by their reserved name prefixes
+# (only the attribute sync creates those), admin-created groups are Local
+# by source, and every other IdP-sourced group falls back to the generic
+# ``idp`` token.
+GROUP_TYPE_PROFESSION = "profession"
+GROUP_TYPE_DEPARTMENT = "department"
+GROUP_TYPE_BUSINESS_UNIT = "business-unit"
+GROUP_TYPE_LOCAL = "local"
+GROUP_TYPE_IDP = "idp"
+
+
+def resolve_group_type(p: Principal) -> str:
+    """Map a group principal to its UI type token.
+
+    Source is checked before name: an admin-created group keeps the
+    ``local`` token even if someone names it ``title/…`` — the type must
+    not change under a rename, and only the attribute sync owns the
+    prefixed names in practice.
+    """
+    if p.source == AuthProviderEnum.Local.value:
+        return GROUP_TYPE_LOCAL
+    name = p.name or ""
+    if name.startswith("title/"):
+        return GROUP_TYPE_PROFESSION
+    if name.startswith("dept/"):
+        return GROUP_TYPE_DEPARTMENT
+    if name.startswith("store/"):
+        return GROUP_TYPE_BUSINESS_UNIT
+    return GROUP_TYPE_IDP
+
+
 class UserGroupCreate(UserGroupUpdate):
     # Immutable after create (absent from ``UserGroupUpdate``). Used
     # by ``sync_user_group_memberships`` to refuse cross-source name
@@ -36,6 +68,7 @@ class UserGroupCreate(UserGroupUpdate):
 class UserGroupListParams(ListParams):
     sortable_fields: ClassVar[List[str]] = [
         "name",
+        "member_count",
         "created_at",
         "updated_at",
     ]
@@ -51,10 +84,15 @@ class UserGroupPublic(SQLModel):
     # display name), so listings can show a readable label while the
     # prefixed ``name`` stays the stable identifier.
     display_name: Optional[str] = None
-    # Count of active users in this group — denormalized on the
-    # response so admin listings can render "Members" at a glance
-    # without an N+1 fan-out to ``/groups/{id}/members``. Always
-    # populated by the list/get routes (zero for empty groups).
+    # Derived UI type token (profession / department / business-unit /
+    # local / idp) — see ``resolve_group_type``.
+    group_type: str = GROUP_TYPE_LOCAL
+    # Number of distinct USER principals reachable from this group
+    # through active memberships — direct members plus everyone inside
+    # nested subgroups. Deliberately NOT the row count (subgroup edges
+    # are not people) and never summed across groups: the same person
+    # counts in every group they belong to. Always populated by the
+    # list/get routes (zero for empty groups).
     member_count: int = 0
     # Where the Group originated. ``Local`` = admin created via UI;
     # ``OIDC`` / ``SAML`` / other IdP names = auto-created by IdP sync.
@@ -72,6 +110,7 @@ class UserGroupPublic(SQLModel):
             name=p.name,
             description=p.description,
             display_name=p.display_name,
+            group_type=resolve_group_type(p),
             member_count=member_count,
             source=p.source,
             created_at=p.created_at,
@@ -98,3 +137,9 @@ class UserGroupMembershipPublic(SQLModel):
     # renders both kinds.
     username: Optional[str] = None
     full_name: Optional[str] = None
+    # Only for ``member_kind == "group"``: the subgroup's derived type
+    # token and its transitive unique-user count, so the members
+    # drawer's Subgroups tab renders type and size without an N+1
+    # fan-out. ``None`` for user rows.
+    group_type: Optional[str] = None
+    group_member_count: Optional[int] = None
