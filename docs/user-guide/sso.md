@@ -68,6 +68,8 @@ With claims captured (see above), enable `--external-auth-attribute-groups` to h
 
 Titles are lower-cased into the group name, so IdP case variants ("Developer" and "developer") land in one group. Departments are keyed by the stable `department_id` — a department rename re-labels the group instead of orphaning it. Store names are kept verbatim.
 
+Users whose attributes never arrive — or whose every mapped attribute value is blank — are parked in the shared `unknown/users` group (display name "Unknown Users"). When a later login delivers real attributes, the same sync moves them out of it; users who sign in without SSO keep the membership.
+
 Membership is recomputed authoritatively at each login: users join the groups matching their current attributes and leave the ones they outgrew. Admin-curated memberships (created in the UI) and admin-created groups are never touched, and groups created by this sync are tagged with the `oidc-attrs` source. Nested groups compose with this: an admin can put `title/developer` and `title/analyst` inside a manual group like `SDLC users`, and every right or quota granted to `SDLC users` reaches the members transitively.
 
 ### Example: Integrate with Auth0 OIDC

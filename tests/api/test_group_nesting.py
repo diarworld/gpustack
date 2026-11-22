@@ -371,6 +371,12 @@ async def test_group_type_tokens(session):
     claim_group = Principal(
         id=65, kind=PrincipalType.GROUP, name="platform-team", source="OIDC"
     )
+    unknown_group = Principal(
+        id=66,
+        kind=PrincipalType.GROUP,
+        name="unknown/users",
+        source="oidc-attrs",
+    )
     for group in (
         title_group,
         dept_group,
@@ -378,6 +384,7 @@ async def test_group_type_tokens(session):
         local_group,
         local_prefixed,
         claim_group,
+        unknown_group,
     ):
         assert (
             resolve_group_type(group)
@@ -388,6 +395,7 @@ async def test_group_type_tokens(session):
                 63: "local",
                 64: "local",
                 65: "idp",
+                66: "unknown",
             }[group.id]
         )
 

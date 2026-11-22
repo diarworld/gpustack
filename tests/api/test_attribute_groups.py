@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.routes.auth import (
+    UNKNOWN_USERS_GROUP_DISPLAY_NAME,
+    UNKNOWN_USERS_GROUP_NAME,
     _attribute_group_names,
     _sync_attribute_groups_if_enabled,
 )
@@ -64,12 +66,18 @@ def test_names_missing_values_skipped():
     assert display == {"title/аналитик": "аналитик"}
 
 
-def test_names_empty_attributes_yield_nothing():
-    assert _attribute_group_names({}) == ([], {})
+def test_names_empty_attributes_park_in_unknown_group():
+    assert _attribute_group_names({}) == (
+        [UNKNOWN_USERS_GROUP_NAME],
+        {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME},
+    )
 
 
-def test_names_whitespace_only_value_is_skipped():
-    assert _attribute_group_names({"title": "   ", "store_name": ""}) == ([], {})
+def test_names_whitespace_only_value_parks_in_unknown_group():
+    assert _attribute_group_names({"title": "   ", "store_name": ""}) == (
+        [UNKNOWN_USERS_GROUP_NAME],
+        {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME},
+    )
 
 
 def test_names_dept_without_name_falls_back_to_id():
@@ -280,3 +288,66 @@ async def test_sync_empty_attributes_clears_own_memberships(session):
     await session.commit()
     rows = (await session.exec(PrincipalMembership.__table__.select())).all()
     assert all(m.deleted_at is not None for m in rows)
+
+
+@pytest.mark.asyncio
+async def test_unknown_users_group_moves_out_when_attributes_arrive(session):
+    """A user parked in unknown/users by the backfill (attributes never
+    arrived) migrates to the real attribute groups on the first login
+    that carries them — the oidc-attrs diff owns both sides of the
+    move, so no stale membership survives."""
+    await _seed_user(session, 1, "u1@example.com")
+
+    # Backfill pass: no attributes → unknown/users.
+    names, display = _attribute_group_names({})
+    await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
+    await session.commit()
+    rows = (await session.exec(PrincipalMembership.__table__.select())).all()
+    assert [m.deleted_at for m in rows] == [None]
+    unknown_group = (
+        await session.exec(
+            Principal.__table__.select().where(
+                Principal.__table__.c.name == UNKNOWN_USERS_GROUP_NAME
+            )
+        )
+    ).first()
+    assert unknown_group is not None
+    assert unknown_group.display_name == UNKNOWN_USERS_GROUP_DISPLAY_NAME
+
+    # Login pass: attributes arrive → moved into the real groups.
+    names, display = _attribute_group_names(
+        {"title": "Разработчик", "department_id": "713"}
+    )
+    await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
+    await session.commit()
+    rows = (await session.exec(PrincipalMembership.__table__.select())).all()
+    active = [m for m in rows if m.deleted_at is None]
+    assert len(active) == 2
+    moved = [m for m in rows if m.deleted_at is not None]
+    assert len(moved) == 1
+    assert moved[0].parent_principal_id == unknown_group.id
+
+
+@pytest.mark.asyncio
+async def test_attributes_vanishing_returns_user_to_unknown_group(session):
+    await _seed_user(session, 1, "u1@example.com")
+    names, display = _attribute_group_names({"title": "аналитик"})
+    await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
+    await session.commit()
+
+    # The IdP stops sending attributes: the fallback group is the
+    # desired state, exactly like any other attribute change.
+    names, display = _attribute_group_names({})
+    await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
+    await session.commit()
+    rows = (await session.exec(PrincipalMembership.__table__.select())).all()
+    active = [m for m in rows if m.deleted_at is None]
+    assert len(active) == 1
+    group = (
+        await session.exec(
+            Principal.__table__.select().where(
+                Principal.__table__.c.id == active[0].parent_principal_id
+            )
+        )
+    ).first()
+    assert group.name == UNKNOWN_USERS_GROUP_NAME

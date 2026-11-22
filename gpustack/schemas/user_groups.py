@@ -34,6 +34,7 @@ class UserGroupUpdate(SQLModel):
 GROUP_TYPE_PROFESSION = "profession"
 GROUP_TYPE_DEPARTMENT = "department"
 GROUP_TYPE_BUSINESS_UNIT = "business-unit"
+GROUP_TYPE_UNKNOWN = "unknown"
 GROUP_TYPE_LOCAL = "local"
 GROUP_TYPE_IDP = "idp"
 
@@ -55,6 +56,8 @@ def resolve_group_type(p: Principal) -> str:
         return GROUP_TYPE_DEPARTMENT
     if name.startswith("store/"):
         return GROUP_TYPE_BUSINESS_UNIT
+    if name.startswith("unknown/"):
+        return GROUP_TYPE_UNKNOWN
     return GROUP_TYPE_IDP
 
 
@@ -85,7 +88,7 @@ class UserGroupPublic(SQLModel):
     # prefixed ``name`` stays the stable identifier.
     display_name: Optional[str] = None
     # Derived UI type token (profession / department / business-unit /
-    # local / idp) — see ``resolve_group_type``.
+    # unknown / local / idp) — see ``resolve_group_type``.
     group_type: str = GROUP_TYPE_LOCAL
     # Number of distinct USER principals reachable from this group
     # through active memberships — direct members plus everyone inside

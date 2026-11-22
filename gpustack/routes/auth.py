@@ -759,6 +759,10 @@ async def _sync_saml_groups_if_enabled(
     await session.commit()
 
 
+UNKNOWN_USERS_GROUP_NAME = "unknown/users"
+UNKNOWN_USERS_GROUP_DISPLAY_NAME = "Unknown Users"
+
+
 def _attribute_group_names(
     attributes: Dict[str, Any],
 ) -> tuple[List[str], Dict[str, str]]:
@@ -779,6 +783,12 @@ def _attribute_group_names(
     Blank attribute values yield no group of that kind, and the sync
     then removes the user from any previously held group of that kind
     — the IdP is authoritative, same contract as the claims map.
+
+    When nothing yields a group — claims never arrived, or every
+    mapped value is blank — the user parks in the shared
+    ``unknown/users`` group instead. The same diff moves them out the
+    day real attributes land; users who sign in without SSO keep the
+    membership, since nothing else ever targets their attributes.
     """
     names: List[str] = []
     display_names: Dict[str, str] = {}
@@ -804,6 +814,9 @@ def _attribute_group_names(
         names.append(name)
         display_names[name] = store
 
+    if not names:
+        names = [UNKNOWN_USERS_GROUP_NAME]
+        display_names = {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME}
     return names, display_names
 
 
