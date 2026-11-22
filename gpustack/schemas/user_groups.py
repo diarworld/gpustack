@@ -45,6 +45,12 @@ class UserGroupPublic(SQLModel):
     id: int
     name: str
     description: Optional[str] = None
+    # Human-readable label. Admin-created groups leave it None and the
+    # UI falls back to ``name``; attribute-derived sync fills it with
+    # the raw attribute value ("Директор магазина", the department's
+    # display name), so listings can show a readable label while the
+    # prefixed ``name`` stays the stable identifier.
+    display_name: Optional[str] = None
     # Count of active users in this group — denormalized on the
     # response so admin listings can render "Members" at a glance
     # without an N+1 fan-out to ``/groups/{id}/members``. Always
@@ -65,6 +71,7 @@ class UserGroupPublic(SQLModel):
             id=p.id,
             name=p.name,
             description=p.description,
+            display_name=p.display_name,
             member_count=member_count,
             source=p.source,
             created_at=p.created_at,
