@@ -74,6 +74,15 @@ The **Applies to** column indicates where the environment variable should be set
 | ----------------------------------- | ---------------------------- | ------- | ---------- |
 | `GPUSTACK_SERVER_CACHE_TTL_SECONDS` | Server cache TTL in seconds. | `600`   | Server     |
 
+### Server Coordination (HA)
+
+| Variable                                      | Description                                                                                                                                                                                                                            | Default  | Applies to |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ---------- |
+| `GPUSTACK_COORDINATOR_MODE`                   | `local` (default) or `redis`. `redis` elects a single leader for the scheduler and controllers across server instances (multi-replica HA) and carries cross-instance events; every replica still serves the API and UI. Requires `GPUSTACK_COORDINATOR_REDIS_URL`. | `local`  | Server     |
+| `GPUSTACK_COORDINATOR_REDIS_URL`              | URL of the Redis the coordinator uses for leader election and cross-instance events. `redis://` or `rediss://`; credentials allowed (unlike `GPUSTACK_REDIS_URL`, this URL is never materialized into gateway CRs). Required when the mode is `redis`. | (empty)  | Server     |
+| `GPUSTACK_COORDINATOR_LEADER_TTL_SECONDS`     | Leader lease TTL. Also the worst-case control-plane failover time: a deposed or unreachable leader exits the process, and a standby can only take the lease once it expires.                                                           | `30`     | Server     |
+| `GPUSTACK_COORDINATOR_RENEW_INTERVAL_SECONDS` | How often the leader renews its lease.                                                                                                                                                                                                 | `10`     | Server     |
+
 ### Authentication & Security
 
 | Variable                            | Description                                                                                                                                                                              | Default | Applies to      |

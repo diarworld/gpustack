@@ -251,6 +251,17 @@ EVENT_BUS_SUBSCRIBER_QUEUE_SIZE = int(
     os.getenv("GPUSTACK_EVENT_BUS_SUBSCRIBER_QUEUE_SIZE", 1024)
 )
 
+# Server coordinator (distributed mode, GPUSTACK_COORDINATOR_MODE=redis).
+# Leader lease TTL and renew cadence. The TTL is also the worst-case
+# control-plane failover time: a deposed or unreachable leader exits the
+# process, and a standby can only take the lease once it expires.
+COORDINATOR_LEADER_TTL_SECONDS = int(
+    os.getenv("GPUSTACK_COORDINATOR_LEADER_TTL_SECONDS", 30)
+)
+COORDINATOR_RENEW_INTERVAL_SECONDS = int(
+    os.getenv("GPUSTACK_COORDINATOR_RENEW_INTERVAL_SECONDS", 10)
+)
+
 # Worker configuration
 WORKER_HEARTBEAT_INTERVAL = int(
     os.getenv("GPUSTACK_WORKER_HEARTBEAT_INTERVAL", 30)

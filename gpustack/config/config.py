@@ -239,6 +239,13 @@ class Config(WorkerConfig, BaseSettings):
                     (they would be materialized in the gateway CR) and
                     no TLS (rediss://): the LB plugin's redis client
                     has no TLS knob.
+        coordinator_mode: "local" (default) or "redis". "redis" elects a
+                    single leader for the scheduler and controllers across
+                    server instances (multi-replica HA) and requires
+                    coordinator_redis_url.
+        coordinator_redis_url: URL of the Redis the coordinator uses for
+                    leader election and cross-instance events. redis:// or
+                    rediss://, credentials allowed.
         disable_worker: (Deprecated) Disable embedded worker.
         enable_worker: Enable embedded worker.
         bootstrap_password: Password for the bootstrap admin user.
@@ -321,6 +328,16 @@ class Config(WorkerConfig, BaseSettings):
     # gateway CR) and so is rediss:// (the LB plugin's redis client has
     # no TLS knob).
     redis_url: Optional[str] = None
+    # Distributed-mode coordinator. "local" (default) runs the scheduler and
+    # controllers on every instance and is the only mode that works with a
+    # single replica. "redis" elects one leader for them via a Redis lease and
+    # carries cross-instance events; running multiple replicas without it
+    # means two schedulers and two controller sets racing on one database.
+    coordinator_mode: Literal["local", "redis"] = "local"
+    # Redis for the coordinator. Unlike redis_url, credentials and TLS are
+    # allowed here: the URL stays inside the server process and is never
+    # materialized into gateway CRs. Required when coordinator_mode is "redis".
+    coordinator_redis_url: Optional[str] = None
     disable_worker: Optional[bool] = None  # Deprecated
     enable_worker: bool = False
     bootstrap_password: Optional[str] = None
@@ -594,6 +611,19 @@ class Config(WorkerConfig, BaseSettings):
         self._derive_auth_cache_key = hmac.new(
             self.jwt_secret_key.encode(), b"gateway-auth-cache", hashlib.sha256
         ).hexdigest()
+
+    @field_validator("coordinator_redis_url")
+    @classmethod
+    def _validate_coordinator_redis_url(cls, value):
+        # Refuse at startup rather than at first election: a malformed URL
+        # would otherwise surface as a replica that never joins the quorum.
+        if value is None:
+            return value
+        if not value.startswith(("redis://", "rediss://")):
+            raise ValueError(
+                "coordinator_redis_url must start with redis:// or rediss://."
+            )
+        return value
 
     @field_validator("trusted_proxy_cidrs")
     @classmethod

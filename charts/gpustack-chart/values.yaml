@@ -131,8 +131,22 @@ server:
       minProtocolVersion: null
       maxProtocolVersion: null
 
+  # Number of server replicas. 1 (default) runs the scheduler and controllers
+  # on the single instance. 2+ requires the HA prerequisites: an external
+  # database (externalDatabaseURL), a shared Redis, and the distributed
+  # coordinator switched on in environmentConfig — the guards in
+  # templates/validate.yaml name the exact keys and refuse to render without
+  # them, because a replica set without the coordinator would run the full
+  # control plane (scheduler + controllers) on every replica and race on the
+  # same database. With the coordinator: API/UI serve from every replica,
+  # the scheduler and controllers run on the Redis-elected leader only, and
+  # a lost leader is replaced within the lease TTL (~30s). Replicas spread
+  # across nodes via the hard podAntiAffinity default (see `affinity`).
+  replicas: 1
+
   # if you have an existing database, set externalDatabaseURL to its connection string
   # e.g. postgresql://user:password@hostname:port/dbname
+  # Required when replicas > 1.
   externalDatabaseURL: null
   dataVolume:
     hostPath: null

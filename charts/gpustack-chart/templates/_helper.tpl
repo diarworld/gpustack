@@ -1,18 +1,15 @@
 {{/* vim: set filetype=mustache: */}}
 {{/*
-NB: these two guards never run. Helm parses `_*.tpl` for its `define` blocks but
+NB: this guard never runs. Helm parses `_*.tpl` for its `define` blocks but
 does not render the file, so top-level actions here are dead code — verified by
-`helm template --set server.ingress.tls.cert=x` rendering cleanly. Moving them
+`helm template --set server.ingress.tls.cert=x` rendering cleanly. Moving it
 to templates/validate.yaml (where guards do run) would start rejecting
-configurations that install today, so it is left as a deliberate separate change.
+configurations that install today, so it is left as a deliberate separate
+change. The multi-replica prerequisites DO live in validate.yaml now, next to
+the coordinator and JWT-secret checks they belong with.
 */}}
 {{- if or (and .Values.server.ingress.tls.cert (not .Values.server.ingress.tls.key)) (and .Values.server.ingress.tls.key (not .Values.server.ingress.tls.cert)) }}
 {{ fail "Both server.ingress.tls.cert and server.ingress.tls.key must be set together or both be empty." }}
-{{- end }}
-{{- if gt (int .Values.server.replicas) 1 }}
-{{- if not .Values.server.externalDatabaseURL }}
-{{ fail "server.externalDatabaseURL is required when server.replicas > 1." }}
-{{- end }}
 {{- end }}
 
 {{/*

@@ -41,3 +41,28 @@ supplying a username and password asks for.
 {{- if and (not $pullSecret.create) $credentials.username $credentials.password }}
 {{- fail "imagePullSecret.credentials are set but imagePullSecret.create is false: the credentials would be discarded. Drop them, or set create=true to have this release own the Secret." }}
 {{- end }}
+
+{{/*
+Multi-replica server prerequisites. The chart renders the shape for any
+replica count, but a community server needs its coordination switched on:
+without an external database two writers do not survive, and without the
+Redis coordinator every replica runs the scheduler and controllers against
+the same database. The JWT secret has no per-replica default either —
+distributed instances must share one signing key (the server would refuse
+to start without it; refusing here names the fix earlier).
+*/}}
+{{- if gt (int (.Values.server.replicas | default 1)) 1 }}
+{{- if not .Values.server.externalDatabaseURL }}
+{{- fail "server.replicas > 1 requires server.externalDatabaseURL: replicas must share one external database." }}
+{{- end }}
+{{- $envConfig := .Values.server.environmentConfig | default dict }}
+{{- if ne (get $envConfig "GPUSTACK_COORDINATOR_MODE" | default "local" | toString) "redis" }}
+{{- fail "server.replicas > 1 requires GPUSTACK_COORDINATOR_MODE=redis in server.environmentConfig: without the distributed coordinator every replica runs the full control plane (split brain)." }}
+{{- end }}
+{{- if not (get $envConfig "GPUSTACK_COORDINATOR_REDIS_URL" | default "" | toString) }}
+{{- fail "server.replicas > 1 requires GPUSTACK_COORDINATOR_REDIS_URL in server.environmentConfig: the Redis coordinator needs a shared Redis." }}
+{{- end }}
+{{- if not (get $envConfig "GPUSTACK_JWT_SECRET_KEY" | default "" | toString) }}
+{{- fail "server.replicas > 1 requires GPUSTACK_JWT_SECRET_KEY in server.environmentConfig: replicas must share one JWT signing secret." }}
+{{- end }}
+{{- end }}

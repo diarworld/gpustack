@@ -1,0 +1,19 @@
+{{- if gt (int (.Values.server.replicas | default 1)) 1 }}
+{{/*
+Keeps voluntary disruptions (node drains, cluster upgrades) from taking out
+more than one server replica at a time. With the default hard anti-affinity
+each replica already sits on its own node; this bounds simultaneous evictions.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "chart_labels" . | indent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-server
+{{- end }}

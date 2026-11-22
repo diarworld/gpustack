@@ -914,6 +914,8 @@ def set_server_options(args, config_data: dict):
         "disable_metrics",
         "database_url",
         "redis_url",
+        "coordinator_mode",
+        "coordinator_redis_url",
         "disable_worker",
         "enable_worker",
         "bootstrap_password",

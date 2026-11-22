@@ -131,6 +131,7 @@ from gpustack.envs import (
     DEFAULT_CLUSTER_KUBERNETES,
 )
 from gpustack.server.coordinator import LocalCoordinator
+from gpustack.server.coordinator.redis import RedisCoordinator
 from gpustack.server.coordinator.cache import preload_cache
 from gpustack.server.coordinator.models import (
     external_topics,
@@ -1544,8 +1545,12 @@ class Server:
                 break
 
         if coordinator is None:
-            coordinator = LocalCoordinator(self._config)
-            logger.debug("Using LocalCoordinator")
+            if self._config.coordinator_mode == "redis":
+                coordinator = RedisCoordinator(self._config)
+                logger.info("Using RedisCoordinator (distributed mode)")
+            else:
+                coordinator = LocalCoordinator(self._config)
+                logger.debug("Using LocalCoordinator")
 
         self._coordinator = coordinator
         await self._coordinator.start()

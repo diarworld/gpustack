@@ -101,6 +101,9 @@ dev = [
     "twine>=5.1.1",
     "matplotlib>=3.10.7",
     "pillow>=13.0.0",
+    # Redis coordinator tests: an in-memory Redis with EVAL (Lua) and PubSub,
+    # so election and bus-delivery tests run without a network dependency.
+    "fakeredis[lua]>=2.26.0",
 ]
 
 docs = [

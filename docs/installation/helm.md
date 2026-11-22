@@ -177,6 +177,53 @@ helm install gpustack oci://registry-1.docker.io/gpustack/gpustack-chart \
   --set server.externalDatabaseURL="postgresql://user:password@host:port/dbname"
 ```
 
+### High Availability (Multiple Server Replicas)
+
+With `server.replicas: 2+`, every replica serves the API and UI (active-active),
+while the scheduler and controllers run on a single Redis-elected leader
+(active-passive). If the leader dies, a standby takes over within the lease TTL
+(30s by default) plus its own startup. Model inference is unaffected either way:
+serving traffic is routed by the gateway directly to workers.
+
+Prerequisites — the chart refuses to render `replicas > 1` without them:
+
+- An external database via `server.externalDatabaseURL`: replicas must share one
+  database, and the database itself should be HA for the deployment to be.
+- `GPUSTACK_COORDINATOR_MODE=redis` in `server.environmentConfig`, plus
+  `GPUSTACK_COORDINATOR_REDIS_URL` pointing at a shared Redis (credentials and
+  TLS allowed). The Redis is a critical dependency of the control plane in this
+  mode: replicas refuse to start and the leader steps down when it is
+  unreachable, so run it HA too. A dedicated logical database (`/1`, `/2`, ...)
+  keeps the coordinator's keys separate from other tenants of the same Redis.
+- `GPUSTACK_JWT_SECRET_KEY` in `server.environmentConfig`: replicas must share
+  one JWT signing secret.
+
+```yaml
+# values.yaml
+server:
+  replicas: 2
+  externalDatabaseURL: postgresql://user:password@host:port/dbname
+  environmentConfig:
+    GPUSTACK_COORDINATOR_MODE: redis
+    GPUSTACK_COORDINATOR_REDIS_URL: redis://redis.example.com:6379/1
+    GPUSTACK_JWT_SECRET_KEY: change-me
+```
+
+```bash
+helm install gpustack oss-gpustack/gpustack-chart \
+  --namespace gpustack-system -f values.yaml
+```
+
+Notes:
+
+- Replicas spread across nodes via a hard pod anti-affinity by default; override
+  `server.affinity` for clusters with fewer schedulable nodes than replicas.
+- During a leader's restart the API answers from the surviving replica. Model
+  calls whose credentials the gateway can validate itself keep working; calls
+  that need the server to validate a raw API key wait for the new leader.
+- Two leaders never run concurrently by design: a leader that loses or cannot
+  confirm its lease exits the process and restarts as a standby.
+
 ### Enabling HTTPS with a Custom Certificate
 
 Provide the certificate and key contents (PEM) via `server.ingress.tls`. When both are set, the ingress schema becomes HTTPS:

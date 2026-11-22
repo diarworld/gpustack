@@ -287,7 +287,7 @@ async def test_legacy_coordinator_wins_when_registered_first(monkeypatch):
             ("static-second", StaticCoordinatorPlugin),
         ],
     )
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     await server._init_coordinator(app)
 
     assert server._coordinator is legacy_coordinator
@@ -320,7 +320,7 @@ async def test_static_coordinator_wins_when_registered_first(monkeypatch):
             ("legacy-second", LegacyCoordinatorPlugin),
         ],
     )
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     await server._init_coordinator(app)
 
     assert server._coordinator is static_coordinator
@@ -338,7 +338,7 @@ async def test_failing_build_coordinator_refuses_startup(monkeypatch):
             raise RuntimeError("coordinator exploded")
 
     app = _load_plugins(monkeypatch, [("broken", Broken)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     # Skipping a failed coordinator would silently fall through to
     # LocalCoordinator in a multi-instance deployment.
     with pytest.raises(RuntimeError, match="Failed to build coordinator.*'broken'"):
@@ -402,7 +402,7 @@ async def test_event_topics_registration_via_server_startup(
             return {"widget": Widget, "worker": Widget}
 
     app = _load_plugins(monkeypatch, [("topics", TopicsPlugin)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     await server._init_coordinator(app)
 
     assert external_topics() == ["widget"]
@@ -420,7 +420,7 @@ async def test_failing_event_topics_refuses_startup(monkeypatch):
             raise RuntimeError("topics exploded")
 
     app = _load_plugins(monkeypatch, [("broken", Broken)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     # Continuing would leave the plugin running without cross-instance
     # enrichment: writes served by another instance would be dropped.
     with pytest.raises(RuntimeError, match="Failed to register event topics.*'broken'"):
@@ -466,7 +466,7 @@ async def test_leader_tasks_are_collected_from_static_plugins_only(monkeypatch):
             ("legacy", LegacyWithLeaderTasks),
         ],
     )
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     server._app = app
     server._start_extension_plugin_leader_tasks()
     await asyncio.sleep(0)
@@ -490,7 +490,7 @@ async def test_failing_leader_task_collection_exits_for_restart(monkeypatch):
         "gpustack.server.server.os._exit", lambda code: exited.append(code)
     )
     app = _load_plugins(monkeypatch, [("broken", Broken)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     server._app = app
     server._start_extension_plugin_leader_tasks()
 
@@ -506,7 +506,7 @@ def test_failing_static_async_tasks_collection_refuses_startup(monkeypatch):
             raise RuntimeError("task collection exploded")
 
     app = _load_plugins(monkeypatch, [("broken", Broken)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
 
     # Static-hook collection failures are uniform: no less fatal than
     # a running task dying in the main gather.
@@ -532,7 +532,7 @@ async def test_dead_leader_task_exits_for_restart(monkeypatch):
         "gpustack.server.server.os._exit", lambda code: exited.append(code)
     )
     app = _load_plugins(monkeypatch, [("dying", Dying)])
-    server = Server(SimpleNamespace(), None)
+    server = Server(SimpleNamespace(coordinator_mode="local"), None)
     server._app = app
     server._start_extension_plugin_leader_tasks()
     await asyncio.sleep(0.05)
