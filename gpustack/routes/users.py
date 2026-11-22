@@ -214,11 +214,14 @@ async def get_user_attribute_values(session: SessionDep):
 
 @router.get("/{id}/groups", response_model=List[UserGroupPublic])
 async def get_user_groups(session: SessionDep, id: int):
-    """Groups the user actively belongs to via admin-curated
-    (``source=Local``) memberships — the surface the user-edit modal
-    manages. IdP-synced memberships (attribute-derived, claim-based)
-    are excluded: they change only in the IdP, and rendering them here
-    would invite edits the sync would undo or refuse."""
+    """All groups the user actively belongs to, any source.
+
+    The user-edit modal splits them by ``group_type``: Local groups
+    render as editable checkboxes (their ids are the ``group_ids`` the
+    PUT diffs against), IdP-synced ones render read-only so the admin
+    sees the full membership picture without being invited to edit
+    rows the sync owns.
+    """
     user = await User.one_by_id(session, id)
     if not user or user.deleted_at is not None or user.kind != PrincipalType.USER:
         raise NotFoundException(message="User not found")
@@ -230,11 +233,11 @@ async def get_user_groups(session: SessionDep, id: int):
         )
         .where(
             PrincipalMembership.member_principal_id == id,
-            PrincipalMembership.source == AuthProviderEnum.Local.value,
             PrincipalMembership.deleted_at.is_(None),
             Principal.kind == PrincipalType.GROUP,
             Principal.deleted_at.is_(None),
         )
+        .order_by(Principal.name)
     )
     groups = (await session.exec(stmt)).all()
     return [UserGroupPublic.from_principal(g) for g in groups]

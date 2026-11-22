@@ -35,6 +35,7 @@ from gpustack.routes.user_groups import (
 from gpustack.routes.users import (
     _apply_local_group_membership_diff,
     _resolve_manageable_groups,
+    get_user_groups,
 )
 from gpustack.server.services import bulk_user_attribute_labels
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
@@ -677,6 +678,36 @@ async def test_local_group_membership_diff_adds_and_soft_deletes(session):
     ).all()
     assert len(rows) == 1
     assert rows[0].deleted_at is not None
+
+
+# ---- GET /users/{id}/groups ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_user_groups_returns_all_kinds(session, monkeypatch):
+    # The user-edit modal renders Local groups as editable checkboxes
+    # and IdP-synced ones read-only, so the endpoint must surface both
+    # kinds (each row carries group_type) — not only admin-curated
+    # ones. Rows are ordered by group name and scoped to the one user.
+    user = await _seed_user(session, 100, "jdoe@example.com")
+    local = await _seed_group(session, 10, "a-manual")
+    attrs = await _seed_attr_group(session, 20, "title/z-dev")
+    await _seed_membership(session, local.id, 100)
+    await _seed_membership(session, attrs.id, 100, source="oidc-attrs")
+    # A second user's membership must not leak into the response.
+    await _seed_user(session, 200, "other@example.com")
+    await _seed_membership(session, local.id, 200)
+
+    from unittest.mock import AsyncMock
+
+    from gpustack.routes import users as users_route
+
+    monkeypatch.setattr(users_route.User, "one_by_id", AsyncMock(return_value=user))
+    groups = await get_user_groups(session, 100)
+    assert [g.id for g in groups] == [10, 20]
+    by_id = {g.id: g for g in groups}
+    assert by_id[10].group_type == "local"
+    assert by_id[20].group_type == "profession"
 
 
 # ---- user attribute labels -----------------------------------------------------
