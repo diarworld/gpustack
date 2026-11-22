@@ -560,6 +560,64 @@ async def sync_user_group_memberships(
         session.add(row)
 
 
+# The wire keys the user-facing surfaces expose for attribute-derived
+# groups, and the name prefix each resolves from. Keys, not values: a
+# user holds at most one group of each kind (the sync diffs against
+# the IdP's single scalar attribute), so a scalar label per kind is
+# enough for table columns.
+_ATTRIBUTE_LABEL_KINDS = {
+    "profession": "title/",
+    "department": "dept/",
+    "business_unit": "store/",
+}
+
+
+async def bulk_user_attribute_labels(
+    session: AsyncSession, user_ids: List[int]
+) -> Dict[int, Dict[str, str]]:
+    """Display labels from each user's attribute-derived groups.
+
+    Returns per-user ``{'profession': …, 'department': …,
+    'business_unit': …}`` carrying only the kinds the user actually
+    holds; users absent from the map hold none. The label is the
+    group's ``display_name`` (the raw title / department / store value
+    the IdP reported) falling back to the prefixed name.
+
+    One query for the whole batch — the users list and the group
+    members list both render these as columns, and an N+1 over
+    per-user membership fetches would dominate those pages. Rows
+    source-scoped to ``oidc-attrs`` only: admin-curated groups named
+    ``title/…`` must not leak into the columns.
+    """
+    if not user_ids:
+        return {}
+    stmt = (
+        select(
+            PrincipalMembership.member_principal_id,
+            Principal.name,
+            Principal.display_name,
+        )
+        .join(
+            Principal,
+            Principal.id == PrincipalMembership.parent_principal_id,
+        )
+        .where(
+            PrincipalMembership.member_principal_id.in_(user_ids),
+            PrincipalMembership.source == AuthProviderEnum.OIDC_ATTRIBUTES.value,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+        )
+    )
+    labels: Dict[int, Dict[str, str]] = {}
+    for member_id, name, display_name in (await session.exec(stmt)).all():
+        for key, prefix in _ATTRIBUTE_LABEL_KINDS.items():
+            if name.startswith(prefix):
+                labels.setdefault(member_id, {})[key] = display_name or name
+                break
+    return labels
+
+
 class APIKeyService:
     def __init__(self, session: AsyncSession):
         self.session = session

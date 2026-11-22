@@ -28,6 +28,7 @@ from gpustack.routes.user_groups import (
     list_groups,
     remove_group_member,
 )
+from gpustack.server.services import bulk_user_attribute_labels
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
 from gpustack.schemas.user_groups import (
     UserGroupListParams,
@@ -464,3 +465,132 @@ async def test_get_group_reports_transitive_count(session):
     group = await get_group(session, None, 10)
     assert group.member_count == 1
     assert group.group_type == "local"
+
+
+# ---- group_type filter --------------------------------------------------------
+
+
+async def _seed_attr_group(
+    session, principal_id: int, name: str, display_name: str | None = None
+) -> Principal:
+    group = Principal(
+        id=principal_id,
+        kind=PrincipalType.GROUP,
+        name=name,
+        display_name=display_name,
+        source="oidc-attrs",
+    )
+    session.add(group)
+    await session.commit()
+    return group
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_group_type(session):
+    await _seed_group(session, 10, "SDLC users")  # local
+    await _seed_attr_group(session, 20, "title/разработчик")
+    await _seed_attr_group(session, 30, "dept/713")
+    await _seed_attr_group(session, 40, "store/Магазин Уфа 2")
+    await _seed_attr_group(session, 50, "unknown/users")
+    session.add(
+        Principal(
+            id=60,
+            kind=PrincipalType.GROUP,
+            name="platform-team",
+            source=AuthProviderEnum.OIDC.value,
+        )
+    )
+    await session.commit()
+    # A Local group borrowing the attribute naming must stay out of
+    # the profession filter — the type is derived source-first.
+    await _seed_group(session, 70, "title/ impostor")
+
+    page = await list_groups(
+        session, None, UserGroupListParams(), group_type="profession"
+    )
+    assert [g.name for g in page.items] == ["title/разработчик"]
+    page = await list_groups(session, None, UserGroupListParams(), group_type="local")
+    assert {g.name for g in page.items} == {"SDLC users", "title/ impostor"}
+    page = await list_groups(
+        session, None, UserGroupListParams(), group_type="department"
+    )
+    assert [g.name for g in page.items] == ["dept/713"]
+    page = await list_groups(
+        session, None, UserGroupListParams(), group_type="business-unit"
+    )
+    assert [g.name for g in page.items] == ["store/Магазин Уфа 2"]
+    page = await list_groups(session, None, UserGroupListParams(), group_type="unknown")
+    assert [g.name for g in page.items] == ["unknown/users"]
+    page = await list_groups(session, None, UserGroupListParams(), group_type="idp")
+    assert [g.name for g in page.items] == ["platform-team"]
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_unknown_group_type(session):
+    await _seed_group(session, 10, "solo")
+    with pytest.raises(InvalidException):
+        await list_groups(session, None, UserGroupListParams(), group_type="bogus")
+
+
+# ---- user attribute labels -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bulk_user_attribute_labels(session):
+    await _seed_user(session, 5, "dev@example.com")
+    await _seed_user(session, 6, "bare@example.com")
+    await _seed_attr_group(session, 20, "title/разработчик", "Разработчик")
+    await _seed_attr_group(session, 30, "dept/713", "ПК Платформа разработки")
+    # No display_name: the prefixed name is the fallback label.
+    await _seed_attr_group(session, 40, "store/Магазин Уфа 2")
+    # An admin-curated membership in a Local group that borrowed the
+    # attribute naming must not leak into the labels.
+    await _seed_group(session, 50, "title/ impostor")
+    for parent, source in (
+        (20, "oidc-attrs"),
+        (30, "oidc-attrs"),
+        (40, "oidc-attrs"),
+        (50, "Local"),
+    ):
+        session.add(
+            PrincipalMembership(
+                parent_principal_id=parent, member_principal_id=5, source=source
+            )
+        )
+    await session.commit()
+
+    labels = await bulk_user_attribute_labels(session, [5, 6])
+    assert labels[5] == {
+        "profession": "Разработчик",
+        "department": "ПК Платформа разработки",
+        # No display_name on the store group: the prefixed name is the
+        # fallback label, prefix included.
+        "business_unit": "store/Магазин Уфа 2",
+    }
+    # The bare user holds no attribute groups at all.
+    assert 6 not in labels
+
+
+@pytest.mark.asyncio
+async def test_member_rows_carry_attribute_labels(session):
+    await _seed_group(session, 10, "SDLC users")
+    await _seed_user(session, 5, "dev@example.com")
+    await _seed_attr_group(session, 20, "title/разработчик", "Разработчик")
+    await _seed_attr_group(session, 30, "dept/713", "ПК Платформа разработки")
+    await _seed_attr_group(session, 40, "store/Магазин Уфа 2", "Магазин Уфа 2")
+    await _edge(session, 10, 5)
+    for parent in (20, 30, 40):
+        session.add(
+            PrincipalMembership(
+                parent_principal_id=parent,
+                member_principal_id=5,
+                source="oidc-attrs",
+            )
+        )
+    await session.commit()
+
+    rows = await list_group_members(session, None, 10)
+    assert len(rows) == 1
+    assert rows[0].profession == "Разработчик"
+    assert rows[0].department == "ПК Платформа разработки"
+    assert rows[0].business_unit == "Магазин Уфа 2"

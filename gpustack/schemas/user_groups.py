@@ -146,3 +146,9 @@ class UserGroupMembershipPublic(SQLModel):
     # fan-out. ``None`` for user rows.
     group_type: Optional[str] = None
     group_member_count: Optional[int] = None
+    # Only for user rows: display labels from the user's
+    # attribute-derived groups (raw title / department / store value).
+    # None when the user holds no group of that kind.
+    profession: Optional[str] = None
+    department: Optional[str] = None
+    business_unit: Optional[str] = None

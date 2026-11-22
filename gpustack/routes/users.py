@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -42,7 +42,7 @@ from gpustack.server.passwords import (
     password_change_required_map,
     set_password,
 )
-from gpustack.server.services import UserService
+from gpustack.server.services import UserService, bulk_user_attribute_labels
 
 router = APIRouter()
 
@@ -53,15 +53,30 @@ async def _to_user_public(session, user: User) -> UserPublic:
     # reflects the actual force-change state.
     result = UserPublic.model_validate(user)
     result.require_password_change = await is_password_change_required(session, user.id)
+    labels = await bulk_user_attribute_labels(session, [user.id])
+    _apply_attribute_labels(result, labels.get(user.id, {}))
     return result
+
+
+def _apply_attribute_labels(item: UserPublic, labels: Dict[str, str]) -> None:
+    """Copy the resolved attribute labels onto the wire DTO.
+
+    ``bulk_user_attribute_labels`` omits kinds the user doesn't hold;
+    the fields default to None, so a plain get keeps them absent.
+    """
+    item.profession = labels.get("profession")
+    item.department = labels.get("department")
+    item.business_unit = labels.get("business_unit")
 
 
 async def _to_users_public(session, page) -> UsersPublic:
     flag_map = await password_change_required_map(session, [u.id for u in page.items])
+    labels = await bulk_user_attribute_labels(session, [u.id for u in page.items])
     items = []
     for u in page.items:
         item = UserPublic.model_validate(u)
         item.require_password_change = flag_map.get(u.id, False)
+        _apply_attribute_labels(item, labels.get(u.id, {}))
         items.append(item)
     return UsersPublic(items=items, pagination=page.pagination)
 

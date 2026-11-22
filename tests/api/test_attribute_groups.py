@@ -20,6 +20,7 @@ from gpustack.routes.auth import (
     UNKNOWN_USERS_GROUP_DISPLAY_NAME,
     UNKNOWN_USERS_GROUP_NAME,
     _attribute_group_names,
+    _attribute_group_names_for_user,
     _sync_attribute_groups_if_enabled,
 )
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
@@ -66,18 +67,43 @@ def test_names_missing_values_skipped():
     assert display == {"title/аналитик": "аналитик"}
 
 
-def test_names_empty_attributes_park_in_unknown_group():
-    assert _attribute_group_names({}) == (
-        [UNKNOWN_USERS_GROUP_NAME],
-        {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME},
-    )
+def test_names_empty_attributes_yield_nothing():
+    # The unknown/users parking is the user-aware wrapper's decision
+    # (see _attribute_group_names_for_user), not the claims parser's.
+    assert _attribute_group_names({}) == ([], {})
 
 
-def test_names_whitespace_only_value_parks_in_unknown_group():
-    assert _attribute_group_names({"title": "   ", "store_name": ""}) == (
-        [UNKNOWN_USERS_GROUP_NAME],
-        {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME},
+def test_names_whitespace_only_value_is_skipped():
+    assert _attribute_group_names({"title": "   ", "store_name": ""}) == ([], {})
+
+
+# ---- user-aware wrapper: the unknown/users parking ---------------------------
+
+
+def _user(source: str, external_attributes=None):
+    return SimpleNamespace(id=1, source=source, external_attributes=external_attributes)
+
+
+def test_unknown_parking_applies_to_oidc_accounts_only():
+    # An OIDC account without attributes parks in unknown/users.
+    names, display = _attribute_group_names_for_user(_user(AuthProviderEnum.OIDC.value))
+    assert names == [UNKNOWN_USERS_GROUP_NAME]
+    assert display == {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME}
+
+    # Local and SAML accounts never park: a Local account is refused
+    # at the SSO callback (source mismatch), so its attributes can
+    # never arrive and 'unknown' would be a lie that never heals.
+    for source in (AuthProviderEnum.Local.value, AuthProviderEnum.SAML.value):
+        assert _attribute_group_names_for_user(_user(source)) == ([], {})
+
+
+def test_unknown_parking_skipped_when_attributes_derive_groups():
+    names, display = _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, {"title": "Аналитик"})
     )
+    assert names == ["title/аналитик"]
+    assert display == {"title/аналитик": "Аналитик"}
+    assert UNKNOWN_USERS_GROUP_NAME not in names
 
 
 def test_names_dept_without_name_falls_back_to_id():
@@ -299,7 +325,9 @@ async def test_unknown_users_group_moves_out_when_attributes_arrive(session):
     await _seed_user(session, 1, "u1@example.com")
 
     # Backfill pass: no attributes → unknown/users.
-    names, display = _attribute_group_names({})
+    names, display = _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, external_attributes=None)
+    )
     await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
     await session.commit()
     rows = (await session.exec(PrincipalMembership.__table__.select())).all()
@@ -315,8 +343,11 @@ async def test_unknown_users_group_moves_out_when_attributes_arrive(session):
     assert unknown_group.display_name == UNKNOWN_USERS_GROUP_DISPLAY_NAME
 
     # Login pass: attributes arrive → moved into the real groups.
-    names, display = _attribute_group_names(
-        {"title": "Разработчик", "department_id": "713"}
+    names, display = _attribute_group_names_for_user(
+        _user(
+            AuthProviderEnum.OIDC.value,
+            {"title": "Разработчик", "department_id": "713"},
+        )
     )
     await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
     await session.commit()
@@ -331,13 +362,15 @@ async def test_unknown_users_group_moves_out_when_attributes_arrive(session):
 @pytest.mark.asyncio
 async def test_attributes_vanishing_returns_user_to_unknown_group(session):
     await _seed_user(session, 1, "u1@example.com")
-    names, display = _attribute_group_names({"title": "аналитик"})
+    names, display = _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, {"title": "аналитик"})
+    )
     await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
     await session.commit()
 
     # The IdP stops sending attributes: the fallback group is the
     # desired state, exactly like any other attribute change.
-    names, display = _attribute_group_names({})
+    names, display = _attribute_group_names_for_user(_user(AuthProviderEnum.OIDC.value))
     await sync_user_group_memberships(session, 1, "oidc-attrs", names, display)
     await session.commit()
     rows = (await session.exec(PrincipalMembership.__table__.select())).all()

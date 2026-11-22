@@ -296,6 +296,13 @@ class UserPublic(UserBase):
     id: int
     created_at: datetime
     updated_at: datetime
+    # Display labels from the user's attribute-derived groups (the
+    # department name, raw title, store name the IdP reported). None
+    # when the user holds no group of that kind — local accounts never
+    # do. Hydrated by the users list/get routes in bulk.
+    profession: Optional[str] = None
+    department: Optional[str] = None
+    business_unit: Optional[str] = None
 
 
 UsersPublic = PaginatedList[UserPublic]

@@ -36,6 +36,12 @@ from gpustack.schemas.principals import (
     is_reserved_principal_name,
 )
 from gpustack.schemas.user_groups import (
+    GROUP_TYPE_BUSINESS_UNIT,
+    GROUP_TYPE_DEPARTMENT,
+    GROUP_TYPE_IDP,
+    GROUP_TYPE_LOCAL,
+    GROUP_TYPE_PROFESSION,
+    GROUP_TYPE_UNKNOWN,
     UserGroupCreate,
     UserGroupListParams,
     UserGroupMembershipPublic,
@@ -44,8 +50,9 @@ from gpustack.schemas.user_groups import (
     UserGroupsPublic,
     resolve_group_type,
 )
-from gpustack.schemas.users import User
+from gpustack.schemas.users import AuthProviderEnum, User
 from gpustack.server.deps import SessionDep, TenantContextDep
+from gpustack.server.services import bulk_user_attribute_labels
 
 router = APIRouter()
 
@@ -212,12 +219,41 @@ async def _list_groups_by_member_count(
     )
 
 
+def _group_type_conditions(group_type: str) -> Optional[List]:
+    """SQL conditions selecting groups whose derived type is token.
+
+    Mirrors ``resolve_group_type`` in SQL: source wins over the name
+    prefix, so a Local group named ``title/…`` stays out of the
+    profession filter. ``idp`` is the complement — IdP-sourced groups
+    without any known prefix.
+    """
+    source = Principal.source
+    name = Principal.name
+    non_local = source != AuthProviderEnum.Local.value
+    prefixed = {
+        GROUP_TYPE_PROFESSION: "title/",
+        GROUP_TYPE_DEPARTMENT: "dept/",
+        GROUP_TYPE_BUSINESS_UNIT: "store/",
+        GROUP_TYPE_UNKNOWN: "unknown/",
+    }
+    if group_type == GROUP_TYPE_LOCAL:
+        return [source == AuthProviderEnum.Local.value]
+    if group_type in prefixed:
+        return [non_local, name.like(f"{prefixed[group_type]}%")]
+    if group_type == GROUP_TYPE_IDP:
+        return [non_local] + [
+            name.not_like(f"{prefix}%") for prefix in prefixed.values()
+        ]
+    return None
+
+
 @router.get("/groups", response_model=UserGroupsPublic)
 async def list_groups(
     session: SessionDep,
     ctx: TenantContextDep,
     params: UserGroupListParams = Depends(),
     search: Optional[str] = None,
+    group_type: Optional[str] = None,
     include_reserved: bool = False,
 ):
     """List all groups. Visible to any authenticated user — Group names
@@ -233,6 +269,11 @@ async def list_groups(
     Default (and explicit) ordering by ``member_count`` paginates in
     Python — the count is derived, so it cannot be ordered by SQL
     OFFSET/LIMIT. Every other sort stays on the mixin's SQL pagination.
+
+    ``group_type`` filters by the derived type token (local /
+    profession / department / business-unit / unknown / idp) — the
+    UI's Type column filter. Unknown tokens are rejected rather than
+    matching nothing, so a stale UI can't silently blank the list.
     """
     fuzzy_fields = {"name": search} if search else {}
     extra_conditions = []
@@ -240,6 +281,16 @@ async def list_groups(
         extra_conditions.append(
             Principal.name.not_like(f"{RESERVED_PRINCIPAL_NAME_PREFIX}%"),
         )
+    if group_type:
+        conditions = _group_type_conditions(group_type)
+        if conditions is None:
+            raise InvalidException(
+                message=(
+                    f"Unknown group type '{group_type}'. Allowed: local, "
+                    "profession, department, business-unit, unknown, idp."
+                )
+            )
+        extra_conditions.extend(conditions)
     if _member_count_sort_requested(params.order_by):
         return await _list_groups_by_member_count(
             session, params, fuzzy_fields, extra_conditions, params.order_by
@@ -476,11 +527,17 @@ async def list_group_members(session: SessionDep, ctx: TenantContextDep, group_i
     subgroup_counts = await _bulk_transitive_member_counts(
         session, list(group_by_principal)
     )
+    # The Users tab renders each member's attribute labels (Business
+    # Unit / Department / Profession columns) — bulk again, one query
+    # for the whole member page.
+    user_ids = [u.id for u in user_by_principal.values()]
+    attribute_labels = await bulk_user_attribute_labels(session, user_ids)
     out: List[UserGroupMembershipPublic] = []
     for r in rows:
         u = user_by_principal.get(r.member_principal_id)
         g = group_by_principal.get(r.member_principal_id)
         if u is not None:
+            labels = attribute_labels.get(u.id, {})
             out.append(
                 UserGroupMembershipPublic(
                     member_principal_id=u.id,
@@ -490,6 +547,9 @@ async def list_group_members(session: SessionDep, ctx: TenantContextDep, group_i
                     created_at=r.created_at,
                     username=u.name,
                     full_name=u.display_name,
+                    profession=labels.get("profession"),
+                    department=labels.get("department"),
+                    business_unit=labels.get("business_unit"),
                 )
             )
         elif g is not None:

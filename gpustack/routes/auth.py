@@ -766,7 +766,7 @@ UNKNOWN_USERS_GROUP_DISPLAY_NAME = "Unknown Users"
 def _attribute_group_names(
     attributes: Dict[str, Any],
 ) -> tuple[List[str], Dict[str, str]]:
-    """Build the attribute-derived group set for one user.
+    """Build the attribute-derived group set for one user's claims.
 
     Group names carry a kind prefix so the three attribute kinds can
     never collide with each other or with admin-curated groups:
@@ -784,11 +784,10 @@ def _attribute_group_names(
     then removes the user from any previously held group of that kind
     — the IdP is authoritative, same contract as the claims map.
 
-    When nothing yields a group — claims never arrived, or every
-    mapped value is blank — the user parks in the shared
-    ``unknown/users`` group instead. The same diff moves them out the
-    day real attributes land; users who sign in without SSO keep the
-    membership, since nothing else ever targets their attributes.
+    Returns only the groups the claims actually derive; the
+    ``unknown/users`` fallback is the caller's decision (see
+    :func:`_attribute_group_names_for_user`), because parking depends
+    on who the user is, not on what the claims say.
     """
     names: List[str] = []
     display_names: Dict[str, str] = {}
@@ -814,7 +813,21 @@ def _attribute_group_names(
         names.append(name)
         display_names[name] = store
 
-    if not names:
+    return names, display_names
+
+
+def _attribute_group_names_for_user(user) -> tuple[List[str], Dict[str, str]]:
+    """Attribute groups for one user, with the unknown-accounts parking.
+
+    An OIDC account whose claims never arrived — or whose every mapped
+    value is blank — parks in the shared ``unknown/users`` group; the
+    same diff moves it out the day real attributes land. Accounts from
+    other sources stay out: a Local account is refused at the SSO
+    callback (source mismatch is a security check), so its attributes
+    can never arrive and ``unknown`` would be a lie that never heals.
+    """
+    names, display_names = _attribute_group_names(user.external_attributes or {})
+    if not names and (user.source or "") == AuthProviderEnum.OIDC.value:
         names = [UNKNOWN_USERS_GROUP_NAME]
         display_names = {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME}
     return names, display_names
@@ -835,8 +848,7 @@ async def _sync_attribute_groups_if_enabled(
     """
     if not config.external_auth_attribute_groups:
         return
-    attributes = user.external_attributes or {}
-    names, display_names = _attribute_group_names(attributes)
+    names, display_names = _attribute_group_names_for_user(user)
     await sync_user_group_memberships(
         session, user.id, AuthProviderEnum.OIDC_ATTRIBUTES, names, display_names
     )
