@@ -471,6 +471,11 @@ class ServeManager(ContainerLogPersister):
         self._log_persistence_lock = threading.Lock()
         self._error_model_instances = {}
         self._pending_model_instance_errors: Dict[int, dict] = {}
+        # Consecutive bad workload observations per instance, before the state
+        # sync is allowed to declare ERROR. One failed read is not proof of a
+        # dead workload: a containerd restart makes healthy workloads read as
+        # missing or UNKNOWN for a few ticks while the containers keep serving.
+        self._workload_bad_observations: Dict[int, int] = {}
         self._model_cache_by_instance = {}
         self._model_instance_by_instance_id = {}
         self._starting_model_instances: Set[int] = set()
@@ -2358,8 +2363,48 @@ class ServeManager(ContainerLogPersister):
                     WorkloadStatusStateEnum.INACTIVE,
                     WorkloadStatusStateEnum.FAILED,
                 ]:
-                    # Only if not in ERROR state yet.
+                    # Only if not in ERROR state yet — a declared instance has
+                    # nothing left to debounce and nothing new to report; the
+                    # restart path owns it from here.
                     if model_instance.state != ModelInstanceStateEnum.ERROR:
+                        # A missing or non-FAILED read is not proof of a dead
+                        # workload: a containerd restart makes healthy workloads
+                        # read as missing or UNKNOWN for a few ticks while the
+                        # containers keep serving. Require the bad observation to
+                        # persist across consecutive syncs before declaring
+                        # ERROR. FAILED is exempt: the runtime has already
+                        # settled a terminal diagnosis (an exit code, an
+                        # image-pull failure), and delaying it would only delay
+                        # the restart that cleans the instance up.
+                        bad_ticks = (
+                            self._workload_bad_observations.get(model_instance.id, 0)
+                            + 1
+                        )
+                        self._workload_bad_observations[model_instance.id] = bad_ticks
+                        immediate = (
+                            workload is not None
+                            and workload.state == WorkloadStatusStateEnum.FAILED
+                        )
+                        if (
+                            not immediate
+                            and bad_ticks < envs.MODEL_INSTANCE_ERROR_DEBOUNCE_TICKS
+                        ):
+                            logger.warning(
+                                "Model instance %s workload %s for %d consecutive "
+                                "sync(s); %d more before declaring error",
+                                model_instance.name,
+                                (
+                                    "missing"
+                                    if not workload
+                                    else f"reports {workload.state.value}"
+                                ),
+                                bad_ticks,
+                                envs.MODEL_INSTANCE_ERROR_DEBOUNCE_TICKS - bad_ticks,
+                            )
+                            continue
+                        observed_ticks = self._workload_bad_observations.pop(
+                            model_instance.id, 0
+                        )
                         # Surface the workload's own diagnosis (e.g. a device-plugin
                         # admission rejection, an image-pull failure, an exit code)
                         # when available.
@@ -2373,6 +2418,17 @@ class ServeManager(ContainerLogPersister):
                         failure_message = self._append_log_diagnosis(
                             model_instance, failure_message
                         )
+                        # When the debounce held the declaration back, the
+                        # count tells a reader the failure outlasted the
+                        # grace rather than appearing on a single read. A
+                        # first-tick declaration — an immediate FAILED, or a
+                        # threshold of one — leaves the message untouched:
+                        # nothing was waited for, so there is nothing to say.
+                        if observed_ticks > 1:
+                            failure_message = (
+                                f"{failure_message} (observed in {observed_ticks} "
+                                f"consecutive syncs)"
+                            )
                         with contextlib.suppress(NotFoundException):
                             # Get patch dict for main worker.
                             if is_main_worker:
@@ -2411,6 +2467,9 @@ class ServeManager(ContainerLogPersister):
                             self._report_model_instance(model_instance, **patch_dict)
                     continue
 
+                # The workload is alive and serving — the bad-observation count,
+                # if any, described a transient read and is no longer owed.
+                self._workload_bad_observations.pop(model_instance.id, None)
                 # The workload is alive and this worker did not necessarily start it,
                 # so reconcile the log persistence threads that belong to it.
                 self._ensure_container_log_persistence(model_instance)
@@ -5167,6 +5226,7 @@ class ServeManager(ContainerLogPersister):
         self._port_reservations.release_model(mi.id, forget_generation=delete_logs)
         self._error_model_instances.pop(mi.id, None)
         self._pending_model_instance_errors.pop(mi.id, None)
+        self._workload_bad_observations.pop(mi.id, None)
         self._model_cache_by_instance.pop(mi.id, None)
         with self._model_instance_start_lock:
             if not retain_instance:

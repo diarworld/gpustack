@@ -413,6 +413,15 @@ MODEL_INSTANCE_HEALTH_CHECK_INTERVAL = int(
 MODEL_INSTANCE_STATE_RECONCILE_INTERVAL = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL", 0)
 )
+# Consecutive bad workload observations (missing, UNKNOWN, UNHEALTHY, INACTIVE)
+# required before the state sync declares a model instance ERROR. A single
+# failed read is not proof of a dead workload: a containerd restart or a CRI
+# hiccup makes healthy workloads vanish or report UNKNOWN for a few seconds
+# while the containers themselves keep serving. FAILED stays immediate — the
+# runtime's own diagnosis is terminal, not transient.
+MODEL_INSTANCE_ERROR_DEBOUNCE_TICKS = int(
+    os.getenv("GPUSTACK_MODEL_INSTANCE_ERROR_DEBOUNCE_TICKS", 5)
+)
 DISABLE_OS_FILELOCK = os.getenv("GPUSTACK_DISABLE_OS_FILELOCK", "false").lower() in [
     "true",
     "1",
