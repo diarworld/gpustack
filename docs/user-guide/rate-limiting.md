@@ -270,6 +270,13 @@ The counter rebuild cooperates with resets: usage recorded before the
 latest reset of a window kind is forgiven, so a rebuild after a Redis
 loss resumes from the reset instead of resurrecting the forgiven spend.
 
+It honors the free-window schedule the same way: the plugin admits
+requests inside the window without counting them, so rows recorded after
+the schedule went live (the settings row's creation) whose request
+started inside it are excluded from the replay — otherwise every server
+restart would bill the free time back into the budgets. A disabled
+schedule excludes nothing.
+
 ## Metrics
 
 The plugin declares three counters per rate-limit decision:
