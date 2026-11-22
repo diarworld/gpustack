@@ -455,6 +455,26 @@ async def test_list_name_sort_stays_on_sql_path(session):
 
 
 @pytest.mark.asyncio
+async def test_list_page_non_positive_returns_all_groups(session):
+    # ``page=-1`` is the codebase's fetch-everything convention: the
+    # members-drawer subgroup picker loads the full candidate list with
+    # it, so the Python-paginated member-count path must honor it too
+    # and not clamp to the first page.
+    await _seed_group(session, 10, "beta")
+    await _seed_group(session, 20, "alpha")
+    await _seed_group(session, 30, "gamma")
+
+    page = await list_groups(session, None, UserGroupListParams(page=-1, perPage=2))
+    # All counts are zero here, so the name tiebreaker orders the page.
+    assert [g.name for g in page.items] == ["alpha", "beta", "gamma"]
+    assert page.pagination.total == 3
+
+    page = await list_groups(session, None, UserGroupListParams(page=1, perPage=2))
+    assert len(page.items) == 2
+    assert page.pagination.total == 3
+
+
+@pytest.mark.asyncio
 async def test_get_group_reports_transitive_count(session):
     await _seed_group(session, 10, "top")
     await _seed_group(session, 20, "mid")

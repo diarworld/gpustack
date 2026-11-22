@@ -176,6 +176,11 @@ async def _list_groups_by_member_count(
     count query dominates either way. ``member_count`` governs the
     primary key in its requested direction; name is the stable
     tiebreaker so pages don't reshuffle between identical counts.
+
+    ``page <= 0`` disables the slice, mirroring
+    ``paginated_by_query``'s "fetch everything" convention the picker
+    surfaces rely on (the members drawer loads its full subgroup
+    candidate list with ``page=-1``).
     """
     stmt = select(Principal).where(
         Principal.kind == PrincipalType.GROUP,
@@ -202,9 +207,11 @@ async def _list_groups_by_member_count(
 
     total = len(groups)
     per_page = params.perPage or 100
-    total_page = math.ceil(total / per_page)
-    start = (max(params.page, 1) - 1) * per_page
-    page_items = groups[start : start + per_page]
+    if params.page is not None and params.page > 0:
+        start = (params.page - 1) * per_page
+        page_items = groups[start : start + per_page]
+    else:
+        page_items = groups
     return UserGroupsPublic(
         items=[
             UserGroupPublic.from_principal(g, member_count=counts.get(g.id, 0))
@@ -214,7 +221,7 @@ async def _list_groups_by_member_count(
             page=params.page,
             perPage=per_page,
             total=total,
-            totalPage=total_page,
+            totalPage=math.ceil(total / per_page),
         ),
     )
 
