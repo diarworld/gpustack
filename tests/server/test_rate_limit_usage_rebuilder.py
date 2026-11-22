@@ -71,10 +71,12 @@ def _reset(user_id: int, kind: str, at: datetime):
     return SimpleNamespace(user_id=user_id, kind=kind, reset_at=at)
 
 
-# (user_id, api_key_id, completed_at, prompt, completion) — the tuple the
-# details scan projects. Timestamps are naive UTC, as the table stores them.
-def _row(user_id, api_key_id, ts, prompt, completion):
-    return (user_id, api_key_id, ts, prompt, completion)
+# (user_id, api_key_id, completion/created ts, started_at, prompt,
+# completion) — the tuple the details scan projects. Timestamps are naive
+# UTC, as the table stores them; ``started_at`` is the admission stamp the
+# free-window test reads (None falls back to the coalesced stamp).
+def _row(user_id, api_key_id, ts, prompt, completion, started_at=None):
+    return (user_id, api_key_id, ts, started_at, prompt, completion)
 
 
 def hour_ts(naive: datetime) -> int:
@@ -85,6 +87,9 @@ def hour_ts(naive: datetime) -> int:
 class FakeResult:
     def __init__(self, items):
         self._items = items
+
+    def first(self):
+        return self._items[0] if self._items else None
 
     def all(self):
         return self._items
@@ -187,10 +192,15 @@ def frozen_now(monkeypatch):
     return FIXED_NOW
 
 
-async def _run(monkeypatch, rlc, users, keys, rows, resets=(), existing=None):
+async def _run(
+    monkeypatch, rlc, users, keys, rows, resets=(), existing=None, settings=None
+):
     # One shared session across the async-with blocks; exec order per cycle
-    # is users, keys, then (only when something is missing) resets and rows.
-    shared = FakeAsyncSession([users, keys, list(resets), rows])
+    # is users, keys, the settings row, resets, and (only when something is
+    # missing) the usage rows.
+    shared = FakeAsyncSession(
+        [users, keys, [settings] if settings else [], list(resets), rows]
+    )
 
     def factory():
         return shared
@@ -273,7 +283,7 @@ async def test_warmup_replaces_a_stale_counter(frozen_now, monkeypatch):
     month_key = _long_windows(rlc, user7)["each_month"]
     rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
-    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    shared = FakeAsyncSession([[user7], [key42], [], [], rows])
     monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
     monkeypatch.setattr(
         rebuilder,
@@ -391,7 +401,7 @@ async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
     rows = [_row(7, 42, datetime(2026, 11, 19, 9, 0), 100, 50)]
 
     rebuild = rebuilder.RateLimitUsageRebuilder(SimpleNamespace(gateway_rate_limit=rlc))
-    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    shared = FakeAsyncSession([[user7], [key42], [], [], rows])
     monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
     client = FakeRedis()
     monkeypatch.setattr(
@@ -418,7 +428,7 @@ async def test_failed_warmup_retries_as_warmup(frozen_now, monkeypatch):
 
     # The retry is still a warm-up: it DELs the stale counter instead of
     # merging into it.
-    shared = FakeAsyncSession([[user7], [key42], [], rows])
+    shared = FakeAsyncSession([[user7], [key42], [], [], rows])
     monkeypatch.setattr(rebuilder, "async_session", lambda: shared)
     month_key = _long_windows(rlc, user7)["each_month"]
     client.existing.add(month_key)
@@ -479,3 +489,121 @@ async def test_month_boundary_follows_the_deployment_timezone(frozen_now, monkey
     (member,) = month_members
     # The kept bucket is the 23:00 UTC hour of Oct 31.
     assert member == f"rebuild-7-{hour_ts(datetime(2026, 10, 31, 23, 0))}|50"
+
+
+# The settings row the free-window tests seed: a daily 15:00–06:00 UTC
+# window (no whole-day entries), gone live Saturday Nov 21 at 12:00 UTC.
+_FREE_SETTINGS = SimpleNamespace(
+    free_enabled=True,
+    free_start="15:00",
+    free_end="06:00",
+    free_days=[],
+    created_at=datetime(2026, 11, 21, 12, 0),
+)
+
+SUNDAY_NOW = datetime(2026, 11, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class FrozenSunday(rebuilder.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return SUNDAY_NOW if tz is None else SUNDAY_NOW.astimezone(tz)
+
+
+@pytest.fixture
+def frozen_sunday(monkeypatch):
+    monkeypatch.setattr(rebuilder, "datetime", FrozenSunday)
+    return SUNDAY_NOW
+
+
+@pytest.mark.asyncio
+async def test_free_window_usage_is_not_rebuilt(frozen_sunday, monkeypatch):
+    """The plugin admits free-window requests without counting them, so the
+    replay must not bill them back: post-policy rows admitted inside the
+    schedule stay out of the rebuilt counters, while post-policy rows
+    outside the window and pre-policy rows (counted live by the
+    then-current plugin) all stay in."""
+    rlc = _cfg()
+    user7 = _user(7, weekly=100_000)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [
+        # Friday 18:00 UTC — inside the schedule's daily span, but recorded
+        # before the policy went live (Saturday 12:00): the plugin of that
+        # moment counted it, so it stays.
+        _row(7, 42, datetime(2026, 11, 20, 18, 0), 30, 0),
+        # Saturday 12:30 UTC — post-policy, outside the daily window: counts.
+        _row(7, 42, datetime(2026, 11, 21, 12, 30), 11, 0),
+        # Saturday 18:00 UTC — post-policy, inside the daily window: free.
+        _row(7, 42, datetime(2026, 11, 21, 18, 0), 40, 0),
+        # Sunday 03:00 UTC — post-policy, inside the daily window: free.
+        _row(7, 42, datetime(2026, 11, 22, 3, 0), 50, 0),
+    ]
+
+    client, _, _ = await _run(
+        monkeypatch, rlc, [user7], [key42], rows, settings=_FREE_SETTINGS
+    )
+
+    month_key = _long_windows(rlc, user7)["each_month"]
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[month_key]).values()) == 41
+    week_key = _long_windows(rlc, user7)["604800s"]
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[week_key]).values()) == 41
+
+
+@pytest.mark.asyncio
+async def test_free_window_judges_admission_not_completion(frozen_sunday, monkeypatch):
+    """A stream that started inside the window is free in full even when
+    its completion stamp lands after the window's end — the plugin counted
+    nothing for it, and the admission stamp is what the replay reads."""
+    rlc = _cfg()
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [
+        # Started Saturday 23:50 UTC (inside the window), completed Sunday
+        # 00:30 UTC (outside it): free, stays out.
+        _row(
+            7,
+            42,
+            datetime(2026, 11, 22, 0, 30),
+            70,
+            0,
+            started_at=datetime(2026, 11, 21, 23, 50),
+        ),
+    ]
+
+    client, _, _ = await _run(
+        monkeypatch, rlc, [user7], [key42], rows, settings=_FREE_SETTINGS
+    )
+
+    month_key = _long_windows(rlc, user7)["each_month"]
+    assert month_key not in client.zsets
+
+
+@pytest.mark.asyncio
+async def test_disabled_free_window_rebuilds_every_row(frozen_sunday, monkeypatch):
+    """With the schedule off the gateway counts everything, so the replay
+    keeps every row — including hours the (idle) schedule would cover."""
+    rlc = _cfg()
+    user7 = _user(7)
+    key42 = _key(42, access_key="ak-abc", user_id=7)
+    rows = [
+        _row(7, 42, datetime(2026, 11, 21, 18, 0), 40, 0),
+        _row(7, 42, datetime(2026, 11, 22, 3, 0), 50, 0),
+    ]
+
+    client, _, _ = await _run(
+        monkeypatch,
+        rlc,
+        [user7],
+        [key42],
+        rows,
+        settings=SimpleNamespace(
+            free_enabled=False,
+            free_start="15:00",
+            free_end="06:00",
+            free_days=["sat", "sun"],
+            created_at=datetime(2026, 11, 21, 12, 0),
+        ),
+    )
+
+    month_key = _long_windows(rlc, user7)["each_month"]
+    assert sum(tokens for tokens, _ in _tokens(client.zsets[month_key]).values()) == 90

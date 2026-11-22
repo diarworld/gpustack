@@ -34,6 +34,14 @@ Usage recorded before a rate-limit reset (``gateway_rate_limit_resets``)
 is forgiven: rows older than the user's latest reset of a window kind are
 excluded, so a rebuilt weekly or monthly counter resumes from the reset
 instead of resurrecting the forgiven spend.
+
+The free-window schedule is mirrored the same way: the plugin admits
+everything inside the window without counting it, so usage rows admitted
+there (per the settings row's schedule) are excluded from the replay --
+otherwise every server restart would bill the free spend back into the
+budgets. The exclusion applies only to rows recorded after the settings
+row was created (the moment the policy went live): earlier rows were
+counted live by the then-current plugin and stay in.
 """
 
 import asyncio
@@ -45,6 +53,7 @@ from sqlalchemy import func
 from sqlmodel import select
 
 from gpustack.config.config import Config, GatewayRateLimitConfig
+from gpustack.gateway.rate_limit_settings import FreeWindow
 from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowSpec,
     calendar_elapsed_seconds,
@@ -54,6 +63,7 @@ from gpustack.gateway.rate_limit_usage import (
 )
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
+from gpustack.schemas.gateway_rate_limit_settings import GatewayRateLimitSettings
 from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.server.db import async_session
@@ -154,8 +164,9 @@ class RateLimitUsageRebuilder:
             redis_key: _window_start_ts(spec, now, rlc.timezone)
             for redis_key, (spec, _) in specs.items()
         }
+        free_policy = await self._free_policy()
         plain, forgiven, cutoffs = await self._load_usage_buckets(
-            min(starts.values()), now
+            min(starts.values()), now, rlc.timezone, free_policy
         )
         written = await self._write(
             client, specs, starts, plain, forgiven, cutoffs, targets, replace
@@ -208,8 +219,40 @@ class RateLimitUsageRebuilder:
                 specs[spec.redis_key] = (spec, user.id)
         return specs
 
+    async def _free_policy(self) -> Tuple[Optional[FreeWindow], Optional[datetime]]:
+        """The enforced free-window schedule and the instant it went live.
+
+        ``(None, None)`` when the settings row is absent, the schedule is
+        disabled, or the row carries no creation stamp — every row then
+        counts, exactly as before the free windows. Otherwise rows admitted
+        from ``policy_start`` (the row's creation: the moment the schedule
+        became enforceable) that fall inside the schedule belong to the
+        replay's exclusion set.
+        """
+        async with async_session() as session:
+            settings = (await session.exec(select(GatewayRateLimitSettings))).first()
+        if settings is None or not settings.free_enabled:
+            return None, None
+        policy_start = settings.created_at
+        if policy_start is None:
+            return None, None
+        if policy_start.tzinfo is None:
+            # Naive stamps are UTC, matching UTCDateTime storage.
+            policy_start = policy_start.replace(tzinfo=timezone.utc)
+        schedule = FreeWindow(
+            enabled=True,
+            start=settings.free_start,
+            end=settings.free_end,
+            days=settings.free_days,
+        )
+        return schedule, policy_start
+
     async def _load_usage_buckets(
-        self, min_start_ts: int, now: datetime
+        self,
+        min_start_ts: int,
+        now: datetime,
+        timezone_name: str,
+        free_policy: Tuple[Optional[FreeWindow], Optional[datetime]],
     ) -> Tuple[Dict, Dict, Dict]:
         """Per (user_id, api_key_id, hour) token sums from the details table.
 
@@ -221,6 +264,11 @@ class RateLimitUsageRebuilder:
         than resurrect it. ``cutoffs`` tells which (user, kind) pairs the
         ``forgiven`` map governs; the rest read ``plain``.
 
+        Rows the free window admitted free (post-policy, started inside
+        the schedule) are dropped before aggregation: the plugin counts
+        nothing for them, and replaying them would bill usage the
+        deployment made free.
+
         The range rides the indexed ``date`` column, which holds the server
         process's local calendar date -- it can sit a day ahead of or behind
         the UTC date and of the gateway's calendar timezone alike, so the
@@ -228,6 +276,7 @@ class RateLimitUsageRebuilder:
         row on the coalesced completion stamp. Keyless rows (UI traffic)
         bucket under ``api_key_id`` None and feed only user-level combos.
         """
+        schedule, policy_start = free_policy
         # The scan is only a pre-range; the +1-day pads keep it correct for
         # any server offset while the row-level ts filter does the real work.
         min_date = (
@@ -246,6 +295,7 @@ class RateLimitUsageRebuilder:
                             ModelUsageDetails.started_at,
                             ModelUsageDetails.created_at,
                         ).label("ts"),
+                        ModelUsageDetails.started_at,
                         ModelUsageDetails.prompt_token_count,
                         ModelUsageDetails.completion_token_count,
                     ).where(
@@ -266,13 +316,25 @@ class RateLimitUsageRebuilder:
 
         plain: Dict[Tuple[int, Optional[int]], Dict[int, int]] = {}
         forgiven: Dict[Tuple[str, int, Optional[int]], Dict[int, int]] = {}
-        for user_id, api_key_id, ts, prompt, completion in rows:
+        for user_id, api_key_id, ts, started_at, prompt, completion in rows:
             total = (prompt or 0) + (completion or 0)
             if not user_id or total <= 0 or ts is None:
                 continue
             if ts.tzinfo is None:
                 # Naive stamps are UTC, matching UTCDateTime storage.
                 ts = ts.replace(tzinfo=timezone.utc)
+            if schedule is not None and policy_start is not None:
+                # The plugin judges free-ness at admission: a stream that
+                # started inside the window is free in full even when its
+                # completion stamp lands outside. No stamp at all falls
+                # back to the coalesced one.
+                admission = started_at if started_at is not None else ts
+                if admission.tzinfo is None:
+                    admission = admission.replace(tzinfo=timezone.utc)
+                if admission >= policy_start and schedule.is_active(
+                    admission, timezone_name
+                ):
+                    continue
             hour_ts = int(ts.replace(minute=0, second=0, microsecond=0).timestamp())
             per_hours = plain.setdefault((user_id, api_key_id), {})
             per_hours[hour_ts] = per_hours.get(hour_ts, 0) + total
