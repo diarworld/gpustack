@@ -269,6 +269,15 @@ COORDINATOR_REDIS_MAX_CONNECTIONS = int(
     os.getenv("GPUSTACK_COORDINATOR_REDIS_MAX_CONNECTIONS", 100)
 )
 
+# How often the model route controllers re-derive route target states and the
+# route counters from the database in full. In distributed mode events travel
+# id-only and are rehydrated on arrival, so the edge-triggered chain from an
+# instance state flip to the route's ready_targets counter can silently lose a
+# hop; this pass is the durability net that repairs the drift regardless of
+# where the event chain broke. Same cost model as the gateway reconcilers: the
+# pass diffs before writing, so an unchanged recomputation costs reads only.
+MODEL_ROUTE_RESYNC_INTERVAL = int(os.getenv("GPUSTACK_MODEL_ROUTE_RESYNC_INTERVAL", 60))
+
 # Worker configuration
 WORKER_HEARTBEAT_INTERVAL = int(
     os.getenv("GPUSTACK_WORKER_HEARTBEAT_INTERVAL", 30)

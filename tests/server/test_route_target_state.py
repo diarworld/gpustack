@@ -17,7 +17,7 @@ import pytest
 
 from gpustack.schemas.model_routes import TargetStateEnum
 from gpustack.schemas.models import ModelStateEnum
-from gpustack.server.controllers import derive_route_target_state
+from gpustack.server.controllers import derive_route_target_state, recount_route_targets
 
 
 def _target(**kwargs):
@@ -28,6 +28,30 @@ def _target(**kwargs):
 
 def _model(state=ModelStateEnum.RUNNING, ready_replicas=1):
     return SimpleNamespace(state=state, ready_replicas=ready_replicas)
+
+
+def _route(route_targets):
+    return SimpleNamespace(route_targets=route_targets)
+
+
+def test_the_recount_ignores_soft_deleted_targets():
+    """Soft-deleted targets linger in the table but no longer count — the same
+    exclusion every writer of the counters applies, so two writers can never
+    fight over a diverging row."""
+    route = _route(
+        [
+            SimpleNamespace(state=TargetStateEnum.ACTIVE, deleted_at=None),
+            SimpleNamespace(state=TargetStateEnum.ACTIVE, deleted_at="x"),
+            SimpleNamespace(state=TargetStateEnum.UNAVAILABLE, deleted_at=None),
+        ]
+    )
+    assert recount_route_targets(route) == (2, 1)
+
+
+def test_the_recount_of_a_route_with_no_loaded_targets_is_zero():
+    """An unloaded relationship reads as `[]`... and `None` — either way the
+    route counts nothing rather than raising."""
+    assert recount_route_targets(_route(None)) == (0, 0)
 
 
 def test_a_running_model_makes_its_target_active():

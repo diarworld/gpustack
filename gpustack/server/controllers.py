@@ -3610,6 +3610,20 @@ def derive_route_target_state(
     return TargetStateEnum.UNAVAILABLE
 
 
+def recount_route_targets(route: "ModelRoute") -> Tuple[int, int]:
+    """The (targets, ready_targets) a route row should carry, from its targets.
+
+    Soft-deleted targets linger in the table but no longer count — the same
+    exclusion every writer of these counters applies, so two writers can never
+    fight over a diverging row.
+    """
+    live_targets = [t for t in (route.route_targets or []) if t.deleted_at is None]
+    return (
+        len(live_targets),
+        len([t for t in live_targets if t.state == TargetStateEnum.ACTIVE]),
+    )
+
+
 async def reconcile_route_target_states(session: AsyncSession, model: Model) -> bool:
     """Bring this model's route targets in line with its servability.
 
@@ -3651,6 +3665,7 @@ async def reconcile_route_target_states(session: AsyncSession, model: Model) -> 
         return False
 
     changed = False
+    changed_route_ids: Set[Optional[int]] = set()
     for target in targets:
         desired = derive_route_target_state(target, model)
         if target.state != desired:
@@ -3665,7 +3680,66 @@ async def reconcile_route_target_states(session: AsyncSession, model: Model) -> 
             target.state = desired
             await target.update(session=session, auto_commit=True)
             changed = True
+            changed_route_ids.add(target.route_id)
+    if changed:
+        # The flips above are the very event that should move the routes'
+        # denormalized ready_targets counter, so re-count them here rather
+        # than trusting the modelroute event chain to come back around: in
+        # distributed mode that chain travels id-only and a lost hop leaves
+        # the counter stale for as long as nothing else touches the route.
+        for route_id in changed_route_ids:
+            if route_id is not None:
+                await reconcile_route_counters(session, route_id)
     return changed
+
+
+async def reconcile_route_counters(session: AsyncSession, route_id: int) -> bool:
+    """Bring one route's denormalized target counters in line with its targets.
+
+    Level-triggered on purpose, and the durability net for the counter chain:
+    `_notify_parents` stamps the counters on the modelroute event it publishes
+    and `ModelRouteController._sync_targets` writes them on the same event,
+    but in distributed mode the event travels id-only and is rehydrated on
+    arrival, so either hop can silently miss. This recomputes the answer from
+    the target rows whenever it is called, so a missed event is repaired by
+    the next call instead of never.
+
+    Returns whether the route row (or the route itself, via the orphan
+    delete) changed.
+    """
+    model_route: Optional[ModelRoute] = await ModelRoute.one_by_id(
+        session,
+        route_id,
+        options=[selectinload(ModelRoute.route_targets)],
+    )
+    if not model_route:
+        return False
+
+    target_total, ready_target_total = recount_route_targets(model_route)
+    model_route_service = ModelRouteService(session=session)
+    if target_total == 0 and model_route.created_model_id is not None:
+        await model_route_service.delete(model_route, auto_commit=True)
+        return True
+
+    if (
+        model_route.targets != target_total
+        or model_route.ready_targets != ready_target_total
+    ):
+        logger.info(
+            "Route %s: targets %s -> %s, ready_targets %s -> %s "
+            "(re-counted from target rows)",
+            model_route.name,
+            model_route.targets,
+            target_total,
+            model_route.ready_targets,
+            ready_target_total,
+        )
+        model_route.targets = target_total
+        model_route.ready_targets = ready_target_total
+
+        await model_route_service.update(model_route, auto_commit=True)
+        return True
+    return False
 
 
 class PairingLocality(NamedTuple):
@@ -7827,6 +7901,10 @@ class ModelProviderController:
 class ModelRouteTargetController:
     def __init__(self, config: Config):
         self._config = config
+        # Retained reference: the event loop holds only a weak reference to a
+        # bare task, so an unreferenced resync loop could be collected
+        # mid-flight (see the note at Server._start_leader_tasks).
+        self._resync_task: Optional[asyncio.Task] = None
 
     async def start(self):
         # Before the subscription, because the gap between them is the hole
@@ -7840,6 +7918,14 @@ class ModelRouteTargetController:
         # one pass over a table with as many rows as there are route targets.
         await self._resync_all_targets()
 
+        # And once per interval forever, because startup is not the only gap:
+        # in distributed mode an event travels id-only and is rehydrated on
+        # arrival, so any hop of the edge-triggered chain from an instance
+        # state flip to a route's ready_targets counter can be lost without a
+        # trace. The pass repairs whatever drifted, wherever it drifted, and
+        # diffs before writing, so a healthy fleet costs reads only.
+        self._resync_task = asyncio.create_task(self._resync_loop())
+
         async for event in ModelRouteTarget.subscribe(
             source="model_route_target_controller"
         ):
@@ -7847,6 +7933,12 @@ class ModelRouteTargetController:
                 await self._reconcile(event)
             except Exception as e:
                 logger.exception(f"Failed to reconcile model route target: {e}")
+
+    async def _resync_loop(self):
+        while True:
+            await asyncio.sleep(envs.MODEL_ROUTE_RESYNC_INTERVAL)
+            await self._resync_all_targets()
+            await self._resync_all_route_counters()
 
     async def _resync_all_targets(self):
         """Re-derive every target's state from what it points at.
@@ -7865,7 +7957,7 @@ class ModelRouteTargetController:
                     desired = derive_route_target_state(target, model)
                     if target.state != desired:
                         logger.info(
-                            "Startup resync: route target %s %s -> %s",
+                            "Route target resync: %s %s -> %s",
                             target.name,
                             target.state,
                             desired,
@@ -7875,7 +7967,7 @@ class ModelRouteTargetController:
                         repaired += 1
                 if repaired:
                     logger.info(
-                        "Startup resync corrected %d route target(s) whose "
+                        "Route target resync corrected %d target(s) whose "
                         "state had drifted from their model's.",
                         repaired,
                     )
@@ -7883,7 +7975,31 @@ class ModelRouteTargetController:
             # Never fatal: the controller's steady-state job is more important
             # than this repair, and the per-model pass in `sync_model_status`
             # is a second chance at the same correction.
-            logger.warning("Route target startup resync failed: %s", e)
+            logger.warning("Route target resync failed: %s", e)
+
+    async def _resync_all_route_counters(self):
+        """Re-count every route's denormalized target counters from its targets.
+
+        Idempotent and write-on-difference, like the target resync above: a
+        healthy fleet logs nothing and writes nothing.
+        """
+        try:
+            async with async_session() as session:
+                routes = await ModelRoute.all(session)
+        except Exception as e:
+            logger.warning("Route counter resync failed: %s", e)
+            return
+        # One session per route: a failure counting one route must not skip
+        # the rest, and a write must not hold a transaction open across the
+        # whole table.
+        for route in routes:
+            try:
+                async with async_session() as session:
+                    await reconcile_route_counters(session, route.id)
+            except Exception as e:
+                logger.warning(
+                    "Route counter resync failed for route %s: %s", route.id, e
+                )
 
     async def _notify_parents(
         self, session: AsyncSession, target: ModelRouteTarget, event: Event
@@ -7932,12 +8048,8 @@ class ModelRouteTargetController:
             # stale ``ready_targets`` regress watch-stream clients past the
             # value the REST API already returns. Soft-deleted targets are
             # excluded: they linger in the table but no longer count.
-            live_targets = [
-                t for t in (model_route.route_targets or []) if t.deleted_at is None
-            ]
-            copied_route.targets = len(live_targets)
-            copied_route.ready_targets = len(
-                [t for t in live_targets if t.state == TargetStateEnum.ACTIVE]
+            copied_route.targets, copied_route.ready_targets = recount_route_targets(
+                model_route
             )
             await event_bus.publish(
                 ModelRoute.__name__.lower(),
@@ -8113,36 +8225,7 @@ class ModelRouteController:
         model_route_id = resolve_event_id(event)
         if not model_route_id:
             return False
-        model_route: ModelRoute = await ModelRoute.one_by_id(
-            session,
-            model_route_id,
-            options=[selectinload(ModelRoute.route_targets)],
-        )
-        if not model_route:
-            return False
-        # Soft-deleted targets linger in the table but no longer count —
-        # the same exclusion the API write path's ``_recount_route_targets``
-        # applies, so the two writers can never fight over a diverging row.
-        live_targets = [t for t in model_route.route_targets if t.deleted_at is None]
-        target_total = len(live_targets)
-        ready_target_total = len(
-            [t for t in live_targets if t.state == TargetStateEnum.ACTIVE]
-        )
-        model_route_service = ModelRouteService(session=session)
-        if target_total == 0 and model_route.created_model_id is not None:
-            await model_route_service.delete(model_route, auto_commit=True)
-            return True
-
-        if (
-            model_route.targets != target_total
-            or model_route.ready_targets != ready_target_total
-        ):
-            model_route.targets = target_total
-            model_route.ready_targets = ready_target_total
-
-            await model_route_service.update(model_route, auto_commit=True)
-            return True
-        return False
+        return await reconcile_route_counters(session, model_route_id)
 
     async def _reconcile(self, event: Event):
         """
