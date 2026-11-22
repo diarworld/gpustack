@@ -76,8 +76,18 @@ UserGroupsPublic = PaginatedList[UserGroupPublic]
 
 
 class UserGroupMembershipPublic(SQLModel):
-    user_id: int
+    # The member principal's id. For ``user`` members this equals
+    # ``user_id`` (principal id == user id since identity
+    # consolidation); for ``group`` members it is the subgroup's
+    # principal id and ``user_id`` is None.
+    member_principal_id: int = 0
+    # ``user`` for direct user rows, ``group`` for a nested subgroup.
+    member_kind: str = "user"
+    user_id: Optional[int] = None
     group_id: int
     created_at: datetime
+    # Users: login name and display label. Subgroups surface their
+    # ``name`` / ``display_name`` through the same fields so one list
+    # renders both kinds.
     username: Optional[str] = None
     full_name: Optional[str] = None

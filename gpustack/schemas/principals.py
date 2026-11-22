@@ -68,6 +68,9 @@ class AuthProviderEnum(str, Enum):
     OIDC = "OIDC"
     SAML = "SAML"
     CAS = "CAS"
+    # Attribute-derived group sync (``external_auth_attribute_groups``):
+    # owns its own rows so it never fights the claim-based sync above.
+    OIDC_ATTRIBUTES = "oidc-attrs"
 
 
 # Canonical ``name`` of the built-in platform Org-principal. Created

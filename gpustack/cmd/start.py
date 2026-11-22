@@ -612,6 +612,16 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env_bool("EXTERNAL_AUTH_INSECURE_SKIP_TLS_VERIFY"),
     )
     server_group.add_argument(
+        "--external-auth-attribute-groups",
+        action=OptionalBoolAction,
+        help="Derive user Groups from the claims persisted in external_attributes "
+        "on every SSO login: title/<title in lower case>, dept/<department_id> "
+        "(display_name = department_name) and store/<store_name>. Membership is "
+        "recomputed authoritatively at each login; admin-curated groups are "
+        "untouched.",
+        default=get_gpustack_env_bool("EXTERNAL_AUTH_ATTRIBUTE_GROUPS"),
+    )
+    server_group.add_argument(
         "--external-auth-post-logout-redirect-key",
         type=str,
         help="Generic key for post-logout redirection across IdPs.",
@@ -939,6 +949,7 @@ def set_server_options(args, config_data: dict):
         "external_auth_full_name",
         "external_auth_avatar_url",
         "external_auth_claims",
+        "external_auth_attribute_groups",
         "external_auth_default_inactive",
         "external_auth_insecure_skip_tls_verify",
         "oidc_issuer",

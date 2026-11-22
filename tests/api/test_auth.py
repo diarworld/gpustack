@@ -1253,6 +1253,9 @@ async def test_oidc_callback_uses_system_trust_store(monkeypatch):
             # Claim capture defaults to off; this test exercises the
             # trust-store path, not attribute persistence.
             "external_auth_claims": None,
+            # Attribute-derived groups default to off; this test
+            # exercises the trust-store path, not group sync.
+            "external_auth_attribute_groups": False,
         },
     )()
     request.app.state.jwt_manager = type(

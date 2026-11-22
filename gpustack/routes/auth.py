@@ -11,7 +11,7 @@ import logging
 import jwt
 from jwt.algorithms import RSAAlgorithm
 from gpustack.config.config import Config
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Form, Request, Response
 from gpustack.api.exceptions import (
     ConflictException,
@@ -759,6 +759,77 @@ async def _sync_saml_groups_if_enabled(
     await session.commit()
 
 
+def _attribute_group_names(
+    attributes: Dict[str, Any],
+) -> tuple[List[str], Dict[str, str]]:
+    """Build the attribute-derived group set for one user.
+
+    Group names carry a kind prefix so the three attribute kinds can
+    never collide with each other or with admin-curated groups:
+
+    - ``title/<title in lower case>`` — IdP case variants ("Разработчик"
+      vs "разработчик") must resolve to one group; the label keeps the
+      casing as received so the UI shows a readable title.
+    - ``dept/<department_id>`` — keyed by the stable department code;
+      the department's display name rides in ``display_name``, so a
+      department rename re-labels the group instead of orphaning it.
+    - ``store/<store_name>`` — verbatim; store names are few and
+      consistently cased.
+
+    Blank attribute values yield no group of that kind, and the sync
+    then removes the user from any previously held group of that kind
+    — the IdP is authoritative, same contract as the claims map.
+    """
+    names: List[str] = []
+    display_names: Dict[str, str] = {}
+
+    def _clean(value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    title = _clean(attributes.get("title"))
+    if title:
+        name = f"title/{title.lower()}"
+        names.append(name)
+        display_names[name] = title
+
+    dept_id = _clean(attributes.get("department_id"))
+    if dept_id:
+        name = f"dept/{dept_id}"
+        names.append(name)
+        display_names[name] = _clean(attributes.get("department_name")) or dept_id
+
+    store = _clean(attributes.get("store_name"))
+    if store:
+        name = f"store/{store}"
+        names.append(name)
+        display_names[name] = store
+
+    return names, display_names
+
+
+async def _sync_attribute_groups_if_enabled(
+    session, user, user_data, config: Config
+) -> None:
+    """Derive Groups from the user's ``external_attributes``.
+
+    Runs after ``_save_oidc_external_attributes`` so the freshly
+    persisted claims are the input. Owns the ``oidc-attrs`` source
+    marker — claim-based group sync (``external_auth_groups``) and
+    this mode can coexist because each only reconciles rows it
+    sourced itself. Extracted from the callback for the same reason
+    as ``_sync_oidc_groups_if_enabled``: the callback sits at flake8's
+    complexity ceiling.
+    """
+    if not config.external_auth_attribute_groups:
+        return
+    attributes = user.external_attributes or {}
+    names, display_names = _attribute_group_names(attributes)
+    await sync_user_group_memberships(
+        session, user.id, AuthProviderEnum.OIDC_ATTRIBUTES, names, display_names
+    )
+    await session.commit()
+
+
 def _coerce_group_claim(raw) -> List[str]:
     """Normalise an OIDC claim / SAML attribute into a list[str].
 
@@ -988,6 +1059,7 @@ async def oidc_callback(request: Request, session: SessionDep):
 
     await _sync_oidc_groups_if_enabled(session, user, user_data, config)
     await _save_oidc_external_attributes(session, user, user_data, config)
+    await _sync_attribute_groups_if_enabled(session, user, user_data, config)
 
     jwt_manager: JWTManager = request.app.state.jwt_manager
     access_token = jwt_manager.create_jwt_token(

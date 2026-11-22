@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable, List, Optional, Set
 
 from fastapi import Depends, Header, Request
+from sqlalchemy import literal
 from sqlalchemy.orm import aliased
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -184,21 +185,57 @@ async def _user_group_principal_ids(
     that may be a member of zero or more Orgs. Cluster_access grants
     against a Group apply wherever the user acts, mirroring how AD/IAM
     groups behave.
+
+    Resolution is transitive: a nested subgroup ("SDLC users" containing
+    ``title/разработчик``) contributes every ancestor on its path, so
+    grants and future per-group policies see the groups the user only
+    reaches through nesting. Implemented as a recursive CTE over
+    ``principal_memberships`` — supported by every backend dialect
+    (PostgreSQL/openGauss, MySQL/OceanBase, SQLite). The depth cap is
+    unreachable in practice (add-time cycle checks keep the graph a
+    DAG); it bounds the walk if the data were corrupted by hand.
     """
-    stmt = (
-        select(PrincipalMembership.parent_principal_id)
-        .join(
-            Principal,
-            Principal.id == PrincipalMembership.parent_principal_id,
+    GROUP_RESOLUTION_DEPTH = 32
+    membership = PrincipalMembership.__table__
+    principal = Principal.__table__
+    membership_next = membership.alias()
+
+    seed = (
+        select(
+            membership.c.parent_principal_id.label("group_principal_id"),
+            literal(0).label("depth"),
         )
+        .join(principal, principal.c.id == membership.c.parent_principal_id)
         .where(
-            PrincipalMembership.member_principal_id == user_principal_id,
-            PrincipalMembership.deleted_at.is_(None),
-            Principal.kind == PrincipalType.GROUP,
-            Principal.deleted_at.is_(None),
+            membership.c.member_principal_id == user_principal_id,
+            membership.c.deleted_at.is_(None),
+            principal.c.kind == PrincipalType.GROUP,
+            principal.c.deleted_at.is_(None),
         )
     )
-    return list((await session.exec(stmt)).all())
+    # Every hop: an already-reached group is itself an active member of
+    # another live GROUP principal. Enum members bind through the
+    # column's SQLEnum type even in core-table queries.
+    edge = seed.cte("user_group_edge", recursive=True)
+    edge = edge.union_all(
+        select(
+            membership_next.c.parent_principal_id.label("group_principal_id"),
+            (edge.c.depth + 1).label("depth"),
+        )
+        .join(
+            membership_next,
+            membership_next.c.member_principal_id == edge.c.group_principal_id,
+        )
+        .join(principal, principal.c.id == membership_next.c.parent_principal_id)
+        .where(
+            membership_next.c.deleted_at.is_(None),
+            edge.c.depth < GROUP_RESOLUTION_DEPTH - 1,
+            principal.c.kind == PrincipalType.GROUP,
+            principal.c.deleted_at.is_(None),
+        )
+    )
+    rows = (await session.exec(select(edge.c.group_principal_id).distinct())).all()
+    return list(rows)
 
 
 async def _accessible_clusters(

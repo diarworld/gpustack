@@ -41,6 +41,7 @@ def _config(**overrides):
         external_auth_insecure_skip_tls_verify=False,
         external_auth_group_sync=False,
         external_auth_groups=None,
+        external_auth_attribute_groups=False,
         oidc_scopes=None,
     )
     defaults.update(overrides)

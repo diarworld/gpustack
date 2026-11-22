@@ -24,6 +24,7 @@ The following CLI flags are available for OIDC configuration:
 | `--external-auth-full-name` (Optional)                | Mapping of OIDC user information to user's full name. Multiple elements can be combined, e.g., `name` or `firstName+lastName`. By default, the `name` claim is used. |
 | `--external-auth-avatar-url` (Optional)               | Mapping of OIDC user information to user's avatar URL. By default, the `picture` claim is used if available.                                                         |
 | `--external-auth-claims` (Optional)                   | Comma-separated claim names persisted onto the user's `external_attributes` at every login, e.g., `title,org_id,division`. See [Capturing IdP claims](#capturing-idp-claims). |
+| `--external-auth-attribute-groups` (Optional)         | Derive user Groups from the captured claims on every login: `title/…`, `dept/…` and `store/…` groups, membership recomputed authoritatively. See [Groups from IdP attributes](#groups-from-idp-attributes). |
 | `--external-auth-default-inactive` (Optional)         | Prevents new SSO users from being activated by default.                                                                                                              |
 | `--external-auth-post-logout-redirect-key` (Optional) | Generic parameter name for post-logout redirection across different IdPs (e.g., Auth0 `returnTo`). Applied to both OIDC and SAML.                                    |
 
@@ -54,6 +55,20 @@ GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division,cost_center,shop_id"
 ```
 
 On every SSO login GPUStack copies the current values of these claims from the userinfo response into the user's `external_attributes` (visible in `GET /users/{id}`), rewriting whatever a previous login stored — the IdP is the source of truth. Claims arrive only if the IdP emits them for your client: those behind *optional* client scopes must be requested via `--oidc-scopes`, while claims behind *default* client scopes are always included.
+
+### Groups from IdP attributes
+
+With claims captured (see above), enable `--external-auth-attribute-groups` to have GPUStack maintain groups from them on every login. Three group kinds are derived, with prefixed names so they can never collide with each other or with admin-curated groups:
+
+| Kind | Group name | Display name |
+|---|---|---|
+| Job title | `title/<title in lower case>` | the title as the IdP reports it |
+| Department | `dept/<department_id>` | the department name |
+| Store / location | `store/<store_name>` | the store name |
+
+Titles are lower-cased into the group name, so IdP case variants ("Developer" and "developer") land in one group. Departments are keyed by the stable `department_id` — a department rename re-labels the group instead of orphaning it. Store names are kept verbatim.
+
+Membership is recomputed authoritatively at each login: users join the groups matching their current attributes and leave the ones they outgrew. Admin-curated memberships (created in the UI) and admin-created groups are never touched, and groups created by this sync are tagged with the `oidc-attrs` source. Nested groups compose with this: an admin can put `title/developer` and `title/analyst` inside a manual group like `SDLC users`, and every right or quota granted to `SDLC users` reaches the members transitively.
 
 ### Example: Integrate with Auth0 OIDC
 

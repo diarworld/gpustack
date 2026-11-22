@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
-from typing import List, NamedTuple, Optional, Tuple, Union, Set
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Set
 from sqlalchemy import delete, func, or_, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, select
@@ -367,11 +367,82 @@ async def _insert_group_or_refetch(
         return existing
 
 
+def _refresh_display_names(
+    session: AsyncSession,
+    groups: List[Principal],
+    display_names: Dict[str, str],
+) -> None:
+    """Refresh the human-readable labels on groups this provider owns.
+
+    The attribute-derived sync passes the raw attribute values, so a
+    renamed department or a differently-cased title re-labels the
+    existing group instead of orphaning it. Labels are trimmed; an
+    empty mapping entry leaves the current label alone.
+    """
+    for grp in groups:
+        label = (display_names.get(grp.name) or "").strip()
+        if not label or grp.display_name == label:
+            continue
+        grp.display_name = label
+        session.add(grp)
+
+
+async def _resolve_sync_groups(
+    session: AsyncSession,
+    wanted_names: List[str],
+    provider: str,
+) -> tuple[Set[int], List[Principal]]:
+    """Resolve the sync's desired group names to owned group principals.
+
+    A name matching an existing GROUP row with a *different* source is
+    refused, not adopted — the IdP claim for it is skipped so the
+    user's other groups still sync. Unknown names are inserted (with
+    a SAVEPOINT guard against concurrent creators); a lost insert race
+    re-reads the winner. Returns the owned groups' ids and rows.
+    """
+    desired_group_ids: Set[int] = set()
+    desired_groups: List[Principal] = []
+    if not wanted_names:
+        return desired_group_ids, desired_groups
+
+    existing = (
+        await session.exec(
+            select(Principal).where(
+                Principal.kind == PrincipalType.GROUP,
+                Principal.deleted_at.is_(None),
+                Principal.name.in_(wanted_names),
+            )
+        )
+    ).all()
+    existing_by_name = {p.name: p for p in existing}
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for name in wanted_names:
+        grp = existing_by_name.get(name)
+        if grp is not None and grp.source != provider:
+            logger.warning(
+                "Skipping group sync for '%s': exists with source "
+                "'%s' but provider is '%s'.",
+                name,
+                grp.source,
+                provider,
+            )
+            continue
+        if grp is None:
+            grp = await _insert_group_or_refetch(session, name, provider, now)
+            if grp is None:
+                continue
+        desired_group_ids.add(grp.id)
+        desired_groups.append(grp)
+    return desired_group_ids, desired_groups
+
+
 async def sync_user_group_memberships(
     session: AsyncSession,
     user_principal_id: int,
-    provider: AuthProviderEnum,
+    provider: str,
     group_names: List[str],
+    display_names: Optional[Dict[str, str]] = None,
 ) -> None:
     """Authoritatively reconcile a user's Group memberships from an IdP.
 
@@ -394,12 +465,22 @@ async def sync_user_group_memberships(
     Group entities themselves are never deleted by this function — a
     Group may have outstanding (Org → Group) bindings the admin
     relies on; lifecycle for Group rows lives on the ``/groups`` admin
-    surface. Provider must be ``OIDC`` or ``SAML``; ``Local`` would
-    be a logic error and is rejected.
+    surface. Provider must not be ``Local`` — that would be a logic
+    error. Callers pass an ``AuthProviderEnum`` value or another
+    source marker (e.g. the attribute-derived-group sync's
+    ``oidc-attrs``); the value is stored verbatim in the free-form
+    ``source`` columns, and each marker only ever owns its own rows.
+
+    ``display_names`` optionally maps a group name to the human
+    readable label the IdP currently reports (the attribute-derived
+    sync passes the raw attribute values; the claim-based sync passes
+    nothing). Rows are refreshed on groups this provider owns, so a
+    renamed department updates the label without re-creating the
+    group.
 
     Caller commits.
     """
-    if provider == AuthProviderEnum.Local:
+    if provider == AuthProviderEnum.Local.value:
         raise InternalServerErrorException(
             message="sync_user_group_memberships is not for Local provider"
         )
@@ -418,36 +499,13 @@ async def sync_user_group_memberships(
 
     # Cross-source name matches are refused, not adopted — the IdP
     # claim is skipped so the user's other groups still sync.
-    desired_group_ids: Set[int] = set()
-    if wanted_names:
-        existing = (
-            await session.exec(
-                select(Principal).where(
-                    Principal.kind == PrincipalType.GROUP,
-                    Principal.deleted_at.is_(None),
-                    Principal.name.in_(wanted_names),
-                )
-            )
-        ).all()
-        existing_by_name = {p.name: p for p in existing}
+    desired_group_ids, desired_groups = await _resolve_sync_groups(
+        session, wanted_names, provider
+    )
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        for name in wanted_names:
-            grp = existing_by_name.get(name)
-            if grp is not None and grp.source != provider:
-                logger.warning(
-                    "Skipping group sync for '%s': exists with source "
-                    "'%s' but provider is '%s'.",
-                    name,
-                    grp.source,
-                    provider,
-                )
-                continue
-            if grp is None:
-                grp = await _insert_group_or_refetch(session, name, provider, now)
-                if grp is None:
-                    continue
-            desired_group_ids.add(grp.id)
+    # Refresh the human-readable labels on groups this provider owns.
+    if display_names:
+        _refresh_display_names(session, desired_groups, display_names)
 
     # Memberships this sync owns: this user's rows with matching
     # provider on both the membership and the parent group. The

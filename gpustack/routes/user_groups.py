@@ -46,7 +46,8 @@ router = APIRouter()
 
 
 class GroupMembershipCreate(BaseModel):
-    user_ids: List[int]
+    user_ids: List[int] = []
+    group_ids: List[int] = []
 
 
 async def _load_group(session, group_id: int) -> Principal:
@@ -249,6 +250,69 @@ async def _resolve_user(session, user_id: int) -> Optional[User]:
     return user
 
 
+async def _resolve_group_member(
+    session, group_principal_id: int
+) -> Optional[Principal]:
+    """Resolve a GROUP principal eligible for nesting.
+
+    Reserved system groups (``system/…``) are membership-implicit and
+    hidden from the Group-CRUD surface — nesting one under a curated
+    group would leak a non-editable row into the member lists, so they
+    are refused here like everywhere else on this surface.
+    """
+    group = await Principal.one_by_id(session, group_principal_id)
+    if (
+        not group
+        or group.deleted_at is not None
+        or group.kind != PrincipalType.GROUP
+        or is_reserved_principal_name(group.name)
+    ):
+        return None
+    return group
+
+
+async def _would_create_cycle(
+    session, parent_principal_id: int, child_principal_id: int
+) -> bool:
+    """True if making ``child`` a member of ``parent`` closes a cycle.
+
+    The new edge puts ``child`` inside ``parent``; it loops only if
+    ``child`` is already an ancestor of ``parent`` — walking up from
+    ``parent`` through active memberships reaches ``child``. The walk
+    bound mirrors the recursive-resolution cap in ``api/tenant.py`` —
+    add-time checks are the primary defense, the cap is belt and
+    suspenders, so a pathologically deep (or corrupt) graph is
+    rejected rather than walked forever.
+    """
+    frontier = {parent_principal_id}
+    visited: set = set()
+    for _ in range(64):
+        if not frontier:
+            return False
+        parents = set(
+            (
+                await session.exec(
+                    select(PrincipalMembership.parent_principal_id)
+                    .join(
+                        Principal,
+                        Principal.id == PrincipalMembership.parent_principal_id,
+                    )
+                    .where(
+                        PrincipalMembership.member_principal_id.in_(frontier),
+                        PrincipalMembership.deleted_at.is_(None),
+                        Principal.kind == PrincipalType.GROUP,
+                        Principal.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+        )
+        if child_principal_id in parents:
+            return True
+        visited |= frontier
+        frontier = parents - visited
+    return True
+
+
 @router.get(
     "/groups/{group_id}/members",
     response_model=List[UserGroupMembershipPublic],
@@ -263,22 +327,135 @@ async def list_group_members(session: SessionDep, ctx: TenantContextDep, group_i
     rows = list((await session.exec(stmt)).all())
     member_ids = {r.member_principal_id for r in rows}
     user_by_principal: dict[int, User] = {}
+    group_by_principal: dict[int, Principal] = {}
     if member_ids:
-        result = await session.exec(select(User).where(User.id.in_(member_ids)))
+        # ``User`` is an alias of ``Principal`` — one table. Without the
+        # kind filter a nested subgroup would come back in this result
+        # and be rendered as a user.
+        result = await session.exec(
+            select(User).where(User.id.in_(member_ids), User.kind == PrincipalType.USER)
+        )
         user_by_principal = {u.id: u for u in result.all()}
+        # Nested subgroups ride the same membership rows; resolve them
+        # so the list can render both member kinds.
+        result = await session.exec(
+            select(Principal).where(
+                Principal.id.in_(member_ids),
+                Principal.kind == PrincipalType.GROUP,
+                Principal.deleted_at.is_(None),
+            )
+        )
+        group_by_principal = {g.id: g for g in result.all()}
     out: List[UserGroupMembershipPublic] = []
     for r in rows:
         u = user_by_principal.get(r.member_principal_id)
-        out.append(
-            UserGroupMembershipPublic(
-                user_id=getattr(u, "id", 0),
-                group_id=group_id,
-                created_at=r.created_at,
-                username=getattr(u, "name", None),
-                full_name=getattr(u, "display_name", None),
+        g = group_by_principal.get(r.member_principal_id)
+        if u is not None:
+            out.append(
+                UserGroupMembershipPublic(
+                    member_principal_id=u.id,
+                    member_kind="user",
+                    user_id=u.id,
+                    group_id=group_id,
+                    created_at=r.created_at,
+                    username=u.name,
+                    full_name=u.display_name,
+                )
             )
-        )
+        elif g is not None:
+            out.append(
+                UserGroupMembershipPublic(
+                    member_principal_id=g.id,
+                    member_kind="group",
+                    user_id=None,
+                    group_id=group_id,
+                    created_at=r.created_at,
+                    username=g.name,
+                    full_name=g.display_name,
+                )
+            )
+        else:
+            # Dangling member (principal hard-deleted out from under
+            # the membership row): keep the row visible so the admin
+            # can remove it, with nothing to render as identity.
+            out.append(
+                UserGroupMembershipPublic(
+                    member_principal_id=r.member_principal_id,
+                    member_kind="user",
+                    user_id=None,
+                    group_id=group_id,
+                    created_at=r.created_at,
+                    username=None,
+                    full_name=None,
+                )
+            )
     return out
+
+
+async def _validate_subgroup_candidates(
+    session,
+    parent_group_id: int,
+    candidates: dict[int, Principal],
+) -> None:
+    """Reject subgroup candidates that cannot nest under the parent.
+
+    Reserved and non-GROUP principals are refused the same way the
+    CRUD surface refuses them; self-nesting would corrupt the DAG the
+    recursive rights resolution walks. Cycle closure is checked
+    separately, after the duplicate pass — an existing edge is a
+    409, not a cycle.
+    """
+    for gid in sorted(candidates):
+        group = candidates[gid]
+        if (
+            group.kind != PrincipalType.GROUP
+            or group.deleted_at is not None
+            or is_reserved_principal_name(group.name)
+        ):
+            raise NotFoundException(message=f"Group(s) not found: {gid}")
+    if parent_group_id in candidates:
+        raise InvalidException(message="A group cannot be nested inside itself")
+
+
+async def _upsert_group_memberships(
+    session,
+    parent_group_id: int,
+    candidates: List[tuple[Principal, str]],
+    existing_by_principal: dict[int, PrincipalMembership],
+) -> List[tuple[str, Principal, PrincipalMembership]]:
+    """Insert or revive one membership row per candidate.
+
+    A soft-deleted row is resurrected so a member removed from the
+    group and re-added keeps a single timeline row (matches the
+    add_org_members handling); a fresh candidate gets a new row.
+    Commits on success; rolls back and raises on any write failure so
+    the request stays all-or-nothing.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    stored: List[tuple[str, Principal, PrincipalMembership]] = []
+    try:
+        for principal, member_kind in candidates:
+            existing = existing_by_principal.get(principal.id)
+            if existing is not None:
+                existing.deleted_at = None
+                existing.updated_at = now
+                session.add(existing)
+                link = existing
+            else:
+                link = PrincipalMembership(
+                    parent_principal_id=parent_group_id,
+                    member_principal_id=principal.id,
+                    role=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(link)
+            stored.append((member_kind, principal, link))
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        raise InvalidException(message=f"Failed to add group members: {e}")
+    return stored
 
 
 @router.post(
@@ -291,33 +468,54 @@ async def add_group_members(
     group_id: int,
     body: GroupMembershipCreate,
 ):
-    """Add one or more users to a group in a single request.
+    """Add users and/or subgroups to a group in a single request.
 
-    All-or-nothing: validate every user up front; if any check fails,
-    raise and write nothing. Otherwise all rows insert in a single
+    All-or-nothing: validate every candidate up front — users must be
+    live USER principals, subgroups live non-reserved GROUP principals
+    whose inclusion would not close a cycle; any failure raises and
+    writes nothing. Otherwise all rows insert (or revive) in a single
     transaction.
     """
     await _load_group(session, group_id)
 
-    if not body.user_ids:
-        raise InvalidException(message="user_ids must not be empty")
-
     user_ids = list(dict.fromkeys(body.user_ids))
+    group_ids = list(dict.fromkeys(body.group_ids))
+    if not user_ids and not group_ids:
+        raise InvalidException(message="user_ids/group_ids must not both be empty")
+    overlap = set(user_ids) & set(group_ids)
+    if overlap:
+        # The id namespaces are shared, so one of the two lookups
+        # below would fail anyway — reject the contradiction directly.
+        raise InvalidException(
+            message=f"Principal(s) listed as both user and group: {sorted(overlap)}"
+        )
 
-    rows = (await session.exec(select(User).where(User.id.in_(user_ids)))).all()
-    users_by_id: dict[int, User] = {
-        u.id: u for u in rows if u.kind == PrincipalType.USER and u.deleted_at is None
-    }
-    missing = [uid for uid in user_ids if uid not in users_by_id]
-    if missing:
-        raise NotFoundException(message=f"User(s) not found: {missing}")
+    users_by_id: dict[int, User] = {}
+    if user_ids:
+        rows = (await session.exec(select(User).where(User.id.in_(user_ids)))).all()
+        users_by_id = {
+            u.id: u
+            for u in rows
+            if u.kind == PrincipalType.USER and u.deleted_at is None
+        }
+        missing = [uid for uid in user_ids if uid not in users_by_id]
+        if missing:
+            raise NotFoundException(message=f"User(s) not found: {missing}")
+
+    groups_by_id: dict[int, Principal] = {}
+    if group_ids:
+        rows = (
+            await session.exec(select(Principal).where(Principal.id.in_(group_ids)))
+        ).all()
+        groups_by_id = {g.id: g for g in rows}
+        await _validate_subgroup_candidates(session, group_id, groups_by_id)
 
     # After identity consolidation, a user's principal id IS user.id.
-    principal_ids = list(users_by_id.keys())
+    principal_ids = list(users_by_id.keys()) + list(groups_by_id.keys())
 
     # Bulk-load existing memberships (including soft-deleted, so we can
     # resurrect them instead of producing duplicate rows). Matches the
-    # add_org_members soft-delete handling so a user removed from a
+    # add_org_members soft-delete handling so a member removed from a
     # group and re-added keeps a single timeline row.
     existing_rows = (
         await session.exec(
@@ -331,71 +529,73 @@ async def add_group_members(
         m.member_principal_id: m for m in existing_rows
     }
     duplicates = [
-        uid
-        for uid in user_ids
-        if (m := existing_by_principal.get(uid)) is not None and m.deleted_at is None
+        pid
+        for pid in principal_ids
+        if (m := existing_by_principal.get(pid)) is not None and m.deleted_at is None
     ]
     if duplicates:
         raise AlreadyExistsException(
-            message=f"User(s) already in group {group_id}: {duplicates}"
+            message=f"Member(s) already in group {group_id}: {duplicates}"
         )
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    stored_pairs: List[tuple[User, PrincipalMembership]] = []
-    try:
-        for uid in user_ids:
-            user = users_by_id[uid]
-            existing = existing_by_principal.get(user.id)
-            if existing is not None:
-                existing.deleted_at = None
-                existing.updated_at = now
-                session.add(existing)
-                stored_pairs.append((user, existing))
-            else:
-                link = PrincipalMembership(
-                    parent_principal_id=group_id,
-                    member_principal_id=user.id,
-                    role=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(link)
-                stored_pairs.append((user, link))
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        raise InvalidException(message=f"Failed to add group members: {e}")
+    # Only now, with duplicates ruled out, can a cycle check be
+    # trusted: the edge being re-added is a 409 above, not a loop.
+    for gid in sorted(groups_by_id):
+        if await _would_create_cycle(session, group_id, gid):
+            raise InvalidException(
+                message=f"Adding group {gid} would create a membership cycle"
+            )
+
+    candidates = [
+        *[(users_by_id[uid], "user") for uid in user_ids],
+        *[(groups_by_id[gid], "group") for gid in group_ids],
+    ]
+    stored = await _upsert_group_memberships(
+        session, group_id, candidates, existing_by_principal
+    )
 
     return [
         UserGroupMembershipPublic(
-            user_id=user.id,
+            member_principal_id=principal.id,
+            member_kind=member_kind,
+            user_id=principal.id if member_kind == "user" else None,
             group_id=group_id,
             created_at=link.created_at,
-            username=user.name,
-            full_name=user.display_name,
+            username=principal.name,
+            full_name=principal.display_name,
         )
-        for user, link in stored_pairs
+        for member_kind, principal, link in stored
     ]
 
 
 @router.delete(
-    "/groups/{group_id}/members/{user_id}",
+    "/groups/{group_id}/members/{member_id}",
     dependencies=[Depends(require_platform_admin)],
 )
 async def remove_group_member(
     session: SessionDep,
     group_id: int,
-    user_id: int,
+    member_id: int,
 ):
+    """Remove a member (user or nested subgroup) from a group.
+
+    The path id is the member principal's id — a user's id (principal
+    id == user id) or a subgroup's principal id. Deleting the
+    membership row for a subgroup immediately cuts its users'
+    transitive membership; the recursive resolution walks only active
+    rows.
+    """
     await _load_group(session, group_id)
 
-    user = await _resolve_user(session, user_id)
-    if not user:
+    member = await _resolve_user(session, member_id)
+    if member is None:
+        member = await _resolve_group_member(session, member_id)
+    if member is None:
         raise NotFoundException(message="Group membership not found")
 
     stmt = select(PrincipalMembership).where(
         PrincipalMembership.parent_principal_id == group_id,
-        PrincipalMembership.member_principal_id == user.id,
+        PrincipalMembership.member_principal_id == member.id,
         PrincipalMembership.deleted_at.is_(None),
     )
     link = (await session.exec(stmt)).first()

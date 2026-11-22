@@ -395,6 +395,16 @@ class Config(WorkerConfig, BaseSettings):
     # an upgraded server.
     external_auth_groups: Optional[str] = None
     external_auth_group_sync: bool = False
+    # Derive Groups from the claims persisted in ``external_attributes``
+    # (see ``external_auth_claims``) on every login: ``title/<title in
+    # lower case>``, ``dept/<department_id>`` (display_name =
+    # department_name) and ``store/<store_name>``. Independent of the
+    # claim-based group sync above — attribute groups own the
+    # ``oidc-attrs`` source, so both mechanisms can run side by side
+    # without touching each other's rows. Titles are lower-cased into
+    # the group name so IdP case variants land in one group; store
+    # names stay verbatim. Disabled by default.
+    external_auth_attribute_groups: bool = False
     oidc_client_id: Optional[str] = None  # oidc client id
     oidc_client_secret: Optional[str] = None  # oidc client secret
     oidc_redirect_uri: Optional[str] = None  # oidc redirect uri
