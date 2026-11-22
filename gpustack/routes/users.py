@@ -4,6 +4,7 @@ from typing import Dict, List
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import func, or_
 from sqlalchemy.orm import aliased
 from sqlmodel import select
 
@@ -36,6 +37,7 @@ from gpustack.schemas.users import (
     UsersPublic,
     UserSelfUpdate,
 )
+from gpustack.schemas.user_groups import UserGroupPublic
 from gpustack.server.passwords import (
     clear_password,
     is_password_change_required,
@@ -88,14 +90,69 @@ class UserMembership(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# The users-page filters keyed by the wire param, each mapped to the
+# group-name prefix of the attribute kind it resolves from.
+_ATTRIBUTE_LABEL_FILTERS = {
+    "business_unit": "store/",
+    "department": "dept/",
+    "profession": "title/",
+}
+
+
+def _attribute_label_member_ids_subquery(prefix: str, label: str):
+    """USER ids holding an attribute-derived group labelled ``label``.
+
+    One kind, exact label match against the group's display_name (the
+    value the IdP reported) or its prefixed name. Scoped to active
+    ``oidc-attrs`` rows: admin-curated groups must not answer these
+    filters, and soft-deleted memberships must not resurrect anyone.
+    """
+    return (
+        select(PrincipalMembership.member_principal_id)
+        .join(
+            Principal,
+            Principal.id == PrincipalMembership.parent_principal_id,
+        )
+        .where(
+            PrincipalMembership.source == AuthProviderEnum.OIDC_ATTRIBUTES.value,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+            Principal.name.like(f"{prefix}%"),
+            or_(
+                Principal.display_name == label,
+                Principal.name == label,
+            ),
+        )
+    )
+
+
 @router.get("", response_model=UsersPublic)
 async def get_users(
     params: UserListParams = Depends(),
     search: str = None,
+    business_unit: str = None,
+    department: str = None,
+    profession: str = None,
 ):
     fuzzy_fields = {}
     if search:
         fuzzy_fields = {"name": search, "display_name": search}
+
+    # Attribute-label filters: each narrows to users holding the
+    # attribute-derived group with that exact label.
+    extra_conditions = []
+    label_values = {
+        "business_unit": business_unit,
+        "department": department,
+        "profession": profession,
+    }
+    for param, value in label_values.items():
+        if value:
+            prefix = _ATTRIBUTE_LABEL_FILTERS[param]
+            extra_conditions.append(
+                User.id.in_(_attribute_label_member_ids_subquery(prefix, value))
+            )
 
     if params.watch:
         return StreamingResponse(
@@ -114,8 +171,162 @@ async def get_users(
                 "deleted_at": None,
             },
             order_by=params.order_by,
+            extra_conditions=extra_conditions or None,
         )
         return await _to_users_public(session, page)
+
+
+class UserAttributeValues(BaseModel):
+    """Distinct attribute-derived labels per kind — the option lists
+    for the users-page filters. Only labels at least one live user
+    actually holds (the join drops emptied groups)."""
+
+    business_unit: List[str] = []
+    department: List[str] = []
+    profession: List[str] = []
+
+
+@router.get("/attribute-values", response_model=UserAttributeValues)
+async def get_user_attribute_values(session: SessionDep):
+    # Declared before ``/{id}`` on purpose: "attribute-values" would
+    # otherwise be captured as an int path param and 422.
+    values = UserAttributeValues()
+    for param, prefix in _ATTRIBUTE_LABEL_FILTERS.items():
+        stmt = (
+            select(func.coalesce(Principal.display_name, Principal.name))
+            .join(
+                PrincipalMembership,
+                PrincipalMembership.parent_principal_id == Principal.id,
+            )
+            .where(
+                Principal.kind == PrincipalType.GROUP,
+                Principal.source == AuthProviderEnum.OIDC_ATTRIBUTES.value,
+                Principal.deleted_at.is_(None),
+                PrincipalMembership.deleted_at.is_(None),
+                Principal.name.like(f"{prefix}%"),
+            )
+            .distinct()
+        )
+        rows = (await session.exec(stmt)).all()
+        setattr(values, param, sorted(row for row in rows if row))
+    return values
+
+
+@router.get("/{id}/groups", response_model=List[UserGroupPublic])
+async def get_user_groups(session: SessionDep, id: int):
+    """Groups the user actively belongs to via admin-curated
+    (``source=Local``) memberships — the surface the user-edit modal
+    manages. IdP-synced memberships (attribute-derived, claim-based)
+    are excluded: they change only in the IdP, and rendering them here
+    would invite edits the sync would undo or refuse."""
+    user = await User.one_by_id(session, id)
+    if not user or user.deleted_at is not None or user.kind != PrincipalType.USER:
+        raise NotFoundException(message="User not found")
+    stmt = (
+        select(Principal)
+        .join(
+            PrincipalMembership,
+            PrincipalMembership.parent_principal_id == Principal.id,
+        )
+        .where(
+            PrincipalMembership.member_principal_id == id,
+            PrincipalMembership.source == AuthProviderEnum.Local.value,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+        )
+    )
+    groups = (await session.exec(stmt)).all()
+    return [UserGroupPublic.from_principal(g) for g in groups]
+
+
+async def _resolve_manageable_groups(
+    session: SessionDep, group_ids: List[int]
+) -> List[Principal]:
+    """Validate the ids as live admin-curated (``source=Local``) groups.
+
+    Raises ``InvalidException`` naming the offenders — attribute-derived
+    and other IdP-synced groups are not admin-manageable, the same rule
+    the members drawer enforces server-side via ``_load_manageable_group``.
+    """
+    desired = list(dict.fromkeys(group_ids))
+    if not desired:
+        return []
+    candidates = (
+        await session.exec(
+            select(Principal).where(
+                Principal.id.in_(desired),
+                Principal.kind == PrincipalType.GROUP,
+                Principal.deleted_at.is_(None),
+                Principal.source == AuthProviderEnum.Local.value,
+            )
+        )
+    ).all()
+    found = {group.id for group in candidates}
+    missing = sorted(gid for gid in desired if gid not in found)
+    if missing:
+        raise InvalidException(
+            message=("Group(s) not found or not admin-managed (Local): " f"{missing}")
+        )
+    return candidates
+
+
+async def _apply_local_group_membership_diff(
+    session: SessionDep, user_id: int, desired_groups: List[Principal]
+) -> None:
+    """Reconcile the user's Local-source group membership rows.
+
+    Added ids revive an existing soft-deleted row (a single timeline
+    per pair, like ``_upsert_group_memberships``) or insert a fresh
+    one; ids absent from the desired set are soft-deleted. Only rows
+    whose parent is a GROUP principal are in scope — Local-source
+    user-in-Org rows share the source marker and must survive an
+    admin's group edit. IdP-synced memberships carry their own source
+    markers and are neither seen nor touched, so the next login's
+    sync can never be clobbered by this diff.
+
+    Writes only; the caller owns the surrounding transaction.
+    """
+    desired_ids = {group.id for group in desired_groups}
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = (
+        await session.exec(
+            select(PrincipalMembership)
+            .join(
+                Principal,
+                Principal.id == PrincipalMembership.parent_principal_id,
+            )
+            .where(
+                PrincipalMembership.member_principal_id == user_id,
+                PrincipalMembership.source == AuthProviderEnum.Local.value,
+                Principal.kind == PrincipalType.GROUP,
+            )
+        )
+    ).all()
+    existing_by_parent = {row.parent_principal_id: row for row in rows}
+
+    for parent_id, row in existing_by_parent.items():
+        if parent_id not in desired_ids and row.deleted_at is None:
+            row.deleted_at = now
+            row.updated_at = now
+            session.add(row)
+
+    for group in desired_groups:
+        row = existing_by_parent.get(group.id)
+        if row is None:
+            session.add(
+                PrincipalMembership(
+                    parent_principal_id=group.id,
+                    member_principal_id=user_id,
+                    role=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        elif row.deleted_at is not None:
+            row.deleted_at = None
+            row.updated_at = now
+            session.add(row)
 
 
 @router.get("/{id}", response_model=UserPublic)
@@ -274,6 +485,12 @@ async def update_user(session: SessionDep, id: int, user_in: UserUpdate):
             message=("Password is required when switching a user's source to Local.")
         )
 
+    # Group memberships are resolved before the write transaction so a
+    # bad id surfaces as a 400 rather than the generic 500 handler.
+    desired_groups: List[Principal] = []
+    if user_in.group_ids is not None:
+        desired_groups = await _resolve_manageable_groups(session, user_in.group_ids)
+
     try:
         # ``exclude_unset=True`` so only the fields the client
         # actually sent get written — a partial PUT that omits e.g.
@@ -297,6 +514,9 @@ async def update_user(session: SessionDep, id: int, user_in: UserUpdate):
         # to a NOT NULL column, and using the client's raw value
         # bypasses the enum check that lives at the schema layer.
         update_data.pop("source", None)
+        # Memberships are handled by the diff below, not as a column
+        # write on the user row.
+        update_data.pop("group_ids", None)
         if is_switching:
             update_data["source"] = new_source
 
@@ -322,6 +542,8 @@ async def update_user(session: SessionDep, id: int, user_in: UserUpdate):
             # Local → SSO: drop the local password so /login can't be
             # used as a parallel ingress that bypasses the IdP.
             await clear_password(session, user.id, auto_commit=False)
+        if user_in.group_ids is not None:
+            await _apply_local_group_membership_diff(session, user.id, desired_groups)
         await session.commit()
         # Cache invalidation runs *after* the commit so a concurrent
         # read during the transaction's window can't refill the entry

@@ -25,6 +25,7 @@ from gpustack.routes import (
     user_groups as user_groups_route,
 )
 from gpustack.schemas.principals import (
+    AuthProviderEnum,
     OrgRole,
     Principal,
     PrincipalMembership,
@@ -529,6 +530,9 @@ async def test_add_group_members_rejects_missing_user(monkeypatch):
         display_name=None,
         name="team-a",
     )
+    # Admin-managed group: the manageability guard must pass so the
+    # test exercises the user-resolution failure it exists for.
+    group.source = AuthProviderEnum.Local.value
     monkeypatch.setattr(
         user_groups_route.Principal,
         "one_by_id",

@@ -7,6 +7,8 @@ in-memory SQLite so the soft-delete and recursion semantics hold
 against actual rows.
 """
 
+from datetime import datetime, timezone
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -23,15 +25,22 @@ from gpustack.routes.user_groups import (
     GroupMembershipCreate,
     _bulk_transitive_member_counts,
     add_group_members,
+    delete_group,
     get_group,
     list_group_members,
     list_groups,
     remove_group_member,
+    update_group,
+)
+from gpustack.routes.users import (
+    _apply_local_group_membership_diff,
+    _resolve_manageable_groups,
 )
 from gpustack.server.services import bulk_user_attribute_labels
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
 from gpustack.schemas.user_groups import (
     UserGroupListParams,
+    UserGroupUpdate,
     resolve_group_type,
 )
 from gpustack.schemas.users import AuthProviderEnum
@@ -82,6 +91,37 @@ async def _active_member_ids(session, group_id: int) -> set:
         )
     ).all()
     return {r.member_principal_id for r in rows}
+
+
+async def _seed_membership(
+    session,
+    parent_id: int,
+    member_id: int,
+    *,
+    deleted_at=None,
+    source: str = AuthProviderEnum.Local.value,
+) -> PrincipalMembership:
+    row = PrincipalMembership(
+        parent_principal_id=parent_id,
+        member_principal_id=member_id,
+        source=source,
+        deleted_at=deleted_at,
+    )
+    session.add(row)
+    await session.commit()
+    return row
+
+
+async def _active_parent_ids_of_user(session, user_id: int) -> set:
+    rows = (
+        await session.exec(
+            PrincipalMembership.__table__.select().where(
+                PrincipalMembership.__table__.c.member_principal_id == user_id,
+                PrincipalMembership.__table__.c.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    return {r.parent_principal_id for r in rows}
 
 
 # ---- add subgroup -----------------------------------------------------------
@@ -550,6 +590,93 @@ async def test_list_rejects_unknown_group_type(session):
     await _seed_group(session, 10, "solo")
     with pytest.raises(InvalidException):
         await list_groups(session, None, UserGroupListParams(), group_type="bogus")
+
+
+# ---- IdP-synced groups are read-only on the admin surface ---------------------
+
+
+@pytest.mark.asyncio
+async def test_member_writes_rejected_for_idp_synced_group(session):
+    await _seed_user(session, 5, "dev@example.com")
+    await _seed_attr_group(session, 20, "title/разработчик")
+
+    with pytest.raises(InvalidException):
+        await add_group_members(session, 20, GroupMembershipCreate(user_ids=[5]))
+    with pytest.raises(InvalidException):
+        await remove_group_member(session, 20, 5)
+
+
+@pytest.mark.asyncio
+async def test_group_row_writes_rejected_for_idp_synced_group(session):
+    await _seed_attr_group(session, 20, "title/разработчик")
+
+    with pytest.raises(InvalidException):
+        await update_group(session, 20, UserGroupUpdate(name="renamed"))
+    with pytest.raises(InvalidException):
+        await delete_group(session, 20)
+
+
+@pytest.mark.asyncio
+async def test_resolve_manageable_groups_rejects_non_local_ids(session):
+    local = await _seed_group(session, 10, "Manual")
+    await _seed_attr_group(session, 20, "title/разработчик")
+
+    # Duplicates collapse; only live Local GROUP principals survive.
+    resolved = await _resolve_manageable_groups(session, [10, 10])
+    assert [g.id for g in resolved] == [local.id]
+
+    # An IdP-synced group is not admin-manageable, same rule the
+    # members drawer enforces.
+    with pytest.raises(InvalidException):
+        await _resolve_manageable_groups(session, [20])
+    with pytest.raises(InvalidException):
+        await _resolve_manageable_groups(session, [99])
+
+
+@pytest.mark.asyncio
+async def test_local_group_membership_diff_adds_and_soft_deletes(session):
+    await _seed_user(session, 100, "jdoe@example.com")
+    keep = await _seed_group(session, 10, "keep")
+    drop = await _seed_group(session, 20, "drop")
+    revive = await _seed_group(session, 30, "revive")
+    # A Local-source user-in-Org row shares the source marker but is
+    # out of scope: the diff only touches rows whose parent is a GROUP.
+    org = Principal(
+        id=40,
+        kind=PrincipalType.ORG,
+        name="retail-org",
+        source=AuthProviderEnum.Local.value,
+    )
+    session.add(org)
+    await session.commit()
+
+    await _seed_membership(session, keep.id, 100)
+    await _seed_membership(session, drop.id, 100)
+    await _seed_membership(
+        session,
+        revive.id,
+        100,
+        deleted_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    await _seed_membership(session, org.id, 100)
+
+    desired = await _resolve_manageable_groups(session, [10, 30])
+    await _apply_local_group_membership_diff(session, 100, desired)
+    await session.commit()
+
+    active = await _active_parent_ids_of_user(session, 100)
+    assert active == {keep.id, revive.id, org.id}
+    # The removal is a soft delete: the timeline row survives.
+    rows = (
+        await session.exec(
+            PrincipalMembership.__table__.select().where(
+                PrincipalMembership.__table__.c.member_principal_id == 100,
+                PrincipalMembership.__table__.c.parent_principal_id == drop.id,
+            )
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].deleted_at is not None
 
 
 # ---- user attribute labels -----------------------------------------------------

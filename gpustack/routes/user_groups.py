@@ -380,6 +380,7 @@ async def create_group(session: SessionDep, body: UserGroupCreate):
 )
 async def update_group(session: SessionDep, group_id: int, body: UserGroupUpdate):
     group = await _load_group(session, group_id)
+    _ensure_admin_manageable(group, what="row")
 
     if body.name != group.name:
         if is_reserved_principal_name(body.name):
@@ -416,6 +417,9 @@ async def update_group(session: SessionDep, group_id: int, body: UserGroupUpdate
 )
 async def delete_group(session: SessionDep, group_id: int):
     group = await _load_group(session, group_id)
+    # The sync would recreate (or re-derive) an IdP-owned group on the
+    # next login, so a delete here is a lie that doesn't stick.
+    _ensure_admin_manageable(group, what="row")
     try:
         await group.delete(session)
     except Exception as e:
@@ -591,6 +595,31 @@ async def list_group_members(session: SessionDep, ctx: TenantContextDep, group_i
     return out
 
 
+def _ensure_admin_manageable(group: Principal, *, what: str) -> None:
+    """Refuse edits to anything the IdP owns.
+
+    Only admin-created (``source=Local``) groups are admin-manageable:
+    attribute-derived and claim-synced groups are the IdP's authority,
+    and a hand-made change would survive the next sync diff (each sync
+    owns only its own source marker) — silently diverging from what
+    the IdP says until someone notices.
+    """
+    if group.source != AuthProviderEnum.Local.value:
+        raise InvalidException(
+            message=(
+                f"Group '{group.name}' is synced from the IdP "
+                f"(KeyCloak); its {what} can only be changed in the IdP."
+            )
+        )
+
+
+async def _load_manageable_group(session, group_id: int) -> Principal:
+    """Load a group whose membership the admin surface may edit."""
+    group = await _load_group(session, group_id)
+    _ensure_admin_manageable(group, what="membership")
+    return group
+
+
 async def _validate_subgroup_candidates(
     session,
     parent_group_id: int,
@@ -675,7 +704,7 @@ async def add_group_members(
     writes nothing. Otherwise all rows insert (or revive) in a single
     transaction.
     """
-    await _load_group(session, group_id)
+    await _load_manageable_group(session, group_id)
 
     user_ids = list(dict.fromkeys(body.user_ids))
     group_ids = list(dict.fromkeys(body.group_ids))
@@ -784,7 +813,7 @@ async def remove_group_member(
     transitive membership; the recursive resolution walks only active
     rows.
     """
-    await _load_group(session, group_id)
+    await _load_manageable_group(session, group_id)
 
     member = await _resolve_user(session, member_id)
     if member is None:

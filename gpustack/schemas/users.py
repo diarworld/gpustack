@@ -201,6 +201,12 @@ class UserCreate(UserBase):
 class UserUpdate(UserBase):
     password: Optional[str] = None
 
+    # Full desired set of admin-curated (``source=Local``) groups the
+    # user belongs to; ``None`` (omitted) leaves memberships untouched.
+    # IdP-synced memberships are not addressable here — see
+    # ``_sync_user_local_groups``.
+    group_ids: Optional[List[int]] = None
+
     # ``update_user`` feeds this straight into ``set_password``, exactly as
     # ``create_user`` does, so it has to carry the same policy: without the
     # validator here an admin could set a password through
