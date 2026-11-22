@@ -261,6 +261,13 @@ COORDINATOR_LEADER_TTL_SECONDS = int(
 COORDINATOR_RENEW_INTERVAL_SECONDS = int(
     os.getenv("GPUSTACK_COORDINATOR_RENEW_INTERVAL_SECONDS", 10)
 )
+# Cap on concurrent Redis connections per server process in distributed mode.
+# When the cap is hit the coordinator's pool waits for a free connection
+# instead of failing the command, so this bounds the Redis-side connection
+# footprint rather than throughput.
+COORDINATOR_REDIS_MAX_CONNECTIONS = int(
+    os.getenv("GPUSTACK_COORDINATOR_REDIS_MAX_CONNECTIONS", 100)
+)
 
 # Worker configuration
 WORKER_HEARTBEAT_INTERVAL = int(

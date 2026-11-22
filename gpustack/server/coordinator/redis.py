@@ -27,6 +27,11 @@ Mode of operation:
   while a subscriber's connection is down are not replayed. That is by
   design: the controllers' resync loops are the durability net, and server
   cache invalidations are bounded by the cache TTL.
+* **One bounded blocking pool** -- every command shares a single
+  ``BlockingConnectionPool`` capped at
+  ``GPUSTACK_COORDINATOR_REDIS_MAX_CONNECTIONS`` connections; a command
+  issued when the cap is hit waits for a free connection instead of failing.
+  The pub/sub listener holds one of those connections.
 """
 
 import asyncio
@@ -36,6 +41,7 @@ import time
 from typing import Any, Optional
 
 import redis.asyncio as redis_asyncio
+from redis.asyncio import BlockingConnectionPool
 
 from gpustack import envs
 from gpustack.server.coordinator.base import Coordinator, Event
@@ -68,6 +74,34 @@ _RECONNECT_DELAY_SECONDS = 1
 # replica that cannot join the bus must refuse startup, not serve with a
 # silently dead event path.
 _LISTENER_READY_TIMEOUT_SECONDS = 5
+
+# How long a command waits for a free pool connection before failing. A
+# PUBLISH round-trip is sub-millisecond on a healthy Redis, so a burst
+# drains far faster than this; the wait only binds when Redis is slow.
+_POOL_ACQUIRE_TIMEOUT_SECONDS = 10
+
+
+def _build_client(url: str) -> "redis_asyncio.Redis":
+    """Build the coordinator's Redis client.
+
+    A blocking pool, not redis-py's default one: ``ConnectionPool`` caps
+    itself at 100 connections and raises ``MaxConnectionsError("Too many
+    connections")`` the moment they are all in use. The startup reconcile
+    burst issues more than 100 concurrent publishes, so the default pool
+    turned every overflow into a dropped cross-instance event plus an ERROR
+    line in the bus. A blocking pool waits out the burst instead, and the
+    cap then bounds the Redis-side connection footprint rather than
+    throughput.
+    """
+    pool = BlockingConnectionPool.from_url(
+        url,
+        max_connections=envs.COORDINATOR_REDIS_MAX_CONNECTIONS,
+        timeout=_POOL_ACQUIRE_TIMEOUT_SECONDS,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    return redis_asyncio.Redis.from_pool(pool)
 
 
 class RedisCoordinator(Coordinator):
@@ -110,12 +144,7 @@ class RedisCoordinator(Coordinator):
                     "not set. Point GPUSTACK_COORDINATOR_REDIS_URL at the "
                     "shared Redis instance."
                 )
-            self._client = redis_asyncio.Redis.from_url(
-                url,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-            )
+            self._client = _build_client(url)
         # Refuse to come up against an unreachable Redis: a replica that
         # cannot coordinate must neither serve nor silently fall back to
         # running the full control plane.

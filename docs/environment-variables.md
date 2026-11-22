@@ -82,6 +82,7 @@ The **Applies to** column indicates where the environment variable should be set
 | `GPUSTACK_COORDINATOR_REDIS_URL`              | URL of the Redis the coordinator uses for leader election and cross-instance events. `redis://` or `rediss://`; credentials allowed (unlike `GPUSTACK_REDIS_URL`, this URL is never materialized into gateway CRs). Required when the mode is `redis`. | (empty)  | Server     |
 | `GPUSTACK_COORDINATOR_LEADER_TTL_SECONDS`     | Leader lease TTL. Also the worst-case control-plane failover time: a deposed or unreachable leader exits the process, and a standby can only take the lease once it expires.                                                           | `30`     | Server     |
 | `GPUSTACK_COORDINATOR_RENEW_INTERVAL_SECONDS` | How often the leader renews its lease.                                                                                                                                                                                                 | `10`     | Server     |
+| `GPUSTACK_COORDINATOR_REDIS_MAX_CONNECTIONS`  | Cap on concurrent Redis connections per server process in `redis` mode. When the cap is hit a command waits for a free connection instead of failing, so this bounds the Redis-side connection footprint rather than throughput.        | `100`    | Server     |
 
 ### Authentication & Security
 

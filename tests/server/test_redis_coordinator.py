@@ -13,8 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 from fakeredis import FakeServer
-from fakeredis.aioredis import FakeRedis
+from fakeredis.aioredis import FakeAsyncRedisConnection, FakeRedis
 from fastapi import FastAPI
+from redis.asyncio import BlockingConnectionPool
 
 from gpustack.extension import Plugin, PluginContext
 from gpustack.server import bus as bus_module
@@ -244,6 +245,56 @@ def _server_stub(config):
     return server
 
 
+def test_client_pool_is_blocking_and_bounded(monkeypatch):
+    """The coordinator's pool must wait for a slot, not fail past the cap.
+
+    redis-py 8.x caps its default pool at 100 connections and raises
+    ``MaxConnectionsError("Too many connections")`` the moment they are all
+    in use; the startup reconcile burst issues more concurrent publishes
+    than that, which dropped cross-instance event delivery on every boot.
+    """
+    from gpustack.server.coordinator import redis as redis_coordinator
+
+    monkeypatch.setattr(redis_coordinator.envs, "COORDINATOR_REDIS_MAX_CONNECTIONS", 7)
+    client = redis_coordinator._build_client("redis://tests.invalid/0")
+    pool = client.connection_pool
+    assert isinstance(pool, BlockingConnectionPool)
+    assert pool.max_connections == 7
+    assert pool.timeout == redis_coordinator._POOL_ACQUIRE_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_publish_waits_for_pool_slot_instead_of_erroring():
+    """A publish issued with the pool exhausted blocks until a slot frees."""
+    redis_server = FakeServer()
+    pool = BlockingConnectionPool(
+        connection_class=FakeAsyncRedisConnection,
+        max_connections=2,
+        timeout=5,
+        decode_responses=True,
+        server=redis_server,
+    )
+    client = FakeRedis(connection_pool=pool, server=redis_server, decode_responses=True)
+    coordinator = RedisCoordinator(_config("first"), client=client)
+    await coordinator.start()
+
+    # The pub/sub listener holds one pool connection; hold the other so the
+    # pool is exhausted. A default (non-blocking) pool would raise
+    # MaxConnectionsError here instead of waiting.
+    held = await pool.get_connection()
+    try:
+        task = asyncio.create_task(
+            coordinator.publish("model", Event(type=EventType.UPDATED, data={"id": 1}))
+        )
+        await asyncio.sleep(0.1)
+        assert not task.done()
+    finally:
+        await pool.release(held)
+
+    await asyncio.wait_for(task, timeout=5)
+    await coordinator.stop()
+
+
 async def _teardown_coordinators():
     bus_module.event_bus.set_coordinator(None)
     cache_module.set_coordinator(None)
@@ -273,8 +324,8 @@ async def test_init_coordinator_defaults_to_local(monkeypatch):
 async def test_init_coordinator_selects_redis_mode(monkeypatch):
     fake_client = FakeRedis(decode_responses=True)
     monkeypatch.setattr(
-        "gpustack.server.coordinator.redis.redis_asyncio.Redis",
-        SimpleNamespace(from_url=lambda *args, **kwargs: fake_client),
+        "gpustack.server.coordinator.redis._build_client",
+        lambda url: fake_client,
     )
     config = SimpleNamespace(
         coordinator_mode="redis",
