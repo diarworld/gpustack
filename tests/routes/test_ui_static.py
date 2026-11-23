@@ -38,8 +38,11 @@ SEARCH_INDEX = b'{"docs": []}\n' * 500
 
 # `hack/install.sh` downloads this, and skips it when UI_DOWNLOAD=false, so a
 # checkout can legitimately lack it. Only the test that builds the real app
-# needs it.
+# needs it. Checked by the bundle's anchor file rather than by the directory:
+# a checkout can carry a half-populated ui/ (a packaged chart under static/)
+# whose css/js trees create_app still refuses to mount.
 UI_DIR = Path(gpustack.__file__).parent / "ui"
+UI_PRESENT = (UI_DIR / "index.html").is_file()
 
 
 @pytest.fixture
@@ -394,7 +397,7 @@ def test_cache_control_for(path, expected):
 
 
 @pytest.mark.skipif(
-    not UI_DIR.is_dir(),
+    not UI_PRESENT,
     reason="UI assets not downloaded; create_app requires gpustack/ui",
 )
 def test_static_mount_is_not_shadowed_by_the_docs_mount(config):

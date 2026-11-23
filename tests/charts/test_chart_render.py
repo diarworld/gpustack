@@ -116,8 +116,11 @@ SERVER_AND_TOKEN = [
 
 
 def render(*args: str) -> list[dict]:
+    # Namespace pinned: without it helm resolves "default" from a kubeconfig
+    # but the pod's own namespace from an in-cluster service account, so the
+    # rendered *.svc URLs would depend on where the suite runs.
     result = subprocess.run(
-        [HELM, "template", "gpustack", CHART, *BASE, *args],
+        [HELM, "template", "gpustack", CHART, "--namespace", "default", *BASE, *args],
         capture_output=True,
         text=True,
         timeout=300,
@@ -130,7 +133,7 @@ def render(*args: str) -> list[dict]:
 def render_error(*args: str) -> str:
     """Stderr of a render expected to be refused."""
     result = subprocess.run(
-        [HELM, "template", "gpustack", CHART, *BASE, *args],
+        [HELM, "template", "gpustack", CHART, "--namespace", "default", *BASE, *args],
         capture_output=True,
         text=True,
         timeout=300,
