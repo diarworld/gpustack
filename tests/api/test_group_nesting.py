@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -58,6 +58,17 @@ from gpustack.schemas.users import AuthProviderEnum, UserCreate
 @pytest_asyncio.fixture
 async def session():
     engine = create_async_engine("sqlite+aiosqlite://")
+
+    # SQLite's built-in lower() folds ASCII only, while the production
+    # dialects fold the full Unicode range (PostgreSQL per locale, MySQL
+    # per collation); override it so search tests exercise the same
+    # case-insensitive matching users see.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _unicode_lower(dbapi_conn, _record):
+        dbapi_conn.create_function(
+            "lower", 1, lambda s: s.lower() if isinstance(s, str) else s
+        )
+
     async with engine.begin() as conn:
         await conn.run_sync(Principal.__table__.create)
         await conn.run_sync(PrincipalMembership.__table__.create)
@@ -555,6 +566,45 @@ async def _seed_attr_group(
     session.add(group)
     await session.commit()
     return group
+
+
+@pytest.mark.asyncio
+async def test_list_search_matches_display_name_and_name(session):
+    # The table renders display_name, whose values share nothing with
+    # the prefixed names — a department is dept/713 internally and a
+    # readable label on screen. The search box must match either field,
+    # exactly like the users list already does; both listing paths
+    # (member_count Python pagination and the SQL sort) agree.
+    await _seed_group(session, 10, "SDLC users")
+    await _seed_attr_group(
+        session,
+        30,
+        "dept/713",
+        "ПК Отдел разработки платформенных сервисов",
+    )
+
+    page = await list_groups(session, None, UserGroupListParams(), search="ПК Отдел")
+    assert [g.name for g in page.items] == ["dept/713"]
+    page = await list_groups(
+        session, None, UserGroupListParams(), search="платформенных"
+    )
+    assert [g.name for g in page.items] == ["dept/713"]
+    # The prefixed name still answers an id-style needle.
+    page = await list_groups(session, None, UserGroupListParams(), search="713")
+    assert [g.name for g in page.items] == ["dept/713"]
+    page = await list_groups(session, None, UserGroupListParams(), search="sdlc")
+    assert [g.name for g in page.items] == ["SDLC users"]
+    page = await list_groups(session, None, UserGroupListParams(), search="нет такой")
+    assert page.items == []
+
+    # The SQL-sorted path (any non-member_count order) matches too.
+    page = await list_groups(
+        session,
+        None,
+        UserGroupListParams(sort_by="name"),
+        search="ПК Отдел",
+    )
+    assert [g.name for g in page.items] == ["dept/713"]
 
 
 @pytest.mark.asyncio

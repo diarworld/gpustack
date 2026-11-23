@@ -282,7 +282,13 @@ async def list_groups(
     UI's Type column filter. Unknown tokens are rejected rather than
     matching nothing, so a stale UI can't silently blank the list.
     """
-    fuzzy_fields = {"name": search} if search else {}
+    # Search matches what the admin sees as well as how the row is
+    # keyed: the table renders ``display_name`` (the pretty IdP label),
+    # which shares nothing with the prefixed names the attribute keying
+    # requires — a department is ``dept/713`` internally and «ПК Отдел
+    # …» on screen. OR-ed here, mirroring the users list, which already
+    # searches both fields.
+    fuzzy_fields = {"name": search, "display_name": search} if search else {}
     extra_conditions = []
     if not include_reserved:
         extra_conditions.append(
