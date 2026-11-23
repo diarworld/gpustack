@@ -55,6 +55,7 @@ def test_hub_auth_errors_report_restricted_access(monkeypatch, status):
         )
 
 
+@pytest.mark.network
 def test_get_hub_model_weight_size():
     model_to_weight_sizes = [
         (
@@ -154,9 +155,10 @@ def test_get_hub_model_weight_size():
 
     for model, expected_weight_size in model_to_weight_sizes:
         computed = get_hub_model_weight_size_with_retry(model)
-        assert (
-            computed == expected_weight_size
-        ), f"weight_size mismatch for {model}, computed: {computed}, expected: {expected_weight_size}"
+        assert computed == expected_weight_size, (
+            f"weight_size mismatch for {model}, "
+            f"computed: {computed}, expected: {expected_weight_size}"
+        )
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
@@ -164,6 +166,7 @@ def get_hub_model_weight_size_with_retry(model: Model) -> int:
     return get_model_weight_size(model)
 
 
+@pytest.mark.network
 def test_get_hf_min_gguf_file():
     model_to_gguf_file_path = [
         (
@@ -190,11 +193,13 @@ def test_get_hf_min_gguf_file():
 
     for model, expected_file_path in model_to_gguf_file_path:
         got = get_hugging_face_model_min_gguf_path(model)
-        assert (
-            got == expected_file_path
-        ), f"min GGUF file path mismatch for huggingface model {model}, got: {got}, expected: {expected_file_path}"
+        assert got == expected_file_path, (
+            f"min GGUF file path mismatch for huggingface model {model}, "
+            f"got: {got}, expected: {expected_file_path}"
+        )
 
 
+@pytest.mark.network
 def test_get_ms_min_gguf_file():
     model_to_gguf_file_path = [
         (
@@ -221,9 +226,10 @@ def test_get_ms_min_gguf_file():
 
     for model, expected_file_path in model_to_gguf_file_path:
         got = get_model_scope_model_min_gguf_path(model)
-        assert (
-            got == expected_file_path
-        ), f"min GGUF file path mismatch for modelscope model {model}, got: {got}, expected: {expected_file_path}"
+        assert got == expected_file_path, (
+            f"min GGUF file path mismatch for modelscope model {model}, "
+            f"got: {got}, expected: {expected_file_path}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -247,11 +253,13 @@ def test_get_ms_min_gguf_file():
         ),
     ],
 )
+@pytest.mark.network
 def test_read_repo_file_content(m, file, token, predicate):
     config_dict = read_repo_file_content(m, file, token)
     assert predicate(config_dict)
 
 
+@pytest.mark.network
 def test_match_files_with_mmproj_at_root():
     repo_id = "unsloth/Qwen3.5-4B-GGUF"
 
@@ -295,6 +303,7 @@ def test_modelscope_match_requires_main_file_before_mmproj(monkeypatch):
     )
 
 
+@pytest.mark.network
 def test_match_file_paths_in_subdir_and_mmproj_at_root():
     repo_id = "unsloth/Qwen3.5-397B-A17B-GGUF"
 

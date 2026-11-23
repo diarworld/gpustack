@@ -668,6 +668,7 @@ async def test_select_candidates_2x_64gx4_2x_64gx2(config, m, expected):
         ),
     ],
 )
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_select_candidates_3x_64gx2(config, m, expected):
     def adjust_memory(worker):
@@ -1225,6 +1226,7 @@ async def test_select_candidates_3x_64gx2(config, m, expected):
         ),
     ],
 )
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_select_candidates_3x_64gx8(config, m, expected):
     def adjust_memory(worker):
@@ -1986,16 +1988,14 @@ async def test_select_candidates_2x_64gx4_2x_64gx2_check_msg(
                     gpus_per_replica=8,
                 ),
             ),
-            [
-                """- The model requires approximately 156.24 GiB VRAM and 0.5 GiB RAM.
+            ["""- The model requires approximately 156.24 GiB VRAM and 0.5 GiB RAM.
 - With --npu-memory-fraction=0.9, all GPUs combined need to provide at least 173.60 GiB of total VRAM and each GPU needs 90% of allocatable VRAM.
 - Manual GPU selection resulted in resource overcommit.
 - Selected GPUs have 307.20 GiB allocatable VRAM, 0/8 of GPUs meet the VRAM utilization ratio, providing 276.48 GiB of allocatable VRAM.
 - Worker ascend_0 requires 0.5 GiB of RAM, but only 0.0 GiB is allocatable.
 - Worker ascend_1 requires 0.5 GiB of RAM, but only 0.0 GiB is allocatable.
 - Worker ascend_2 requires 0.5 GiB of RAM, but only 0.0 GiB is allocatable.
-- Worker ascend_3 requires 0.5 GiB of RAM, but only 0.0 GiB is allocatable."""
-            ],
+- Worker ascend_3 requires 0.5 GiB of RAM, but only 0.0 GiB is allocatable."""],
         ),
         (
             1,
