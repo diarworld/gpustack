@@ -331,9 +331,12 @@ class PrincipalBase(SQLModel):
     # absent from the map inherit the deployment concurrency default (the
     # editable ``gateway_rate_limit_settings`` row). Bounds mirror what the
     # plugin's ConcurrencySpec accepts, so the reconciler's rendered combo
-    # can never be refused by the gateway's config parse.
+    # can never be refused by the gateway's config parse. ``none_as_null``
+    # keeps an absent map SQL NULL: SQLAlchemy's JSON type would
+    # otherwise bind plain None as the JSON 'null' scalar, and
+    # ``IS NULL`` filters would miss those rows.
     model_concurrency_limits: Optional[Dict[str, int]] = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
+        default=None, sa_column=Column(JSON(none_as_null=True), nullable=True)
     )
 
     # Claims captured from the SSO IdP at login (``external_auth_claims``
@@ -342,9 +345,9 @@ class PrincipalBase(SQLModel):
     # the IdP is authoritative, so hand edits here survive only until the
     # next sign-in. NULL for Local users and for deployments that capture
     # no claims. JSON so quota automation can read the payload without a
-    # join table.
+    # join table. ``none_as_null`` for the same IS-NULL reason as above.
     external_attributes: Optional[Dict[str, Any]] = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
+        default=None, sa_column=Column(JSON(none_as_null=True), nullable=True)
     )
 
     @field_validator("model_concurrency_limits")

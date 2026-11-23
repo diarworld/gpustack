@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -943,3 +944,49 @@ async def test_create_local_user_stores_attributes_without_sync(session, monkeyp
     assert result.external_attributes == {"title": "Оператор"}
     memberships = (await session.exec(select(PrincipalMembership))).all()
     assert memberships == []
+
+
+@pytest.mark.asyncio
+async def test_create_outstaff_user_joins_outstaff_group(session, monkeypatch):
+    # _ext accounts carry no claims; the marker maps onto the shared
+    # outstaff store group instead of the unknown-users parking — the
+    # same derivation the SSO callback runs at their first login.
+    _patch_attr_groups_flag(monkeypatch, True)
+    result = await create_user(
+        session,
+        UserCreate(
+            username="i.ivanov_ext@lemanapro.ru",
+            source=AuthProviderEnum.OIDC.value,
+        ),
+    )
+    groups = (
+        await session.exec(
+            select(Principal).where(
+                Principal.kind == PrincipalType.GROUP,
+                Principal.source == "oidc-attrs",
+            )
+        )
+    ).all()
+    assert [g.name for g in groups] == ["store/outstaff"]
+    assert groups[0].display_name == "outstaff"
+    assert await _active_member_ids(session, groups[0].id) == {result.id}
+
+
+@pytest.mark.asyncio
+async def test_create_user_without_optional_maps_stores_sql_null(session):
+    # An absent map must bind as SQL NULL, not the JSON 'null' scalar:
+    # IS NULL predicates rely on the storage shape, and the raw column
+    # text must not be the four-character string 'null'.
+    result = await create_user(
+        session,
+        UserCreate(username="bare", source=AuthProviderEnum.OIDC.value),
+    )
+    rows = (
+        await session.exec(
+            text(
+                'select external_attributes, model_concurrency_limits '
+                f'from principals where id = {result.id}'
+            )
+        )
+    ).all()
+    assert tuple(rows[0]) == (None, None)

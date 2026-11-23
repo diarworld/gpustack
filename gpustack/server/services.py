@@ -563,6 +563,26 @@ async def sync_user_group_memberships(
 UNKNOWN_USERS_GROUP_NAME = "unknown/users"
 UNKNOWN_USERS_GROUP_DISPLAY_NAME = "Unknown Users"
 
+# Outstaff accounts are provisioned outside the IdP as ``*_ext``
+# addresses and carry no claims of their own; the marker maps onto the
+# shared outstaff "store" so the attribute-derived bookkeeping has one
+# row to key on.
+OUTSTAFF_STORE_NAME = "outstaff"
+
+
+def _is_outstaff_account(name: Optional[str]) -> bool:
+    """True for ``*_ext`` accounts (``i.ivanov_ext@lemanapro.ru``).
+
+    The marker rides the e-mail's local part and is matched
+    case-insensitively, like the address itself; a bare username
+    ending in ``_ext`` qualifies too, and a domain that merely
+    contains ``ext`` does not.
+    """
+    if not name:
+        return False
+    local_part = name.split('@', 1)[0]
+    return local_part.lower().endswith('_ext')
+
 
 def _attribute_group_names(
     attributes: Dict[str, Any],
@@ -626,9 +646,22 @@ def _attribute_group_names_for_user(user) -> tuple[List[str], Dict[str, str]]:
     other sources stay out: a Local account is refused at the SSO
     callback (source mismatch is a security check), so its attributes
     can never arrive and ``unknown`` would be a lie that never heals.
+
+    ``*_ext`` (outstaff) accounts are the other no-claims shape: their
+    marker stands in for the store attribute, so they land in the
+    shared ``store/outstaff`` group instead of the parking lot. The
+    injection happens here — not on the stored attributes — so the
+    IdP stays authoritative over real claims and every caller of this
+    helper (SSO callback, user creation) derives the same membership.
+    A store claim wins if the IdP ever starts sending one.
     """
-    names, display_names = _attribute_group_names(user.external_attributes or {})
-    if not names and (user.source or "") == AuthProviderEnum.OIDC.value:
+    attributes = dict(user.external_attributes or {})
+    if _is_outstaff_account(getattr(user, 'name', None)) and not attributes.get(
+        'store_name'
+    ):
+        attributes['store_name'] = OUTSTAFF_STORE_NAME
+    names, display_names = _attribute_group_names(attributes)
+    if not names and (user.source or '') == AuthProviderEnum.OIDC.value:
         names = [UNKNOWN_USERS_GROUP_NAME]
         display_names = {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME}
     return names, display_names

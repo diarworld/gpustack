@@ -82,8 +82,10 @@ def test_names_whitespace_only_value_is_skipped():
 # ---- user-aware wrapper: the unknown/users parking ---------------------------
 
 
-def _user(source: str, external_attributes=None):
-    return SimpleNamespace(id=1, source=source, external_attributes=external_attributes)
+def _user(source: str, external_attributes=None, name: str | None = None):
+    return SimpleNamespace(
+        id=1, source=source, external_attributes=external_attributes, name=name
+    )
 
 
 def test_unknown_parking_applies_to_oidc_accounts_only():
@@ -112,6 +114,58 @@ def test_names_dept_without_name_falls_back_to_id():
     names, display = _attribute_group_names({"department_id": "713"})
     assert names == ["dept/713"]
     assert display == {"dept/713": "713"}
+
+
+# ---- outstaff (_ext) marker -------------------------------------------------
+
+
+def test_outstaff_marker_maps_to_store_group():
+    # _ext accounts carry no claims; the marker stands in for the store
+    # attribute, so they land in the shared outstaff group instead of
+    # the unknown-users parking.
+    names, display = _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, name="i.ivanov_ext@lemanapro.ru")
+    )
+    assert names == ["store/outstaff"]
+    assert display == {"store/outstaff": "outstaff"}
+    assert UNKNOWN_USERS_GROUP_NAME not in names
+
+
+def test_outstaff_marker_is_case_insensitive_and_local_part_scoped():
+    # E-mail casing must not hide the marker, and a domain that merely
+    # contains 'ext' is not the marker — the local part decides.
+    assert _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, name="I.Ivanov_EXT@LemanaPro.ru")
+    )[0] == ["store/outstaff"]
+    assert _attribute_group_names_for_user(
+        _user(AuthProviderEnum.OIDC.value, name="i.ivanov@ext.lemanapro.ru")
+    ) == ([UNKNOWN_USERS_GROUP_NAME], {UNKNOWN_USERS_GROUP_NAME: "Unknown Users"})
+
+
+def test_outstaff_marker_rides_alongside_real_claims():
+    # An _ext account whose claims carry a title gets both the title
+    # group and the outstaff store.
+    names, _ = _attribute_group_names_for_user(
+        _user(
+            AuthProviderEnum.OIDC.value,
+            {"title": "Директор направления"},
+            name="a.solonnikov_ext@lemanapro.ru",
+        )
+    )
+    assert names == ["title/директор направления", "store/outstaff"]
+
+
+def test_outstaff_yields_to_real_store_claim():
+    # The IdP stays authoritative: a real store_name wins over the
+    # injected outstaff marker.
+    names, _ = _attribute_group_names_for_user(
+        _user(
+            AuthProviderEnum.OIDC.value,
+            {"store_name": "Магазин 7"},
+            name="i.ivanov_ext@lemanapro.ru",
+        )
+    )
+    assert names == ["store/Магазин 7"]
 
 
 # ---- sync wrapper ----------------------------------------------------------
