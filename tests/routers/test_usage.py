@@ -191,6 +191,65 @@ async def test_get_usage_meta_returns_identity_filters_for_admin():
 
 
 @pytest.mark.asyncio
+async def test_get_usage_meta_include_all_users_adds_idle_accounts():
+    # The usage-derived options cover only accounts with usage rows; the
+    # Limits picker pins users to manage limits, so include_all_users unions
+    # the live directory — a provisioned service account that never called
+    # has no model_usages row to be derived from.
+    session = MagicMock()
+    session.exec = AsyncMock(
+        side_effect=[
+            # user options (scope=all) + existence + display-name lookup.
+            _mock_exec_result(
+                [SimpleNamespace(group_user_name="alice", group_user_id=12)]
+            ),
+            _mock_exec_result([12]),
+            _mock_exec_result([SimpleNamespace(id=12, display_name="Alice Smith")]),
+            # live users: 12 already covered by its usage snapshot, 5892 idle.
+            _mock_exec_result(
+                [
+                    SimpleNamespace(
+                        id=12,
+                        name="alice@lemanapro.ru",
+                        display_name="Alice Smith",
+                    ),
+                    SimpleNamespace(
+                        id=5892,
+                        name="dpc-service@lemanapro.ru",
+                        display_name="DPC Notifier DPC Notifier",
+                    ),
+                ]
+            ),
+            # api_key options + existence.
+            _mock_exec_result([]),
+            # route options (empty → no existence query follows).
+            _mock_exec_result([]),
+            # user-group + organization options (platform-wide admin).
+            _mock_exec_result([]),
+            _mock_exec_result([]),
+        ]
+    )
+    user = User(id=1, name="admin", is_admin=True)
+
+    response = await get_usage_meta(
+        session=session, user=user, ctx=_ctx_for(user), include_all_users=True
+    )
+
+    # The idle account rides along in label order after the usage-derived
+    # options; the user with usage keeps its snapshot option untouched.
+    assert [u.label for u in response.filters.users] == [
+        "alice",
+        "dpc-service@lemanapro.ru",
+    ]
+    idle = response.filters.users[1]
+    assert idle.identity.current.user_id == 5892
+    assert idle.identity.value.user_name == "dpc-service@lemanapro.ru"
+    assert idle.display_name == "DPC Notifier DPC Notifier"
+    assert idle.deleted is False
+    assert response.filters.users[0].display_name == "Alice Smith"
+
+
+@pytest.mark.asyncio
 async def test_get_usage_meta_hides_admin_only_options_for_regular_user():
     session = MagicMock()
     session.exec = AsyncMock(
@@ -215,7 +274,11 @@ async def test_get_usage_meta_hides_admin_only_options_for_regular_user():
     )
     user = User(id=2, name="alice", is_admin=False)
 
-    response = await get_usage_meta(session=session, user=user, ctx=_ctx_for(user))
+    # include_all_users is a no-op in self scope: the user dimension is
+    # admin-only and never populated here.
+    response = await get_usage_meta(
+        session=session, user=user, ctx=_ctx_for(user), include_all_users=True
+    )
 
     assert [item.key for item in response.group_bys] == [
         "date",

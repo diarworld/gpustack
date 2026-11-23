@@ -535,6 +535,48 @@ async def _principal_display_names(session, ids) -> Dict[int, str]:
     return names
 
 
+async def _with_live_users(
+    session, options: List[UsageFilterOption]
+) -> List[UsageFilterOption]:
+    """Union the live USER principals into the user filter options.
+
+    Usage-derived options cover only accounts that already have usage rows.
+    Callers that pin a user to manage their limits (the Usage Limits tab)
+    need the whole directory: a provisioned service account that never
+    called has no model_usages row to be derived from. Users already
+    present (by id) keep their snapshot option; the rest are appended in
+    label order with the live login as the snapshot value."""
+    present = {
+        option.identity.current.user_id
+        for option in options
+        if option.identity.current is not None
+    }
+    users = await _get_rows(
+        session,
+        select(Principal).where(
+            Principal.kind == PrincipalType.USER,
+            Principal.deleted_at.is_(None),
+        ),
+    )
+    extras: List[UsageFilterOption] = []
+    for u in users:
+        if u.id in present:
+            continue
+        extras.append(
+            UsageFilterOption(
+                identity=UsageIdentity(
+                    value=UsageIdentityValue(user_name=u.name),
+                    current=UsageIdentityCurrent(user_id=u.id),
+                ),
+                label=format_usage_user_label(u.name),
+                deleted=False,
+                display_name=(u.display_name or "").strip() or None,
+            )
+        )
+    extras.sort(key=lambda option: option.label)
+    return options + extras
+
+
 async def _group_member_user_ids(session, group_ids) -> set:
     """Direct USER members of the given GROUP principals.
 
@@ -900,6 +942,7 @@ async def get_usage_meta(  # noqa: C901
     user: CurrentUserDep,
     ctx: TenantContextDep,
     scope: str = USAGE_SCOPE_ALL,
+    include_all_users: bool = False,
 ):
     # Default scope is "all"; downgrades to "self" for non-managers so
     # the page works without an explicit scope param.
@@ -927,6 +970,11 @@ async def get_usage_meta(  # noqa: C901
         user_options = await _get_filter_options(
             session, base_statement=base_statement, group_by=USAGE_GROUP_BY_USER
         )
+        if include_all_users:
+            # The usage-derived options only cover accounts with usage rows;
+            # a picker that pins a user to manage their limits must also
+            # offer the idle ones.
+            user_options = await _with_live_users(session, user_options)
     api_key_options = await _get_filter_options(
         session, base_statement=base_statement, group_by=USAGE_GROUP_BY_API_KEY
     )
