@@ -64,6 +64,9 @@ async def test_get_usage_meta_returns_identity_filters_for_admin():
             ),
             # _existing_principal_ids: user 12 still exists (13 would be gone).
             _mock_exec_result([12]),
+            # user display-name lookup: the picker search matches the live
+            # human-readable name too.
+            _mock_exec_result([SimpleNamespace(id=12, display_name="Alice Smith")]),
             _mock_exec_result(
                 [
                     SimpleNamespace(
@@ -156,6 +159,10 @@ async def test_get_usage_meta_returns_identity_filters_for_admin():
     # user 12 still exists → not deleted; the NULL-id legacy row is deleted.
     assert response.filters.users[0].label == "alice"
     assert response.filters.users[0].deleted is False
+    # The live display name rides along for the client-side search; the
+    # NULL-id legacy row has no principal to resolve it from.
+    assert response.filters.users[0].display_name == "Alice Smith"
+    assert response.filters.users[1].display_name is None
     # Label is the pure name; deletion is carried by the ``deleted`` flag.
     assert response.filters.users[1].label == "alice"
     assert response.filters.users[1].deleted is True
@@ -176,10 +183,9 @@ async def test_get_usage_meta_returns_identity_filters_for_admin():
     assert response.filters.routes[2].deleted is False
     assert [item.key for item in response.granularities] == ["day", "week", "month"]
 
-    # exec order: user options / user existence / api_key options / ...
-    # call_args_list[1] is the user-existence lookup, so the api_key options
-    # query is at index 2.
-    api_key_statement = str(session.exec.call_args_list[2].args[0])
+    # exec order: user options / user existence / user display names /
+    # api_key options / ... call_args_list[3] is the api_key options query.
+    api_key_statement = str(session.exec.call_args_list[3].args[0])
     assert "api_key_name IS NOT NULL" in api_key_statement
     assert "access_key IS NOT NULL" in api_key_statement
 
@@ -230,11 +236,12 @@ async def test_get_usage_meta_hides_org_and_group_for_admin_pinned_to_org():
     session = MagicMock()
     session.exec = AsyncMock(
         side_effect=[
-            # user options (scope=all) + existence.
+            # user options (scope=all) + existence + display-name lookup.
             _mock_exec_result(
                 [SimpleNamespace(group_user_name="alice", group_user_id=12)]
             ),
             _mock_exec_result([12]),
+            _mock_exec_result([SimpleNamespace(id=12, display_name="Alice Smith")]),
             # api_key options + existence.
             _mock_exec_result(
                 [

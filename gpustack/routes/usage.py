@@ -514,6 +514,27 @@ async def _organization_info_by_id(session, ids) -> Dict[int, tuple]:
     }
 
 
+async def _principal_display_names(session, ids) -> Dict[int, str]:
+    """Map principal id → live ``display_name`` for user filter options.
+
+    The usage snapshot carries only ``user_name`` (the login), so a picker
+    that searches the human-readable name needs the live principals row.
+    Existence is by raw id (no soft-delete filter), matching the FK-less
+    attribution contract on model_usages — a deleted user keeps its display
+    name here, and its ``(Deleted)`` marker rides the ``deleted`` flag."""
+    names: Dict[int, str] = {}
+    for chunk in _id_chunks(ids):
+        rows = await _get_rows(
+            session,
+            select(Principal.id, Principal.display_name).where(Principal.id.in_(chunk)),
+        )
+        for row in rows:
+            name = (getattr(row, "display_name", None) or "").strip()
+            if name:
+                names[row.id] = name
+    return names
+
+
 async def _group_member_user_ids(session, group_ids) -> set:
     """Direct USER members of the given GROUP principals.
 
@@ -779,15 +800,22 @@ async def _get_filter_options(
     # Resolve which referenced entities still exist so gone ones are tagged
     # ``(Deleted)`` — every id is FK-less now, so it no longer nulls out on
     # delete. ``None`` for dimensions with no backing entity.
-    existing_ids = await _existing_ids_for_dimension(
-        session,
-        group_by,
-        [_identity_entity_id(group_by, idt) for idt in identities],
-    )
-    return [
+    ids = [_identity_entity_id(group_by, idt) for idt in identities]
+    existing_ids = await _existing_ids_for_dimension(session, group_by, ids)
+    options = [
         _option_from_identity(group_by, identity, existing_ids)
         for identity in identities
     ]
+    if group_by == USAGE_GROUP_BY_USER:
+        # User options also carry the live display name so the client-side
+        # search matches the human-readable name, not just the login the
+        # snapshot stored.
+        display_names = await _principal_display_names(session, ids)
+        for option in options:
+            option.display_name = display_names.get(
+                _identity_entity_id(group_by, option.identity)
+            )
+    return options
 
 
 async def _get_organization_filter_options(

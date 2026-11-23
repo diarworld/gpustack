@@ -122,6 +122,10 @@ class UsageFilterItem(BaseModel):
 class UsageFilterOption(UsageFilterItem):
     label: str
     deleted: bool
+    # Live principal ``display_name``, USER filter options only (admin "All"
+    # view). The label stays the snapshotted login ``user_name``; this extra
+    # carries the human-readable name so client-side search can match it too.
+    display_name: Optional[str] = None
 
 
 class UsageFilters(BaseModel):
