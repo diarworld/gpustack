@@ -241,6 +241,7 @@ async def _resolve_or_provision_external_user(
     display_name: str = "",
     avatar_url: Optional[str] = None,
     is_active: bool = True,
+    refresh_display_name: Optional[str] = None,
 ):
     """Resolve an SSO-callback user, provisioning a new principal row
     when the username is new.
@@ -251,9 +252,21 @@ async def _resolve_or_provision_external_user(
     browser-friendly redirect. The three callbacks share this helper
     so the resolve-or-create idiom (and the source-mismatch check
     inside it) stays identical across providers.
+
+    ``refresh_display_name`` carries the raw claim-derived full name
+    and re-points an existing user's ``display_name`` at it whenever it
+    changed, so the IdP stays authoritative across logins (same
+    contract as ``external_attributes``). It is deliberately separate
+    from ``display_name`` — the latter falls back to the username for
+    fresh provisioning, and that fallback must never overwrite an
+    existing name when the claims came back empty.
     """
     user = await _resolve_external_user(session, username, expected_source)
     if user is not None:
+        if refresh_display_name and user.display_name != refresh_display_name:
+            user.display_name = refresh_display_name
+            session.add(user)
+            await session.commit()
         return user
     user_info = User(
         kind=PrincipalType.USER,
@@ -616,7 +629,7 @@ async def saml_callback(request: Request, session: SessionDep):
         )
     elif config.external_auth_full_name:
         # external_auth_full_name is set with concat symbol '+'.
-        full_name = ' '.join(
+        full_name = _join_claims(
             [
                 get_saml_attributes(config, attributes, v.strip())
                 for v in config.external_auth_full_name.split('+')
@@ -643,6 +656,7 @@ async def saml_callback(request: Request, session: SessionDep):
         display_name=full_name or username,
         avatar_url=avatar_url,
         is_active=not config.external_auth_default_inactive,
+        refresh_display_name=full_name or None,
     )
 
     await _sync_saml_groups_if_enabled(session, user, attributes, config)
@@ -706,6 +720,19 @@ def get_saml_attributes(
         if key in attributes:
             return attributes[key]
     return None
+
+
+def _join_claims(parts: List[Optional[str]]) -> str:
+    """Join '+'-composed claim values into a display string, skipping
+    missing or blank ones.
+
+    A claim the IdP didn't send comes back as ``None`` (or empty), and
+    concatenating it verbatim would either crash the join or litter the
+    display name with stray separators. An entirely empty result means
+    "no name claims arrived" — callers fall back to the username for
+    provisioning and skip the display-name refresh.
+    """
+    return " ".join(str(p).strip() for p in parts if p is not None and str(p).strip())
 
 
 def _group_sync_enabled(config: Config) -> bool:
@@ -984,7 +1011,7 @@ async def oidc_callback(request: Request, session: SessionDep):
             ):
                 full_name = user_data.get(config.external_auth_full_name)
             elif config.external_auth_full_name:
-                full_name = ' '.join(
+                full_name = _join_claims(
                     [
                         user_data.get(v.strip())
                         for v in config.external_auth_full_name.split('+')
@@ -1007,6 +1034,7 @@ async def oidc_callback(request: Request, session: SessionDep):
         display_name=full_name or username,
         avatar_url=avatar_url,
         is_active=not config.external_auth_default_inactive,
+        refresh_display_name=full_name or None,
     )
 
     await _sync_oidc_groups_if_enabled(session, user, user_data, config)
@@ -1271,6 +1299,7 @@ async def cas_callback(request: Request, session: SessionDep):
         display_name=full_name or username,
         avatar_url=avatar_url,
         is_active=not config.external_auth_default_inactive,
+        refresh_display_name=full_name or None,
     )
 
     jwt_manager: JWTManager = request.app.state.jwt_manager

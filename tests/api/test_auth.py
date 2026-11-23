@@ -1280,7 +1280,15 @@ async def test_oidc_callback_uses_system_trust_store(monkeypatch):
     from gpustack.schemas.users import AuthProviderEnum
 
     existing_oidc_user = type(
-        "User", (), {"is_active": True, "source": AuthProviderEnum.OIDC}
+        "User",
+        (),
+        {
+            "is_active": True,
+            "source": AuthProviderEnum.OIDC,
+            # Matches the claim-derived full name so the display-name
+            # refresh takes the no-write path.
+            "display_name": "Test User",
+        },
     )()
     monkeypatch.setattr(
         "gpustack.routes.auth.User.first_by_fields",
@@ -1293,6 +1301,157 @@ async def test_oidc_callback_uses_system_trust_store(monkeypatch):
     assert captured["trust_env"] is False
     assert captured["timeout"] is not None
     assert isinstance(captured["verify"], ssl.SSLContext)
+
+
+@pytest.mark.parametrize(
+    "parts,expected",
+    [
+        (["iivanov", "Иван", "Иванов"], "iivanov Иван Иванов"),
+        (["iivanov", None, "Иванов"], "iivanov Иванов"),
+        ([None, "Иван", "Иванов"], "Иван Иванов"),
+        (["  iivanov  ", " ", ""], "iivanov"),
+        ([None, "", None], ""),
+        ([], ""),
+    ],
+)
+def test_join_claims_skips_missing_and_blank(parts, expected):
+    # A claim the IdP didn't send (None) or a blank value must neither
+    # crash the '+'-composition nor leave stray separators behind; an
+    # all-empty set composes to "" so callers fall back safely.
+    assert auth_route._join_claims(parts) == expected
+
+
+@pytest.mark.asyncio
+async def test_oidc_callback_provisions_composed_display_name(monkeypatch):
+    """A fresh SSO user gets display_name composed from the '+'-joined
+    claims (LDAP login + given + family) so client-side search matches
+    every identity field; the shadowed 'name' claim is never read."""
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, data=None):
+            return type(
+                "Resp",
+                (),
+                {
+                    "status_code": 200,
+                    "text": '{"access_token":"token","id_token":"id"}',
+                },
+            )()
+
+    request = type("Request", (), {})()
+    request.app = type("App", (), {})()
+    request.app.state = type("State", (), {})()
+    request.app.state.server_config = type(
+        "Config",
+        (),
+        {
+            "oidc_client_id": "client-id",
+            "oidc_client_secret": "client-secret",
+            "oidc_redirect_uri": "https://gpustack.example.com/auth/oidc/callback",
+            "openid_configuration": {
+                "token_endpoint": "https://issuer.example.com/token"
+            },
+            "external_auth_name": "email",
+            "external_auth_full_name": "preferred_username+given_name+family_name",
+            "external_auth_avatar_url": None,
+            "external_auth_default_inactive": False,
+            "external_auth_insecure_skip_tls_verify": False,
+            "external_auth_group_sync": False,
+            "external_auth_groups": None,
+            "external_auth_claims": None,
+            "external_auth_attribute_groups": False,
+        },
+    )()
+    request.app.state.jwt_manager = type(
+        "JWTManager", (), {"create_jwt_token": lambda self, username: "jwt-token"}
+    )()
+    request.query_params = {"code": "auth-code", "state": "test-state"}
+    request.cookies = {"gpustack_oidc_state": "test-state"}
+    request.url = type("URL", (), {"scheme": "https"})()
+
+    monkeypatch.setattr("gpustack.routes.auth.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("gpustack.routes.auth.use_proxy_env_for_url", lambda url: False)
+    monkeypatch.setattr(
+        "gpustack.routes.auth.get_oidc_user_data",
+        AsyncMock(
+            return_value={
+                "email": "i.ivanov@lmru.tech",
+                # The realm's 'name' claim is shadowed by an LDAP-login
+                # mapper; the composition deliberately avoids it.
+                "name": "iivanov",
+                "preferred_username": "iivanov",
+                "given_name": "Иван",
+                "family_name": "Иванов",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "gpustack.routes.auth.User.first_by_fields", AsyncMock(return_value=None)
+    )
+    create = AsyncMock(return_value=SimpleNamespace(id=1))
+    monkeypatch.setattr("gpustack.routes.auth.User.create", create)
+
+    await oidc_callback(request=request, session=object())
+
+    created = create.call_args[0][1]
+    assert created.name == "i.ivanov@lmru.tech"
+    assert created.display_name == "iivanov Иван Иванов"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "current,refresh,expected",
+    [
+        ("iivanov", "iivanov Иван Иванов", "iivanov Иван Иванов"),
+        ("iivanov Иван Иванов", "iivanov Иван Иванов", "iivanov Иван Иванов"),
+        ("iivanov", None, "iivanov"),
+        ("iivanov", "", "iivanov"),
+    ],
+)
+async def test_resolve_or_provision_refreshes_display_name(
+    monkeypatch, current, refresh, expected
+):
+    """Login re-points display_name at the claim-derived full name only
+    when the claims actually delivered one and it differs — the IdP is
+    authoritative, but an empty claim set must never clobber the
+    existing value with the username fallback."""
+    existing = SimpleNamespace(display_name=current, source=AuthProviderEnum.OIDC)
+    monkeypatch.setattr(
+        "gpustack.routes.auth.User.first_by_fields",
+        AsyncMock(return_value=existing),
+    )
+    create = AsyncMock()
+    monkeypatch.setattr("gpustack.routes.auth.User.create", create)
+
+    session = MagicMock()
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+
+    await auth_route._resolve_or_provision_external_user(
+        session,
+        "i.ivanov@lmru.tech",
+        AuthProviderEnum.OIDC,
+        display_name="i.ivanov@lmru.tech",
+        refresh_display_name=refresh,
+    )
+
+    assert existing.display_name == expected
+    if current != expected:
+        session.add.assert_called_once_with(existing)
+        session.commit.assert_awaited_once()
+    else:
+        session.add.assert_not_called()
+        session.commit.assert_not_awaited()
+    create.assert_not_called()
 
 
 @pytest.mark.asyncio

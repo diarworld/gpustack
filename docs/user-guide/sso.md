@@ -21,7 +21,7 @@ The following CLI flags are available for OIDC configuration:
 | `--oidc-scopes` (Optional)                            | Space- or comma-separated scopes requested at the authorization endpoint, e.g., `openid profile email org_id`. Defaults to `openid profile email`.                   |
 | `--external-auth-provider-name` (Optional)            | Name of the identity provider shown on the login page's SSO button, e.g., `Okta`. Defaults to `OIDC` when unset.                                                     |
 | `--external-auth-name` (Optional)                     | Mapping of OIDC user information to username, e.g., `preferred_username`. By default, the `email` claim is used if available.                                        |
-| `--external-auth-full-name` (Optional)                | Mapping of OIDC user information to user's full name. Multiple elements can be combined, e.g., `name` or `firstName+lastName`. By default, the `name` claim is used. |
+| `--external-auth-full-name` (Optional)                | Mapping of OIDC user information to user's display name. Multiple elements can be combined with `+`, e.g., `name` or `given_name+family_name`; missing claims are skipped. The display name is refreshed from these claims at every SSO login. By default, the `name` claim is used. |
 | `--external-auth-avatar-url` (Optional)               | Mapping of OIDC user information to user's avatar URL. By default, the `picture` claim is used if available.                                                         |
 | `--external-auth-claims` (Optional)                   | Comma-separated claim names persisted onto the user's `external_attributes` at every login, e.g., `title,org_id,division`. See [Capturing IdP claims](#capturing-idp-claims). |
 | `--external-auth-attribute-groups` (Optional)         | Derive user Groups from the captured claims on every login: `title/…`, `dept/…` and `store/…` groups, membership recomputed authoritatively. See [Groups from IdP attributes](#groups-from-idp-attributes). |
@@ -55,6 +55,18 @@ GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division,cost_center,shop_id"
 ```
 
 On every SSO login GPUStack copies the current values of these claims from the userinfo response into the user's `external_attributes` (visible in `GET /users/{id}`), rewriting whatever a previous login stored — the IdP is the source of truth. Claims arrive only if the IdP emits them for your client: those behind *optional* client scopes must be requested via `--oidc-scopes`, while claims behind *default* client scopes are always included.
+
+### User display name
+
+The user's display name (shown across the UI and used by client-side search) comes from `--external-auth-full-name` and is refreshed from the IdP at every SSO login, the same way `external_attributes` are. Claims joined with `+` are concatenated with a space; a claim the IdP did not send is skipped, and if none of them arrive the existing display name is left untouched.
+
+Prefer explicit claims over the default `name` when your realm's client scopes are customized. A custom client scope (for example an API-oriented scope added next to `profile`) can carry a mapper that shadows a standard claim — an LDAP-login mapper emitting `name` makes every freshly provisioned user's display name their LDAP login. Composing the display name from the parts you control avoids the collision:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_FULL_NAME="preferred_username+given_name+family_name"
+```
+
+This renders as `login FirstName LastName`, so searching by LDAP login, real name, or email all match.
 
 ### Groups from IdP attributes
 
