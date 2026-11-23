@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, Set
 from sqlalchemy import delete, func, or_, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, select
@@ -558,6 +558,103 @@ async def sync_user_group_memberships(
         row.deleted_at = now
         row.updated_at = now
         session.add(row)
+
+
+UNKNOWN_USERS_GROUP_NAME = "unknown/users"
+UNKNOWN_USERS_GROUP_DISPLAY_NAME = "Unknown Users"
+
+
+def _attribute_group_names(
+    attributes: Dict[str, Any],
+) -> tuple[List[str], Dict[str, str]]:
+    """Build the attribute-derived group set for one user's claims.
+
+    Group names carry a kind prefix so the three attribute kinds can
+    never collide with each other or with admin-curated groups:
+
+    - ``title/<title in lower case>`` — IdP case variants ("Разработчик"
+      vs "разработчик") must resolve to one group; the label keeps the
+      casing as received so the UI shows a readable title.
+    - ``dept/<department_id>`` — keyed by the stable department code;
+      the department's display name rides in ``display_name``, so a
+      department rename re-labels the group instead of orphaning it.
+    - ``store/<store_name>`` — verbatim; store names are few and
+      consistently cased.
+
+    Blank attribute values yield no group of that kind, and the sync
+    then removes the user from any previously held group of that kind
+    — the IdP is authoritative, same contract as the claims map.
+
+    Returns only the groups the claims actually derive; the
+    ``unknown/users`` fallback is the caller's decision (see
+    :func:`_attribute_group_names_for_user`), because parking depends
+    on who the user is, not on what the claims say.
+    """
+    names: List[str] = []
+    display_names: Dict[str, str] = {}
+
+    def _clean(value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    title = _clean(attributes.get("title"))
+    if title:
+        name = f"title/{title.lower()}"
+        names.append(name)
+        display_names[name] = title
+
+    dept_id = _clean(attributes.get("department_id"))
+    if dept_id:
+        name = f"dept/{dept_id}"
+        names.append(name)
+        display_names[name] = _clean(attributes.get("department_name")) or dept_id
+
+    store = _clean(attributes.get("store_name"))
+    if store:
+        name = f"store/{store}"
+        names.append(name)
+        display_names[name] = store
+
+    return names, display_names
+
+
+def _attribute_group_names_for_user(user) -> tuple[List[str], Dict[str, str]]:
+    """Attribute groups for one user, with the unknown-accounts parking.
+
+    An OIDC account whose claims never arrived — or whose every mapped
+    value is blank — parks in the shared ``unknown/users`` group; the
+    same diff moves it out the day real attributes land. Accounts from
+    other sources stay out: a Local account is refused at the SSO
+    callback (source mismatch is a security check), so its attributes
+    can never arrive and ``unknown`` would be a lie that never heals.
+    """
+    names, display_names = _attribute_group_names(user.external_attributes or {})
+    if not names and (user.source or "") == AuthProviderEnum.OIDC.value:
+        names = [UNKNOWN_USERS_GROUP_NAME]
+        display_names = {UNKNOWN_USERS_GROUP_NAME: UNKNOWN_USERS_GROUP_DISPLAY_NAME}
+    return names, display_names
+
+
+async def sync_attribute_groups_if_enabled(session: AsyncSession, user, config) -> None:
+    """Derive Groups from the user's ``external_attributes``.
+
+    Shared by the OIDC/SAML login callback and the user-creation API:
+    an account provisioned with ``external_attributes`` gets the same
+    attribute-derived groups — created when new (source ``oidc-attrs``),
+    joined when existing — that the SSO callback would derive at first
+    sign-in, including the ``unknown/users`` parking for OIDC accounts
+    whose attributes are empty. Flag-gated on
+    ``external_auth_attribute_groups``; runs the same source-scoped
+    reconciliation as the callback, so admin-curated (``Local``) rows
+    and other providers' memberships are never touched.
+
+    Caller commits.
+    """
+    if not config.external_auth_attribute_groups:
+        return
+    names, display_names = _attribute_group_names_for_user(user)
+    await sync_user_group_memberships(
+        session, user.id, AuthProviderEnum.OIDC_ATTRIBUTES, names, display_names
+    )
 
 
 # The wire keys the user-facing surfaces expose for attribute-derived

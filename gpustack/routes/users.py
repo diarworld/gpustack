@@ -16,6 +16,7 @@ from gpustack.api.exceptions import (
     NotFoundException,
     ConflictException,
 )
+from gpustack.config.config import get_global_config
 from gpustack.schemas.organizations import OrganizationPublic
 from gpustack.schemas.principals import (
     OrgRole,
@@ -44,7 +45,11 @@ from gpustack.server.passwords import (
     password_change_required_map,
     set_password,
 )
-from gpustack.server.services import UserService, bulk_user_attribute_labels
+from gpustack.server.services import (
+    UserService,
+    bulk_user_attribute_labels,
+    sync_attribute_groups_if_enabled,
+)
 
 router = APIRouter()
 
@@ -375,6 +380,21 @@ async def list_user_memberships(session: SessionDep, id: int):
     ]
 
 
+async def _sync_attribute_groups_on_create(session, user, source: str) -> None:
+    """Login parity for API-provisioned OIDC accounts: derive the
+    attribute-derived groups from ``external_attributes`` the same way
+    the SSO callback does after sign-in — a missing group is created,
+    an existing one is joined. Only OIDC accounts run it: the
+    ``oidc-attrs`` rows belong to the OIDC login flow, and accounts of
+    other sources never get their attributes rewritten by it. Caller
+    commits — here that is the single transaction that also creates
+    the user, so a sync failure leaves no half-provisioned account.
+    """
+    if source != AuthProviderEnum.OIDC.value:
+        return
+    await sync_attribute_groups_if_enabled(session, user, get_global_config())
+
+
 @router.post("", response_model=UserPublic)
 async def create_user(session: SessionDep, user_in: UserCreate):
     # USER has its own name namespace (see partitioning rationale on
@@ -414,6 +434,10 @@ async def create_user(session: SessionDep, user_in: UserCreate):
             is_active=user_in.is_active,
             source=source,
         )
+        # Claims supplied by the provisioning caller: stored verbatim
+        # and handed to the attribute-group sync below, exactly as the
+        # SSO callback stores then consumes them at login.
+        to_create.external_attributes = user_in.external_attributes
         # Admin additionally joins the platform Org as OWNER; regular
         # users do NOT auto-join — admin can add them later if shared
         # workspace access is needed.
@@ -438,6 +462,8 @@ async def create_user(session: SessionDep, user_in: UserCreate):
                     updated_at=now,
                 )
             )
+
+        await _sync_attribute_groups_on_create(session, user, source)
 
         await session.commit()
         await session.refresh(user)

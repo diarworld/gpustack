@@ -16,16 +16,18 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from gpustack.routes.auth import (
+from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
+from gpustack.schemas.users import AuthProviderEnum
+from gpustack.server.services import (
     UNKNOWN_USERS_GROUP_DISPLAY_NAME,
     UNKNOWN_USERS_GROUP_NAME,
     _attribute_group_names,
     _attribute_group_names_for_user,
-    _sync_attribute_groups_if_enabled,
+    sync_user_group_memberships,
 )
-from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
-from gpustack.schemas.users import AuthProviderEnum
-from gpustack.server.services import sync_user_group_memberships
+
+# The callback wrapper stays importable for its flag-gate/commit tests.
+from gpustack.routes.auth import _sync_attribute_groups_if_enabled
 
 # ---- _attribute_group_names ------------------------------------------------
 

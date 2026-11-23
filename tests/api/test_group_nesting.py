@@ -7,6 +7,7 @@ in-memory SQLite so the soft-delete and recursion semantics hold
 against actual rows.
 """
 
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import pytest
@@ -32,19 +33,25 @@ from gpustack.routes.user_groups import (
     remove_group_member,
     update_group,
 )
+from gpustack.routes import users as users_route
 from gpustack.routes.users import (
     _apply_local_group_membership_diff,
     _resolve_manageable_groups,
+    create_user,
     get_user_groups,
 )
-from gpustack.server.services import bulk_user_attribute_labels
+from gpustack.server.services import (
+    UNKNOWN_USERS_GROUP_NAME,
+    bulk_user_attribute_labels,
+)
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
 from gpustack.schemas.user_groups import (
     UserGroupListParams,
     UserGroupUpdate,
     resolve_group_type,
 )
-from gpustack.schemas.users import AuthProviderEnum
+from gpustack.schemas.user_passwords import UserPassword
+from gpustack.schemas.users import AuthProviderEnum, UserCreate
 
 
 @pytest_asyncio.fixture
@@ -53,6 +60,9 @@ async def session():
     async with engine.begin() as conn:
         await conn.run_sync(Principal.__table__.create)
         await conn.run_sync(PrincipalMembership.__table__.create)
+        # create_user's response path consults the password row
+        # (require_password_change), so the table must exist here too.
+        await conn.run_sync(UserPassword.__table__.create)
     async with AsyncSession(engine, expire_on_commit=False) as s:
         yield s
     await engine.dispose()
@@ -772,3 +782,164 @@ async def test_member_rows_carry_attribute_labels(session):
     assert rows[0].profession == "Разработчик"
     assert rows[0].department == "ПК Платформа разработки"
     assert rows[0].business_unit == "Магазин Уфа 2"
+
+
+# ---- create_user external_attributes ------------------------------------------
+
+
+def _patch_attr_groups_flag(monkeypatch, enabled: bool) -> None:
+    # The route reads the flag off the global config at call time;
+    # patching the module binding keeps the per-test toggle independent
+    # of the settings object the root conftest installs.
+    monkeypatch.setattr(
+        users_route,
+        "get_global_config",
+        lambda: SimpleNamespace(external_auth_attribute_groups=enabled),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_user_with_external_attributes_syncs_groups(session, monkeypatch):
+    # Login parity: an OIDC account provisioned with external_attributes
+    # starts in the same attribute-derived groups (created when new)
+    # the SSO callback would derive at first sign-in.
+    _patch_attr_groups_flag(monkeypatch, True)
+    result = await create_user(
+        session,
+        UserCreate(
+            username="provisioned",
+            source=AuthProviderEnum.OIDC.value,
+            external_attributes={
+                "title": "Разработчик",
+                "department_id": "713",
+                "department_name": "Отдел ИТ",
+                "store_name": "Магазин 7",
+            },
+        ),
+    )
+    assert result.external_attributes["title"] == "Разработчик"
+    assert result.profession == "Разработчик"
+    assert result.department == "Отдел ИТ"
+    assert result.business_unit == "Магазин 7"
+
+    groups = (
+        await session.exec(
+            select(Principal).where(
+                Principal.kind == PrincipalType.GROUP,
+                Principal.source == "oidc-attrs",
+            )
+        )
+    ).all()
+    by_name = {g.name: g for g in groups}
+    assert by_name["title/разработчик"].display_name == "Разработчик"
+    assert by_name["dept/713"].display_name == "Отдел ИТ"
+    assert by_name["store/Магазин 7"].display_name == "Магазин 7"
+
+    memberships = (
+        await session.exec(
+            select(PrincipalMembership).where(
+                PrincipalMembership.member_principal_id == result.id,
+                PrincipalMembership.source == "oidc-attrs",
+                PrincipalMembership.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    assert {m.parent_principal_id for m in memberships} == {g.id for g in groups}
+
+
+@pytest.mark.asyncio
+async def test_create_user_joins_existing_attr_group(session, monkeypatch):
+    # The "exists → add" half of the login-parity contract: the same
+    # IdP title (in either casing) resolves to the one existing group,
+    # not a duplicate.
+    _patch_attr_groups_flag(monkeypatch, True)
+    existing = await _seed_attr_group(session, 500, "title/аналитик", "Аналитик")
+    first = await create_user(
+        session,
+        UserCreate(
+            username="u1",
+            source=AuthProviderEnum.OIDC.value,
+            external_attributes={"title": "Аналитик"},
+        ),
+    )
+    second = await create_user(
+        session,
+        UserCreate(
+            username="u2",
+            source=AuthProviderEnum.OIDC.value,
+            external_attributes={"title": "аналитик"},
+        ),
+    )
+    rows = (
+        await session.exec(
+            select(Principal).where(
+                Principal.name == "title/аналитик",
+                Principal.kind == PrincipalType.GROUP,
+            )
+        )
+    ).all()
+    assert len(rows) == 1
+    assert rows[0].id == existing.id
+    assert await _active_member_ids(session, existing.id) == {first.id, second.id}
+
+
+@pytest.mark.asyncio
+async def test_create_oidc_user_without_attributes_parks_in_unknown(
+    session, monkeypatch
+):
+    # Same parking rule as the callback: an OIDC account whose claims
+    # are unknown starts in unknown/users until real attributes land.
+    _patch_attr_groups_flag(monkeypatch, True)
+    result = await create_user(
+        session,
+        UserCreate(username="noattrs", source=AuthProviderEnum.OIDC.value),
+    )
+    groups = (
+        await session.exec(
+            select(Principal).where(Principal.kind == PrincipalType.GROUP)
+        )
+    ).all()
+    assert [g.name for g in groups] == [UNKNOWN_USERS_GROUP_NAME]
+    assert await _active_member_ids(session, groups[0].id) == {result.id}
+
+
+@pytest.mark.asyncio
+async def test_create_user_flag_off_stores_attributes_without_groups(
+    session, monkeypatch
+):
+    # The flag gates the group derivation, not the attribute storage —
+    # the same split as the login callback.
+    _patch_attr_groups_flag(monkeypatch, False)
+    result = await create_user(
+        session,
+        UserCreate(
+            username="flagoff",
+            source=AuthProviderEnum.OIDC.value,
+            external_attributes={"title": "Разработчик"},
+        ),
+    )
+    assert result.external_attributes == {"title": "Разработчик"}
+    groups = (
+        await session.exec(
+            select(Principal).where(Principal.kind == PrincipalType.GROUP)
+        )
+    ).all()
+    assert groups == []
+
+
+@pytest.mark.asyncio
+async def test_create_local_user_stores_attributes_without_sync(session, monkeypatch):
+    # The oidc-attrs rows belong to the OIDC flow: a Local account
+    # keeps its stored attributes but derives no groups from them.
+    _patch_attr_groups_flag(monkeypatch, True)
+    result = await create_user(
+        session,
+        UserCreate(
+            username="localop",
+            password="S3curePass!",
+            external_attributes={"title": "Оператор"},
+        ),
+    )
+    assert result.external_attributes == {"title": "Оператор"}
+    memberships = (await session.exec(select(PrincipalMembership))).all()
+    assert memberships == []
