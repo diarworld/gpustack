@@ -150,6 +150,56 @@ class TestUserLimitsCombination:
         assert combo["concurrency_limits"] == {"default": 1}
 
 
+class TestGroupResolvedView:
+    """The reconciler feeds ``user_limits_combination`` an
+    ``EffectiveLimitsView`` — the group quotas resolved onto the user. The
+    combo must render from the resolved numbers exactly as it would from a
+    Principal row carrying them."""
+
+    def test_resolved_values_render_onto_the_combo(self):
+        from tests.gateway.test_effective_limits import _group, _rlc, _user
+        from gpustack.gateway.effective_limits import effective_limits_view
+
+        # The doc example: RPM 2 from group2, TPM 1000 from group1, the
+        # user explicit on nothing.
+        view = effective_limits_view(
+            _user(),
+            [_group(rpm=10, tpm=1000), _group(rpm=2, tpm=10_000)],
+            _rlc(default_monthly_tokens=5_000_000),
+        )
+        combo = user_limits_combination(
+            view, make_rlc(default_monthly_tokens=5_000_000)
+        )
+        assert combo["query_limits"] == {"per_minute": 2}
+        assert combo["token_limits"] == {"per_minute": 1000}
+        assert combo["token_quota"] == {"each_month": 5_000_000}
+
+    def test_group_concurrency_cap_lands_in_the_models_map(self):
+        from tests.gateway.test_effective_limits import _group, _rlc, _user
+        from gpustack.gateway.effective_limits import effective_limits_view
+
+        view = effective_limits_view(
+            _user(), [_group(concurrency={"glm-5.3-flash": 2})], _rlc()
+        )
+        combo = user_limits_combination(view, make_rlc())
+        assert combo["concurrency_limits"] == {
+            "default": 1,
+            "models": {"glm-5.3-flash": 2},
+        }
+
+    def test_user_explicit_still_wins_over_the_groups(self):
+        from tests.gateway.test_effective_limits import _group, _rlc, _user
+        from gpustack.gateway.effective_limits import effective_limits_view
+
+        view = effective_limits_view(
+            _user(rpm=30), [_group(rpm=2)], _rlc(default_monthly_tokens=5_000_000)
+        )
+        combo = user_limits_combination(
+            view, make_rlc(default_monthly_tokens=5_000_000)
+        )
+        assert combo["query_limits"] == {"per_minute": 30}
+
+
 class TestFitCombinations:
     def test_everything_is_kept_when_it_fits(self):
         first = {"name": "user-1", "match": []}

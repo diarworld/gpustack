@@ -12,18 +12,69 @@ lives in ``principal_memberships`` too (``parent=Group, member=User``,
 """
 
 from datetime import datetime
-from typing import ClassVar, List, Optional
+from typing import ClassVar, Dict, List, Optional
 
+from pydantic import field_validator
 from sqlmodel import Field, SQLModel
 
 from gpustack.schemas.common import ListParams, PaginatedList
-from gpustack.schemas.principals import Principal
+from gpustack.schemas.principals import (
+    PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME,
+    PRINCIPAL_MAX_CONCURRENCY_MODELS,
+    Principal,
+)
 from gpustack.schemas.users import AuthProviderEnum
 
 
 class UserGroupUpdate(SQLModel):
     name: str = Field(nullable=False)
     description: Optional[str] = Field(default=None, nullable=True)
+
+
+class UserGroupLimitsUpdate(SQLModel):
+    """The group-level gateway quotas, full-replace semantics.
+
+    The server resolves these onto every member's ``user-<id>`` combo
+    (see ``gpustack.gateway.effective_limits``): a member's explicit user
+    limit wins, otherwise the smallest value across their groups applies,
+    otherwise the deployment default. ``model_concurrency_limits`` maps a
+    model name to the group's in-flight cap for that model; a stored 0 is
+    NOT "unlimited" the way a user-level 0 is — on a group it means the
+    group does not constrain that model, so it never enters the min.
+    Validated against the same bounds the user-level map accepts, so a
+    combo rendered from it is never refused at gateway config parse.
+    """
+
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
+    weekly_token_limit: Optional[int] = None
+    monthly_token_limit: Optional[int] = None
+    model_concurrency_limits: Optional[Dict[str, int]] = None
+
+    @field_validator("model_concurrency_limits")
+    @classmethod
+    def _validate_model_concurrency_limits(
+        cls, value: Optional[Dict[str, int]]
+    ) -> Optional[Dict[str, int]]:
+        if value is None:
+            return None
+        if len(value) > PRINCIPAL_MAX_CONCURRENCY_MODELS:
+            raise ValueError(
+                f"model_concurrency_limits supports at most "
+                f"{PRINCIPAL_MAX_CONCURRENCY_MODELS} models, got {len(value)}"
+            )
+        for name, quota in value.items():
+            if not name or len(name) > PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME:
+                raise ValueError(
+                    f"model_concurrency_limits keys must be 1.."
+                    f"{PRINCIPAL_MAX_CONCURRENCY_MODEL_NAME} characters"
+                )
+            if quota < 0:
+                raise ValueError(
+                    f"model_concurrency_limits[{name!r}] must be >= 0 "
+                    "(0 means unconstrained)"
+                )
+        return value
 
 
 # Stable type tokens for the UI's Type column. Derived, never stored: the
@@ -74,6 +125,10 @@ class UserGroupListParams(ListParams):
         "member_count",
         "created_at",
         "updated_at",
+        "rpm_limit",
+        "tpm_limit",
+        "weekly_token_limit",
+        "monthly_token_limit",
     ]
 
 
@@ -101,6 +156,16 @@ class UserGroupPublic(SQLModel):
     # ``OIDC`` / ``SAML`` / other IdP names = auto-created by IdP sync.
     # UI badges IdP-managed rows distinctly.
     source: str = AuthProviderEnum.Local.value
+    # Group-level gateway quotas (admin-settable on the Groups page).
+    # Server-owned state, unlike the IdP-owned row fields — editable even
+    # on IdP-synced groups. NULL inherits: a member's explicit user limit
+    # wins, otherwise the smallest value across their groups applies, see
+    # ``gpustack.gateway.effective_limits``.
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
+    weekly_token_limit: Optional[int] = None
+    monthly_token_limit: Optional[int] = None
+    model_concurrency_limits: Optional[Dict[str, int]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -116,6 +181,11 @@ class UserGroupPublic(SQLModel):
             group_type=resolve_group_type(p),
             member_count=member_count,
             source=p.source,
+            rpm_limit=p.rpm_limit,
+            tpm_limit=p.tpm_limit,
+            weekly_token_limit=p.weekly_token_limit,
+            monthly_token_limit=p.monthly_token_limit,
+            model_concurrency_limits=p.model_concurrency_limits,
             created_at=p.created_at,
             updated_at=p.updated_at,
         )

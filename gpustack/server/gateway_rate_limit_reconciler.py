@@ -15,15 +15,19 @@ fallback) decide the layout:
 
 * **User limit combos (non-fallback).** One per active user who owns at
   least one key, matching the user's consumer shapes via a capture that
-  merges the API-key and UI forms into one shared bucket. Carries everything
-  that caps the user's keys together: requests and tokens per minute (the
-  user's setting or the deployment default), the weekly / monthly token
-  budgets (setting only -- the monthly falls back to the deployment
-  default), and the per-model in-flight caps (the deployment
-  ``default_concurrency`` restated as the block default plus the user's
-  per-model overrides; admins carry no concurrency block at all, which is
-  what exempts them). Non-fallback so it ANDs with the default plan
-  fallback below: a user cap must bind every request they send.
+  merges the API-key and UI forms into one shared bucket. Carries
+  everything that caps the user's keys together: requests and tokens per
+  minute, the weekly / monthly token budgets, and the per-model in-flight
+  caps — each resolved through the three-level priority
+  (``gpustack.gateway.effective_limits``): the user's explicit value, else
+  the smallest value across the user's groups (the quotas admins set on
+  the Groups page, published onto the same combo — the plugin never sees
+  groups), else the deployment default (none for the weekly budget). The
+  per-model block restates the deployment ``default_concurrency`` as its
+  default plus the resolved overrides; admins carry no concurrency block
+  at all, which is what exempts them. Non-fallback so it ANDs with the
+  default plan fallback below: a user cap must bind every request they
+  send.
 * **The default plan** from the effective defaults (settings row over the
   config file): the fallback safety net for requests whose combos were
   left out under byte pressure or whose consumer no longer matches a live
@@ -47,6 +51,10 @@ from gpustack.gateway import get_async_k8s_config
 from gpustack.gateway.client.extensions_higress_io_v1_api import (
     ExtensionsHigressIoV1Api,
 )
+from gpustack.gateway.effective_limits import (
+    effective_limits_view,
+    load_group_limit_snapshots,
+)
 from gpustack.gateway.rate_limit import (
     WEEK_IN_SECONDS,
     consumer_user_capture,
@@ -60,7 +68,11 @@ from gpustack.gateway.utils import ensure_wasm_plugin
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.schemas.gateway_rate_limit_settings import GatewayRateLimitSettings
-from gpustack.schemas.principals import Principal, PrincipalType
+from gpustack.schemas.principals import (
+    Principal,
+    PrincipalMembership,
+    PrincipalType,
+)
 from gpustack.server.bus import EventType
 from gpustack.server.db import async_session
 
@@ -208,6 +220,7 @@ class GatewayRateLimitReconciler:
         await asyncio.gather(
             self._watch(ApiKey, "api_key"),
             self._watch(Principal, "principal"),
+            self._watch(PrincipalMembership, "membership"),
             self._watch(GatewayRateLimitSettings, "settings"),
             self._flush_loop(),
         )
@@ -291,6 +304,11 @@ class GatewayRateLimitReconciler:
                 )
             ).all()
             keys = (await session.exec(select(ApiKey))).all()
+            # The groups each user draws quotas from, loaded once for the
+            # whole deployment; the per-user resolution happens below.
+            group_snapshots = await load_group_limit_snapshots(
+                session, [user.id for user in users]
+            )
 
         # A user without keys never sends inference requests; skipping their
         # combo keeps the CR tight.
@@ -302,7 +320,8 @@ class GatewayRateLimitReconciler:
         for user in users:
             if user.id not in keys_by_user:
                 continue
-            combo = user_limits_combination(user, rlc)
+            view = effective_limits_view(user, group_snapshots.get(user.id, []), rlc)
+            combo = user_limits_combination(view, rlc)
             if combo is not None:
                 combinations.append(combo)
         return fit_combinations(combinations, self._budget)

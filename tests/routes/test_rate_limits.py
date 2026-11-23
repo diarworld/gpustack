@@ -347,13 +347,68 @@ async def test_non_admin_gets_own_data_regardless_of_user_id(frozen_now, monkeyp
     assert response.user.concurrency_default == 1
     assert session.statements
     # Every statement is either the settings read+seed, the reset-quota
-    # read or the ready-models view; no api_keys statement ever runs.
+    # read, the ready-models view, or the group-quota loader (membership
+    # edges and principal kinds); no api_keys statement ever runs.
     assert all(
         "gateway_rate_limit_resets" in str(s)
         or "gateway_rate_limit_settings" in str(s)
         or "non_admin_user_models" in str(s)
+        or "principal_memberships" in str(s)
+        or "principals" in str(s)
         for s in session.statements
     )
+
+
+@pytest.mark.asyncio
+async def test_group_quotas_resolve_into_the_user_picture(frozen_now, monkeypatch):
+    """The usage endpoint reports what the gateway enforces: the user's
+    groups' quotas resolved per field — user explicit wins, else the
+    smallest group value — not the raw user row."""
+    cfg = _redis_cfg()
+    # Explicit RPM wins over the groups; the other fields resolve from
+    # them, monthly falling through to the deployment default.
+    user = _user(7, rpm=50)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    async def _loader(session, user_ids):
+        return {
+            7: [
+                SimpleNamespace(
+                    rpm_limit=2,
+                    tpm_limit=1000,
+                    weekly_token_limit=500_000,
+                    monthly_token_limit=None,
+                    model_concurrency_limits={"glm-5.3-flash": 1},
+                ),
+                SimpleNamespace(
+                    rpm_limit=10,
+                    tpm_limit=10_000,
+                    weekly_token_limit=900_000,
+                    monthly_token_limit=None,
+                    model_concurrency_limits=None,
+                ),
+            ]
+        }
+
+    monkeypatch.setattr(rate_limits, "load_group_limit_snapshots", _loader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg), user_id=None
+    )
+
+    assert response.user.rpm_limit == 50
+    assert response.user.tpm_limit == 1000
+    assert response.user.weekly_limit == 500_000
+    # Nothing sets the monthly budget: the deployment default applies.
+    assert response.user.monthly_limit == 20_000_000
+    assert _shapes(response.user.windows) == [
+        ("query", "60s", 50),
+        ("token_rolling", "60s", 1000),
+        ("token_rolling", "604800s", 500_000),
+        ("token_calendar", "each_month", 20_000_000),
+    ]
 
 
 @pytest.mark.asyncio

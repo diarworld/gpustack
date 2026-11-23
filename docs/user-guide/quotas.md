@@ -65,6 +65,11 @@ and an override of `0` lifts the cap for that model entirely.
 - **Per-user budgets** — weekly and monthly token budgets an administrator sets
   on your account, shared across all of your keys and sessions. RPM and TPM
   limits set on your account are user-level the same way.
+- **Group quotas** — the same fields at group level, set by an administrator
+  from the Groups page (**Manage limits**). Each field resolves
+  independently: your account's explicit limit wins; otherwise the smallest
+  value across your groups applies; otherwise the deployment default. See
+  [Group Quotas](rate-limiting.md#group-quotas).
 
 This deployment ships the following defaults (administrators edit them on the
 Usage → Limits tab, see [Editing the Deployment Defaults](#editing-the-deployment-defaults)):

@@ -21,6 +21,10 @@ from gpustack.api.exceptions import (
 )
 from gpustack.api.tenant import TenantContext, is_platform_wide
 from gpustack.config.config import Config, GatewayRateLimitConfig
+from gpustack.gateway.effective_limits import (
+    effective_limits_view,
+    load_group_limit_snapshots,
+)
 from gpustack.gateway.rate_limit_usage import (
     RateLimitWindowState,
     RateLimitWindowSpec,
@@ -232,11 +236,17 @@ async def get_rate_limits(
 
     # The user limit combo is non-fallback and governs every request of the
     # user, so these windows are the effective user-level picture: requests
-    # and tokens per minute (the user's setting or the deployment default),
-    # the weekly budget (setting only) and the monthly quota (setting or
-    # default). All bucket on ``gpustack-<id>`` -- the user's own traffic
-    # across all their keys.
-    user_specs = user_limit_windows(rlc, target.id, target)
+    # and tokens per minute, the weekly budget and the monthly quota --
+    # resolved through the user's explicit values, their groups' quotas and
+    # the deployment defaults (see gpustack.gateway.effective_limits), the
+    # same resolution the reconciler publishes onto the combo. All bucket
+    # on ``gpustack-<id>`` -- the user's own traffic across all their keys.
+    view = effective_limits_view(
+        target,
+        (await load_group_limit_snapshots(session, [target.id])).get(target.id, []),
+        rlc,
+    )
+    user_specs = user_limit_windows(rlc, target.id, view)
     all_specs = list(user_specs)
 
     states: List[Optional[RateLimitWindowState]]
@@ -257,7 +267,7 @@ async def get_rate_limits(
     # server-readable counters, so ``running`` stays unset there; admins
     # are exempt and itemize nothing.
     ready_models = await _ready_model_names(session, target)
-    concurrency_specs = model_concurrency_specs(rlc, target.id, target, ready_models)
+    concurrency_specs = model_concurrency_specs(rlc, target.id, view, ready_models)
     concurrency_running: List[Optional[int]] = [None] * len(concurrency_specs)
     concurrency_error = None
     if concurrency_specs and mode == "redis":
@@ -305,10 +315,10 @@ async def get_rate_limits(
             days=free.days,
         ),
         user=UserRateLimits(
-            rpm_limit=target.rpm_limit,
-            tpm_limit=target.tpm_limit,
-            weekly_limit=target.weekly_token_limit,
-            monthly_limit=target.monthly_token_limit,
+            rpm_limit=view.rpm_limit,
+            tpm_limit=view.tpm_limit,
+            weekly_limit=view.weekly_token_limit,
+            monthly_limit=view.monthly_token_limit,
             concurrency_default=rlc.default_concurrency,
             windows=[
                 _window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs
@@ -366,8 +376,15 @@ async def reset_rate_limit(
 
     # Everything the reset forgives: the user-level long token windows of
     # this kind, the user's own limits and the default-plan fallback alike.
-    # A user with no such window has nothing to forgive.
-    windows = user_limit_windows(rlc, target.id, target) + default_plan_windows(
+    # A user with no such window has nothing to forgive. The key layout
+    # does not depend on the resolved quotas, but the specs go through the
+    # same view as the read endpoint so the two never disagree.
+    view = effective_limits_view(
+        target,
+        (await load_group_limit_snapshots(session, [target.id])).get(target.id, []),
+        rlc,
+    )
+    windows = user_limit_windows(rlc, target.id, view) + default_plan_windows(
         rlc, target.id
     )
     counter_keys = [

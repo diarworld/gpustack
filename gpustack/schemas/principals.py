@@ -300,12 +300,16 @@ class PrincipalBase(SQLModel):
         default=None, sa_column=Column(Text, nullable=True)
     )
 
-    # Gateway rate limits, meaningful on USER rows only (NULL on the other
-    # kinds — they never hold an API key). Enforced by the gpustack-rate-limit
+    # Gateway rate limits, meaningful on USER rows (every member's
+    # effective quota draws on them) and GROUP rows (the group-level
+    # quotas admins set on the Groups page; the resolution priority lives
+    # in ``gpustack.gateway.effective_limits``). NULL on the other kinds —
+    # they never hold an API key. Enforced by the gpustack-rate-limit
     # plugin against Redis counters, bucketed per user so every key of the
     # account draws on the same allowance. ``rpm_limit`` / ``tpm_limit`` /
-    # ``monthly_token_limit`` fall back to the deployment defaults when NULL
-    # -- the editable ``gateway_rate_limit_settings`` row, seeded from the
+    # ``monthly_token_limit`` fall back to the deployment defaults when
+    # neither the user nor any of their groups sets them -- the editable
+    # ``gateway_rate_limit_settings`` row, seeded from the
     # ``gateway_rate_limit`` config file (see
     # :mod:`gpustack.gateway.rate_limit_settings`). The budgets (weekly /
     # monthly) have no deployment default, because a default budget silently

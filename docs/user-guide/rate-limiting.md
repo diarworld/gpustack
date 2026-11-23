@@ -109,7 +109,8 @@ their UI sessions.
 
 The weekly budget has no deployment-wide default: only accounts with an
 explicit weekly budget are capped on it. Users without explicit limits are
-governed by the deployment defaults alone.
+governed by their groups' quotas and the deployment defaults — see
+[Group Quotas](#group-quotas).
 
 ### Per-Model Concurrency
 
@@ -154,6 +155,44 @@ Changes take effect within one reconcile interval (30 seconds by default, see
     Rate limits are enforced at the gateway, so they apply to traffic
     that arrives through it. Inference calls made directly to the server's
     API port are not rate limited.
+
+## Group Quotas
+
+Groups carry the same limit fields as user accounts — RPM, TPM, the weekly
+and monthly token budgets and the per-model in-flight caps — set from
+Access Control → Groups with **Manage limits**. A group limit never caps
+the group as a unit: each member's effective limits are **resolved per
+field**, with this priority:
+
+1. the user's explicit limit — set on the account, it wins in both
+   directions;
+2. otherwise, the smallest value across the groups the user belongs to
+   (through nested subgroups too). A group limit both tightens and relaxes
+   the deployment defaults — giving one team a higher RPM than everyone
+   else is a legitimate use;
+3. otherwise, the deployment-wide defaults.
+
+For example, with `default_rpm: 100` and a member of one group capped at
+RPM 10 and another at RPM 2, a user with no explicit limits runs at RPM 2
+and — if the same groups cap TPM at 1000 and 10000 — TPM 1000: each field
+resolves on its own. If the account sets RPM 30 explicitly, 30 applies
+whatever the groups say. The weekly budget has no deployment-wide default,
+so it comes from the user's row, the smallest group value, or nothing.
+
+Group-level per-model caps resolve one model at a time: the user's own
+`model_concurrency_limits` entry wins (a stored `0` is explicit
+unlimited); otherwise the smallest non-zero cap across the member's groups
+applies; otherwise `default_concurrency`. A `0` on a **group** means "this
+group does not constrain the model" — it never enters the comparison, so
+it can neither tighten the deployment default nor lift a sibling group's
+cap.
+
+The resolution happens on the server: the gateway plugin keeps receiving
+one per-user combination with the resolved numbers and never sees groups.
+A quota edit or a membership change (a user joining or leaving a group)
+is picked up within one reconcile interval (30 seconds by default). The
+Usage page and the `GET /v2/usage/rate-limits` endpoint report the
+resolved values — the numbers actually enforced.
 
 ## Failure Behaviour
 
@@ -375,8 +414,9 @@ sum (rate(gpustack_rate_limit_request_total[5m]))
 
 ## Reconciler Events
 
-The server runs a reconciler that watches the API-key and user tables and
-republishes the rate-limit WasmPlugin CR within one reconcile interval (30
+The server runs a reconciler that watches the API-key, principal,
+membership and settings tables and republishes the rate-limit WasmPlugin
+CR within one reconcile interval (30
 seconds by default, `GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS`).
 Its events and log lines carry the `gateway_rate_limit_reconciler` source
 tag (for example `gateway_rate_limit_reconciler.api_key`). That tag marks

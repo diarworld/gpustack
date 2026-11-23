@@ -33,6 +33,7 @@ from gpustack.routes.user_groups import (
     list_groups,
     remove_group_member,
     update_group,
+    update_group_limits,
 )
 from gpustack.routes import users as users_route
 from gpustack.routes.users import (
@@ -47,12 +48,15 @@ from gpustack.server.services import (
 )
 from gpustack.schemas.principals import Principal, PrincipalMembership, PrincipalType
 from gpustack.schemas.user_groups import (
+    UserGroupLimitsUpdate,
     UserGroupListParams,
     UserGroupUpdate,
     resolve_group_type,
 )
 from gpustack.schemas.user_passwords import UserPassword
 from gpustack.schemas.users import AuthProviderEnum, UserCreate
+
+from pydantic import ValidationError
 
 
 @pytest_asyncio.fixture
@@ -1040,3 +1044,91 @@ async def test_create_user_without_optional_maps_stores_sql_null(session):
         )
     ).all()
     assert tuple(rows[0]) == (None, None)
+
+
+# ---- group-level gateway quotas ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_group_limits_set_and_returned(session):
+    group = await _seed_group(session, 20, "team")
+    page = await update_group_limits(
+        session,
+        20,
+        UserGroupLimitsUpdate(
+            rpm_limit=10,
+            tpm_limit=1000,
+            weekly_token_limit=50_000,
+            monthly_token_limit=1_000_000,
+            model_concurrency_limits={"glm-5.3-flash": 2},
+        ),
+    )
+    assert page.rpm_limit == 10
+    assert page.tpm_limit == 1000
+    assert page.weekly_token_limit == 50_000
+    assert page.monthly_token_limit == 1_000_000
+    assert page.model_concurrency_limits == {"glm-5.3-flash": 2}
+    # The listing carries the same values: the table columns read them.
+    listed = await list_groups(session, None, UserGroupListParams())
+    row = next(g for g in listed.items if g.id == 20)
+    assert row.rpm_limit == 10 and row.tpm_limit == 1000
+    assert group.name == "team"  # the name column stays untouched
+
+
+@pytest.mark.asyncio
+async def test_group_limits_full_replace_clears_with_null(session):
+    # The modal submits the complete set: an explicit null lands on the
+    # row and shows as a dash again.
+    await _seed_group(session, 20, "team")
+    await update_group_limits(
+        session, 20, UserGroupLimitsUpdate(rpm_limit=10, tpm_limit=1000)
+    )
+    page = await update_group_limits(
+        session,
+        20,
+        UserGroupLimitsUpdate(rpm_limit=None, tpm_limit=2000),
+    )
+    assert page.rpm_limit is None
+    assert page.tpm_limit == 2000
+
+
+@pytest.mark.asyncio
+async def test_group_limits_settable_on_idp_synced_group(session):
+    # Quotas are server-owned state, nothing the IdP sync owns: the row
+    # writes above stay refused while the limits write goes through.
+    await _seed_attr_group(session, 20, "dept/713")
+    with pytest.raises(InvalidException):
+        await update_group(session, 20, UserGroupUpdate(name="renamed"))
+    page = await update_group_limits(session, 20, UserGroupLimitsUpdate(rpm_limit=3))
+    assert page.rpm_limit == 3
+    assert page.name == "dept/713"
+
+
+@pytest.mark.asyncio
+async def test_group_limits_validation_bounds(session):
+    await _seed_group(session, 20, "team")
+    # The DTO refuses out-of-bounds maps at validation time — the API
+    # surface answers 422 before the route runs.
+    with pytest.raises(ValidationError):
+        UserGroupLimitsUpdate(model_concurrency_limits={"m": -1})
+    with pytest.raises(ValidationError):
+        UserGroupLimitsUpdate(model_concurrency_limits={f"m{i}": 1 for i in range(101)})
+
+
+@pytest.mark.asyncio
+async def test_list_sorts_by_limit_columns(session):
+    # Sorting by a quota column rides the SQL path; where the unset rows
+    # land relative to the set ones is the dialect's NULL ordering, so the
+    # assertion pins only the order of the set values.
+    await _seed_group(session, 10, "no-limit")
+    await _seed_group(session, 20, "tight")
+    await _seed_group(session, 30, "wide")
+    await update_group_limits(session, 20, UserGroupLimitsUpdate(rpm_limit=5))
+    await update_group_limits(session, 30, UserGroupLimitsUpdate(rpm_limit=100))
+
+    page = await list_groups(session, None, UserGroupListParams(sort_by="rpm_limit"))
+    names = [g.name for g in page.items]
+    assert names.index("tight") < names.index("wide")
+    page = await list_groups(session, None, UserGroupListParams(sort_by="-rpm_limit"))
+    names = [g.name for g in page.items]
+    assert names.index("wide") < names.index("tight")

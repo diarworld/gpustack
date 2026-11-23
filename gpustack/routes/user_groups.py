@@ -43,6 +43,7 @@ from gpustack.schemas.user_groups import (
     GROUP_TYPE_PROFESSION,
     GROUP_TYPE_UNKNOWN,
     UserGroupCreate,
+    UserGroupLimitsUpdate,
     UserGroupListParams,
     UserGroupMembershipPublic,
     UserGroupPublic,
@@ -413,6 +414,33 @@ async def update_group(session: SessionDep, group_id: int, body: UserGroupUpdate
         await group.update(session, body.model_dump(exclude_unset=True))
     except Exception as e:
         raise InvalidException(message=f"Failed to update group: {e}")
+    counts = await _bulk_transitive_member_counts(session, [group.id])
+    return UserGroupPublic.from_principal(group, member_count=counts.get(group.id, 0))
+
+
+@router.put(
+    "/groups/{group_id}/limits",
+    response_model=UserGroupPublic,
+    dependencies=[Depends(require_platform_admin)],
+)
+async def update_group_limits(
+    session: SessionDep, group_id: int, body: UserGroupLimitsUpdate
+):
+    """Set the group-level gateway quotas, full-replace semantics.
+
+    Deliberately NOT ``_ensure_admin_manageable``: quotas are server-owned
+    state, nothing the IdP sync owns or rewrites, so they are settable on
+    IdP-synced groups the same as Local ones — that is where most
+    members live. Full-replace: every field the client sends lands on the
+    row, so a ``null`` clears a previously set limit (the dash in the
+    table). The name / type columns stay untouched, and the Principal
+    UPDATED event the write publishes re-reconciles the member combos.
+    """
+    group = await _load_group(session, group_id)
+    try:
+        await group.update(session, body.model_dump(exclude_unset=True))
+    except Exception as e:
+        raise InvalidException(message=f"Failed to update group limits: {e}")
     counts = await _bulk_transitive_member_counts(session, [group.id])
     return UserGroupPublic.from_principal(group, member_count=counts.get(group.id, 0))
 
