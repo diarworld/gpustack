@@ -102,6 +102,14 @@ Rules:
 
 - `make test` (i.e. `uv run pytest`). `tests/` mirrors the `gpustack/` package layout;
   put a new test next to its module's mirror directory.
+- On Windows, do not treat a local full-suite run as a baseline: it fails on CRLF in the
+  log tests, the cp1251 locale in `test_watch_entry_points`, and UI assets. Run the
+  suite in the cluster's Linux pod instead —
+  `gpustack-ops/deploy/test-k8s/run-tests.ps1` (see the ops runbook, "Запуск тестов
+  gpustack в кластере"); keep local pytest runs targeted at the files you touched.
+- Tests that call model hubs live are marked `network` in `pytest.ini`; deselect them
+  with `-m "not network"` when a deterministic baseline matters (a shared egress IP gets
+  rate-limited by ModelScope with 403 that a normal client IP never sees).
 - Async tests use `@pytest.mark.asyncio` explicitly — there is no `asyncio_mode = auto`.
 - Root `conftest.py` provides module-scoped `temp_dir` and `config` fixtures (the latter
   calls `set_global_config`); `tests/conftest.py` puts the repo root first on `sys.path`
