@@ -38,6 +38,7 @@ from gpustack.schemas.resource_events import (
     EVENT_TYPE_LIMIT_EVENT,
     EVENT_TYPE_LIMIT_QUOTA_DAILY,
     EVENT_TYPE_LIMIT_QUOTA_MONTHLY,
+    EVENT_TYPE_LIMIT_QUOTA_WEEKLY,
     EVENT_TYPE_LIMIT_QUOTA_YEARLY,
     EVENT_TYPE_LIMIT_RATE_REQUESTS,
     EVENT_TYPE_LIMIT_RATE_TOKENS,
@@ -117,6 +118,12 @@ def limit_event_type(kind: Optional[str], period: Optional[str]) -> str:
     if kind == "query":
         return EVENT_TYPE_LIMIT_RATE_REQUESTS
     if kind == "token_rolling":
+        if period == "604800s":
+            # The weekly budget rides the same ``token_rolling`` kind as the
+            # per-minute TPM axis, so it needs its own event type for the
+            # usage views to tell the two apart (see rate_limit
+            # .WEEK_IN_SECONDS for why there is no calendar week).
+            return EVENT_TYPE_LIMIT_QUOTA_WEEKLY
         return EVENT_TYPE_LIMIT_RATE_TOKENS
     if kind == "token_calendar":
         return {
@@ -325,6 +332,10 @@ async def _store_limit_events(
                 resource_name=resource_name[:_MAX_NAME_CHARS],
                 event_type=event_type,
                 event_message=_row_message(event, suppressed, is_overflow),
+                # Exact rejection count: folding means one row can stand for
+                # many rejections, and the usage views sum this column rather
+                # than counting rows.
+                event_count=total_count,
                 spec_snapshot={
                     "combo": event.combo,
                     "kind": event.kind,

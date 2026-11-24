@@ -1987,5 +1987,78 @@ async def test_a_storage_row_keeps_its_own_sku_under_the_generic_endpoint(sessio
     by_name = {i["key"]: i for i in out["items"]}
     assert by_name["pv-mixed"]["sku"] == "volume--nfs--aws"
     # A real instance in the same response is still realigned off its
-    # representative — the guard narrows the overwrite, it does not remove it.
+    # representative - the guard narrows the overwrite, it does not remove it.
     assert by_name["gpu-1"]["sku"] == "h100x2"
+
+
+@pytest.mark.asyncio
+async def test_resource_events_stats_sums_event_counts(session, monkeypatch):
+    """The stats aggregation weights rows by event_count: a folded or
+    buffer-overflow row stands for several rejections, so the chart's total
+    is sum(coalesce(event_count, 1)) — not a row count."""
+    import gpustack.routes.resource_usage as ru
+    from gpustack.schemas.resource_events import (
+        EVENT_TYPE_LIMIT_QUOTA_WEEKLY,
+        EVENT_TYPE_LIMIT_RATE_REQUESTS,
+        ResourceEvent,
+    )
+
+    # Pin a zero rollup offset so the day buckets are plain UTC dates.
+    monkeypatch.setattr(ru, "rollup_offset_minutes", lambda: 0)
+
+    def _re(**kw):
+        base = dict(
+            occurred_at=BUCKET,
+            creator_id=7,
+            resource_type="limit",
+            resource_name="alice",
+        )
+        base.update(kw)
+        return ResourceEvent(**base)
+
+    session.add_all(
+        [
+            _re(
+                event_type=EVENT_TYPE_LIMIT_RATE_REQUESTS,
+                event_count=1,
+                event_message="Too many requests per minute",
+            ),
+            _re(
+                event_type=EVENT_TYPE_LIMIT_RATE_REQUESTS,
+                event_count=46,
+                event_message="Too many requests per minute, +45 suppressed",
+            ),
+            _re(
+                event_type=EVENT_TYPE_LIMIT_QUOTA_WEEKLY,
+                event_count=3,
+                event_message="Weekly token quota exceeded",
+            ),
+            # A lifecycle row predating the count column: NULL counts as 1 —
+            # but it stays out of a limit-only query.
+            _re(
+                event_type="created",
+                resource_type="gpu_instance",
+                resource_name="gpu-1",
+                event_message="GPU instance created",
+            ),
+        ]
+    )
+    await session.commit()
+
+    stats = await ru.resource_events_stats(
+        session=session,
+        user=USER,
+        ctx=CTX,
+        start_date=date(2026, 5, 26),
+        end_date=date(2026, 5, 26),
+        resource_type="limit",
+    )
+    assert stats["total"] == 50
+    by_type = {d["event_type"]: d["count"] for d in stats["by_type"]}
+    assert by_type == {
+        EVENT_TYPE_LIMIT_RATE_REQUESTS: 47,
+        EVENT_TYPE_LIMIT_QUOTA_WEEKLY: 3,
+    }
+    # Slices come back largest-first for the donut.
+    assert stats["by_type"][0]["event_type"] == EVENT_TYPE_LIMIT_RATE_REQUESTS
+    assert [(p["date"], p["count"]) for p in stats["series"]] == [("2026-05-26", 50)]

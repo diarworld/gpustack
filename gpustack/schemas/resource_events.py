@@ -57,6 +57,10 @@ EVENT_TYPE_DETACHED = "detached"
 # degrades to a generic row instead of a dropped one.
 EVENT_TYPE_LIMIT_RATE_REQUESTS = "limit_rate_requests"
 EVENT_TYPE_LIMIT_RATE_TOKENS = "limit_rate_tokens"
+# The weekly token budget is the plugin's rolling 7-day window (there is no
+# calendar week), kept as its own event type so the usage views can split it
+# from the per-minute TPM axis it shares the ``token_rolling`` kind with.
+EVENT_TYPE_LIMIT_QUOTA_WEEKLY = "limit_quota_weekly"
 EVENT_TYPE_LIMIT_CONCURRENCY = "limit_concurrency"
 EVENT_TYPE_LIMIT_QUOTA_DAILY = "limit_quota_daily"
 EVENT_TYPE_LIMIT_QUOTA_MONTHLY = "limit_quota_monthly"
@@ -114,6 +118,14 @@ class ResourceEvent(SQLModel, BaseModelMixin, table=True):
     event_type: str = Field(sa_column=Column(String(64), nullable=False))
     event_message: Optional[str] = Field(default=None, max_length=1024)
 
+    # How many real occurrences this row stands for. One for a plain event;
+    # more on the rate-limit rows the collector folds (a burst keeps at most
+    # five rows per flush with the tail counted on the last one) or emits as
+    # a buffer-overflow stand-in. NULL on rows written before the column and
+    # on every other row, which are exactly one event — aggregation treats
+    # NULL as 1.
+    event_count: Optional[int] = Field(default=None, sa_column=Column(Integer))
+
     # ``status.phase`` at event time — denormalized so the collector can
     # answer "what phase was the resource in at T?" without re-reading
     # ``spec_snapshot``.
@@ -165,6 +177,7 @@ class ResourceEventArchive(SQLModel, BaseModelMixin, table=True):
     resource_name: str = Field(default=..., max_length=255)
     event_type: str = Field(sa_column=Column(String(64), nullable=False))
     event_message: Optional[str] = Field(default=None, max_length=1024)
+    event_count: Optional[int] = Field(default=None, sa_column=Column(Integer))
     phase: Optional[str] = Field(default=None, max_length=64)
     spec_snapshot: Optional[Dict[str, Any]] = Field(
         default=None, sa_column=Column(JSON(), nullable=True)

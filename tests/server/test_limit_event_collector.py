@@ -18,6 +18,7 @@ from gpustack.schemas.resource_events import (
     EVENT_TYPE_LIMIT_EVENT,
     EVENT_TYPE_LIMIT_QUOTA_DAILY,
     EVENT_TYPE_LIMIT_QUOTA_MONTHLY,
+    EVENT_TYPE_LIMIT_QUOTA_WEEKLY,
     EVENT_TYPE_LIMIT_QUOTA_YEARLY,
     EVENT_TYPE_LIMIT_RATE_REQUESTS,
     EVENT_TYPE_LIMIT_RATE_TOKENS,
@@ -63,8 +64,10 @@ def test_parse_consumer_user_id(consumer, expected):
         ("query", "60s", EVENT_TYPE_LIMIT_RATE_REQUESTS),
         ("query", "86400s", EVENT_TYPE_LIMIT_RATE_REQUESTS),
         ("token_rolling", "60s", EVENT_TYPE_LIMIT_RATE_TOKENS),
-        # The weekly budget is a sliding 7-day window, not a calendar axis.
-        ("token_rolling", "604800s", EVENT_TYPE_LIMIT_RATE_TOKENS),
+        # The weekly budget rides the token_rolling kind (sliding 7-day
+        # window), but gets its own event type so the usage views can tell it
+        # apart from the per-minute TPM axis.
+        ("token_rolling", "604800s", EVENT_TYPE_LIMIT_QUOTA_WEEKLY),
         ("token_calendar", "each_day", EVENT_TYPE_LIMIT_QUOTA_DAILY),
         ("token_calendar", "each_month", EVENT_TYPE_LIMIT_QUOTA_MONTHLY),
         ("token_calendar", "each_year", EVENT_TYPE_LIMIT_QUOTA_YEARLY),
@@ -142,6 +145,8 @@ async def test_flush_writes_resource_event_row():
     assert row.consumer_principal_id == 3970
     assert row.event_type == EVENT_TYPE_LIMIT_QUOTA_MONTHLY
     assert row.event_message == "Monthly token quota exceeded, model=qwen3-32b"
+    # A plain row stands for exactly one rejection.
+    assert row.event_count == 1
     # Naive UTC — the events table anchors on the storage convention.
     assert row.occurred_at == datetime(2026, 11, 24, 7, 40, 31)
     assert row.spec_snapshot["combo"] == "user-3970"
@@ -182,6 +187,9 @@ async def test_flush_folds_burst_beyond_row_cap():
     assert rows[0].occurred_at == base.replace(tzinfo=None)
     assert rows[4].occurred_at == (base + timedelta(seconds=4)).replace(tzinfo=None)
     assert rows[4].spec_snapshot["count"] == 46
+    # The counts are first-class: plain rows carry 1, the folded tail row
+    # carries the burst, so the usage views can sum exact rejections.
+    assert [r.event_count for r in rows] == [1, 1, 1, 1, 46]
 
 
 @pytest.mark.asyncio
@@ -230,6 +238,7 @@ async def test_buffer_overflow_degrades_to_one_row_per_key():
         "Rate limit events buffer overflow, 7 events suppressed"
     )
     assert overflow.spec_snapshot["count"] == 7
+    assert overflow.event_count == 7
 
 
 @pytest.mark.asyncio

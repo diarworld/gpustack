@@ -80,6 +80,7 @@ from gpustack.schemas.usage import (
 from gpustack.schemas.resource_events import ResourceEvent
 from gpustack.server.db import async_session
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
+from gpustack.server.services import bulk_user_attribute_labels
 from gpustack.utils.export_delivery import (
     ExportSheetPlan,
     export_response,
@@ -337,19 +338,25 @@ def _rollup_shift(col, dialect: str, offset_min: int):
     return func.datetime(col, f"{sign}{abs(offset_min)} minutes")
 
 
-def _bucket_expr(session, granularity: str):
-    """Time-bucket expression over ``bucket_start`` for the requested
-    granularity. Rows are stored at hourly UTC granularity; we shift to the
-    rollup timezone (so buckets follow the operator's calendar, consistent with
-    the token rollup) then truncate via date_trunc (PostgreSQL) / date functions
-    (MySQL).
+def _bucket_expr(session, granularity: str, col=None):
+    """Time-bucket expression for the requested granularity. Rows are stored
+    at hourly UTC granularity; we shift to the rollup timezone (so buckets
+    follow the operator's calendar, consistent with the token rollup) then
+    truncate via date_trunc (PostgreSQL) / date functions (MySQL).
+
+    Defaults to the metered-usage bucket column; the resource-events stats
+    pass ``resource_events.occurred_at`` to bucket on the same calendar.
 
     For a half-hour-offset rollup tz (e.g. ``+05:30``) the hour labels land on
     the UTC ``:30`` boundary, so one stored UTC hour straddles two displayed
     hours. Harmless for aggregation (totals are unchanged) — only the hour-axis
     labels look offset by 30 minutes."""
     dialect = session.get_bind().dialect.name
-    col = _rollup_shift(MeteredUsage.bucket_start, dialect, rollup_offset_minutes())
+    col = _rollup_shift(
+        col if col is not None else MeteredUsage.bucket_start,
+        dialect,
+        rollup_offset_minutes(),
+    )
     if granularity == USAGE_GRANULARITY_HOUR:
         if dialect == "postgresql":
             return func.date_trunc("hour", col)
@@ -2255,6 +2262,17 @@ def _phase_message_of(spec_snapshot) -> Optional[str]:
     return status.get("phase_message") or status.get("phaseMessage")
 
 
+def _creator_label_fields(labels: Dict[str, str]) -> Dict[str, Optional[str]]:
+    """The attribute-label wire fields for one event's creator — the hover
+    tooltip on the events list's name column (profession / department /
+    business unit), resolved in bulk from the attribute-derived groups."""
+    return {
+        "creator_profession": labels.get("profession"),
+        "creator_department": labels.get("department"),
+        "creator_business_unit": labels.get("business_unit"),
+    }
+
+
 @router.get("/resource-events")
 async def resource_events(  # noqa: C901
     session: SessionDep,
@@ -2339,6 +2357,11 @@ async def resource_events(  # noqa: C901
     ).all()
 
     aware_tz = resolve_rollup_tz()  # resolved once, not per row
+    # Attribute labels for the name column's tooltip — one bulk query for the
+    # page, the same hydration the users list applies.
+    attribute_labels = await bulk_user_attribute_labels(
+        session, [r.creator_id for r in rows if r.creator_id is not None]
+    )
     return {
         "pagination": Pagination(
             page=page,
@@ -2362,8 +2385,135 @@ async def resource_events(  # noqa: C901
                 "phase_message": _phase_message_of(r.spec_snapshot),
                 "creator_id": r.creator_id,
                 "creator_name": r.creator_name,
+                **_creator_label_fields(attribute_labels.get(r.creator_id, {})),
             }
             for r in rows
+        ],
+    }
+
+
+def _series_bucket_label(value: Any, granularity: str) -> str:
+    """Axis label for one aggregated event bucket. Days (what the UI consumes)
+    are plain ISO dates — the shape the UI's bucket-range generator emits;
+    hours keep the rollup offset via ``_localize_bucket``."""
+    value = _localize_bucket(value, granularity)
+    if isinstance(value, datetime):
+        if granularity == USAGE_GRANULARITY_HOUR:
+            return value.isoformat()
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text_value = str(value or "")
+    return text_value if granularity == USAGE_GRANULARITY_HOUR else text_value[:10]
+
+
+@router.get("/resource-events/stats")
+async def resource_events_stats(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    scope: str = USAGE_SCOPE_ALL,
+    creator_ids: Optional[str] = None,
+    organization_ids: Optional[str] = None,
+    user_group_ids: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    granularity: str = USAGE_GRANULARITY_DAY,
+):
+    """Event counts for the overview chart, in the caller's scope.
+
+    The identity/date filters of the list endpoint, aggregated instead of
+    paged. Every sum weights rows by ``coalesce(event_count, 1)``: a folded
+    or buffer-overflow row stands for several rate-limit rejections, so
+    counting rows would underreport exactly the bursts the chart exists to
+    show.
+    """
+    if granularity not in (
+        USAGE_GRANULARITY_HOUR,
+        USAGE_GRANULARITY_DAY,
+        USAGE_GRANULARITY_WEEK,
+        USAGE_GRANULARITY_MONTH,
+    ):
+        raise InvalidException(message=f"Unsupported granularity: {granularity}")
+
+    effective_scope = _resolve_effective_scope(user, ctx, scope)
+    org_id = ctx.current_principal_id if ctx is not None else None
+    creator_id_list = _parse_id_csv(creator_ids)
+    organization_id_list = _parse_id_csv(organization_ids)
+    user_group_id_list = _parse_id_csv(user_group_ids)
+    _check_resource_filter_permission(
+        user,
+        ctx,
+        effective_scope,
+        organization_ids=organization_id_list,
+        user_group_ids=user_group_id_list,
+    )
+    group_member_ids = None
+    if user_group_id_list:
+        group_member_ids = await _group_member_user_ids(session, user_group_id_list)
+
+    stmt = select(ResourceEvent)
+    if effective_scope == USAGE_SCOPE_SELF:
+        stmt = stmt.where(ResourceEvent.creator_id == user.id)
+    if org_id is not None:
+        # Tenant scope follows the consumer, same as the list endpoint.
+        stmt = stmt.where(ResourceEvent.consumer_principal_id == org_id)
+    if creator_id_list:
+        stmt = stmt.where(ResourceEvent.creator_id.in_(creator_id_list))
+    if organization_id_list:
+        stmt = stmt.where(ResourceEvent.consumer_principal_id.in_(organization_id_list))
+    if group_member_ids is not None:
+        stmt = stmt.where(ResourceEvent.creator_id.in_(group_member_ids))
+    if resource_type:
+        stmt = stmt.where(ResourceEvent.resource_type == resource_type)
+    ev_start, ev_end = _rollup_day_window(start_date, end_date)
+    if ev_start is not None:
+        stmt = stmt.where(ResourceEvent.occurred_at >= ev_start)
+    if ev_end is not None:
+        stmt = stmt.where(ResourceEvent.occurred_at < ev_end)
+
+    sub = stmt.subquery()
+    weight = func.coalesce(sub.c.event_count, 1)
+
+    total = (
+        await session.exec(select(func.coalesce(func.sum(weight), 0)).select_from(sub))
+    ).first() or 0
+
+    by_type_rows = (
+        await session.exec(
+            select(
+                sub.c.event_type,
+                func.coalesce(func.sum(weight), 0).label("count"),
+            )
+            .select_from(sub)
+            .group_by(sub.c.event_type)
+        )
+    ).all()
+
+    bucket = _bucket_expr(session, granularity, sub.c.occurred_at)
+    series_rows = (
+        await session.exec(
+            select(
+                bucket.label("bucket"),
+                func.coalesce(func.sum(weight), 0).label("count"),
+            )
+            .select_from(sub)
+            .group_by(bucket)
+            .order_by(bucket)
+        )
+    ).all()
+
+    return {
+        "total": int(total),
+        "by_type": sorted(
+            ({"event_type": et, "count": int(c)} for et, c in by_type_rows),
+            key=lambda item: item["count"],
+            reverse=True,
+        ),
+        "series": [
+            {"date": _series_bucket_label(b, granularity), "count": int(c)}
+            for b, c in series_rows
         ],
     }
 
