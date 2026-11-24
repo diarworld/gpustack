@@ -780,6 +780,23 @@ SCALING_SCHEDULER_INTERVAL = max(
     1, int(os.getenv("GPUSTACK_SCALING_SCHEDULER_INTERVAL", 30))
 )  # in seconds
 
+# Decision-model gate for token-budget resets (the d3 service behind the
+# gateway's /v1/systemone). When the URL is set, every self-service reset
+# description is classified before the counters are cleared; an unreachable or
+# unparseable verdict leaves the reset approved (fail-open — the gate may never
+# hold a user's budget hostage to its own availability). Empty URL disables the
+# call entirely. The API key is the bearer token the gateway's ext-auth check
+# accepts; it stays in the process env and never reaches logs.
+D3_DECISION_URL = os.getenv("GPUSTACK_D3_DECISION_URL", "").strip()
+D3_DECISION_API_KEY = os.getenv("GPUSTACK_D3_DECISION_API_KEY", "").strip()
+# Host header for the decision call: the gateway routes by host, so an
+# in-cluster service URL (bypassing external DNS) still has to present the
+# published hostname. Empty means no override — the URL carries its own host.
+D3_DECISION_HOST = os.getenv("GPUSTACK_D3_DECISION_HOST", "").strip()
+# Bound on one classification round-trip. The reset POST blocks on it, and a
+# verdict arriving after this is no better than the fail-open path.
+D3_DECISION_TIMEOUT = float(os.getenv("GPUSTACK_D3_DECISION_TIMEOUT_SECONDS", 10))
+
 # Whether a content kind's OFFICIAL slot is created out of service, leaving the
 # embedded content — what this build ships — to serve.
 #

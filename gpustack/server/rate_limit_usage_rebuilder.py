@@ -62,7 +62,10 @@ from gpustack.gateway.rate_limit_usage import (
     user_limit_windows,
 )
 from gpustack.schemas.api_keys import ApiKey
-from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
+from gpustack.schemas.gateway_rate_limit_resets import (
+    RESET_OUTCOME_APPROVED,
+    GatewayRateLimitReset,
+)
 from gpustack.schemas.gateway_rate_limit_settings import GatewayRateLimitSettings
 from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.principals import Principal, PrincipalType
@@ -284,7 +287,16 @@ class RateLimitUsageRebuilder:
         ).date()
         max_date = now.date() + timedelta(days=1)
         async with async_session() as session:
-            resets = (await session.exec(select(GatewayRateLimitReset))).all()
+            # Only approved presses ever cleared the counters, so only they
+            # may forgive spend; a rejected row is the decision model's
+            # audit trail and forgives nothing.
+            resets = (
+                await session.exec(
+                    select(GatewayRateLimitReset).where(
+                        GatewayRateLimitReset.outcome == RESET_OUTCOME_APPROVED
+                    )
+                )
+            ).all()
             rows = (
                 await session.exec(
                     select(

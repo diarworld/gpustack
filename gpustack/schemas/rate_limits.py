@@ -47,6 +47,12 @@ class RateLimitResetStatus(BaseModel):
     in one week makes the next press available a week after the first
     press, not on the next calendar boundary. ``next_available_at`` is
     ``None`` while presses remain.
+
+    On the reset endpoint the same body carries the press's verdict:
+    ``status`` is ``reset`` when the counters were cleared, ``rejected``
+    when the decision model refused the description — then
+    ``rejection_reason`` names why and the quota state answers as-it-was
+    (a rejected press consumes nothing).
     """
 
     # Resets allowed per floating window (7 days for the weekly budget,
@@ -57,6 +63,11 @@ class RateLimitResetStatus(BaseModel):
     # When the oldest counted reset ages out of the floating window and a
     # press frees up. Only set once ``available`` reaches 0.
     next_available_at: Optional[datetime] = None
+    # What the press became: the counters cleared, or the decision model
+    # refused it. The quota reads omit the field (they carry no verdict).
+    status: str = "reset"
+    # Why the press was rejected, when it was. None otherwise.
+    rejection_reason: Optional[str] = None
 
 
 class ModelConcurrencyUsage(BaseModel):

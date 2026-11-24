@@ -5,15 +5,24 @@ token budgets publish (via
 :func:`gpustack.gateway.rate_limit_usage.expected_windows`) with the live
 counters the gateway's ``gpustack-rate-limit`` plugin keeps in Redis, read
 through :func:`gpustack.gateway.rate_limit_usage.read_windows`.
+
+A self-service reset press is additionally gated by the decision model
+(``D3_DECISION_URL``): the required description is classified before the
+counters clear, and a confident "no real task" verdict rejects the press
+as an audit-only row.
 """
 
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, Request
 from sqlalchemy import or_
 from sqlmodel import select
 
+from gpustack import envs
 from gpustack.api.exceptions import (
     BadRequestException,
     InvalidException,
@@ -36,7 +45,11 @@ from gpustack.gateway.rate_limit_usage import (
     user_limit_windows,
 )
 from gpustack.gateway.rate_limit_settings import effective_rate_limit
-from gpustack.schemas.gateway_rate_limit_resets import GatewayRateLimitReset
+from gpustack.schemas.gateway_rate_limit_resets import (
+    RESET_OUTCOME_APPROVED,
+    RESET_OUTCOME_REJECTED,
+    GatewayRateLimitReset,
+)
 from gpustack.schemas.model_routes import MyModel
 from gpustack.schemas.rate_limits import (
     FreeWindowUsage,
@@ -52,6 +65,8 @@ from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 # Module-level indirection so tests can substitute the reader construction;
 # production callers get the config-wired factory.
 _reader_factory = reader_from_config
@@ -64,6 +79,130 @@ RESET_WINDOW_SECONDS = {"weekly": 604800, "monthly": 30 * 86400}
 # The long token window periods each reset kind forgives, matched against
 # the published windows of the target user.
 _RESET_PERIODS = {"weekly": "604800s", "monthly": "each_month"}
+
+# The confidence the decision model must reach on "no real task" for the
+# press to be rejected; a less confident verdict lets the reset through
+# (the gate decides on its strong answers only).
+D3_REJECT_CONFIDENCE = 0.5
+
+# The three questions the decision model answers for a reset description,
+# verbatim the production prompts: is this a concrete work task, what kind
+# of work it is, and why a rejected press was rejected. The wording is the
+# contract with the d3 service — changing it here changes what the model
+# judges.
+_D3_QUESTIONS = {
+    "answered": {
+        "type": "noul",
+        "instructions": (
+            "Это ответ на вопрос \"Напишите какой задачей вы занимаетесь?\" "
+            "для запроса на сброс лимита LLM токенов. Проверь, содержит ли "
+            "ответ КОНКРЕТНУЮ рабочую задачу. Верни false, если ответ состоит "
+            "из общих отписок, бессмысленных фраз или абстрактных действий "
+            "без привязки к реальному проекту (например: 'для работы', "
+            "'тестирую модель')"
+        ),
+    },
+    "WorkType": {
+        "type": "choice",
+        "instructions": (
+            "Классифицируй род занятий из ответа пользователя. Если ответ не "
+            "содержит реальной рабочей задачи, является отпиской или попыткой "
+            "обойти проверку (например: 'ищу баг в вашей системе', 'тестирую "
+            "платформу', 'просто проверяю'), строго выбирай Unknown."
+        ),
+        "criteria": {
+            "SoftwareDevelopment": (
+                "Разработка программного обеспечения. Создание веб-сайтов, "
+                "мобильных приложений, десктопных программ, игр и встроенного "
+                "ПО (фронтенд, бэкенд, фулстек) с указанием функционала или "
+                "стека."
+            ),
+            "QA": (
+                "Тестирование и обеспечение качества. Написание автотестов, "
+                "проверка конкретного функционала продукта, нагрузочное "
+                "тестирование. НЕ включать абстрактные фразы вроде 'ищу баги' "
+                "или 'тестирую систему' без описания проверяемого продукта."
+            ),
+            "Data": (
+                "Аналитика и работа с данными. Бизнес- и системный анализ, "
+                "сбор требований, работа с базами данных, SQL, ML и ИИ (Data "
+                "Science, Data Engineering)."
+            ),
+            "Run": (
+                "Инфраструктура и эксплуатация. Настройка и поддержка "
+                "серверов, сетей, облачных хранилищ и БД, автоматизация "
+                "процессов доставки кода (DevOps, сисадминство)."
+            ),
+            "InfoSec": (
+                "Информационная безопасность. Защита систем и данных от "
+                "взломов и утечек, аудит уязвимостей конкретных сервисов. НЕ "
+                "включать непрошеный 'поиск багов в вашей системе'."
+            ),
+            "UIUX": (
+                "Дизайн и проектирование интерфейсов. Создание визуального "
+                "стиля, прототипов и пользовательских сценариев для цифровых "
+                "продуктов."
+            ),
+            "Management": (
+                "Управление продуктами и проектами. Планирование сроков, "
+                "координация команд (Project Management) и стратегия развития "
+                "продукта (Product Management)."
+            ),
+            "SupportServiceDesk": (
+                "Техническая поддержка. Консультация пользователей, "
+                "диагностика и устранение сбоев в работе внедренных систем."
+            ),
+            "Unknown": (
+                "Прочая деятельность, отписки, абстрактные формулировки без "
+                "указания проекта/продукта (например, 'ищу баг в системе', "
+                "'тестирую ИИ'), либо работа, для которой не требуется доступ "
+                "к LLM."
+            ),
+        },
+    },
+    "rejection_reason": {
+        "type": "choice",
+        "instructions": (
+            "Укажи код причины отклонения заявки. Если answered = true и "
+            "WorkType != Unknown, строго выбирай None."
+        ),
+        "criteria": {
+            "None": "Заявка корректна, отклонение не требуется.",
+            "TooVague": (
+                "Слишком общее описание: указано направление, но не хватает "
+                "конкретной задачи или объекта/проекта (например: 'пишу код "
+                "для бэкенда', 'делаю дизайн')."
+            ),
+            "BypassAttempt": (
+                "Отписка, манипуляция или попытка обойти проверку без "
+                "реальной задачи (например: 'ищу баг в вашей системе', "
+                "'тестирую лимиты', 'для работы', 'очень надо')."
+            ),
+            "NonIT": (
+                "Задача не относится к ИТ-работам (например: написание "
+                "реферата, генерация текстов, личные вопросы)."
+            ),
+            "Gibberish": (
+                "Бессмысленный набор символов, пустой ответ или несвязный " "текст."
+            ),
+        },
+    },
+}
+
+
+@dataclass
+class _D3Verdict:
+    """One classification round: the answers the decision model gave.
+
+    ``rejection_reason`` is ``None`` when the model named no cause (or
+    answered the literal string "None", its own way of saying none); the
+    reject decision itself rides on ``answered`` + ``confidence``.
+    """
+
+    answered: bool
+    confidence: float
+    work_type: Optional[str]
+    rejection_reason: Optional[str]
 
 
 def _mode(rlc: Optional[GatewayRateLimitConfig]) -> str:
@@ -125,6 +264,123 @@ def _reader(request: Request, cfg: Config):
     return reader
 
 
+def _d3_answer_bool(answer: Dict[str, Any]) -> Optional[bool]:
+    """The yes/no the model returned, in whatever clothing it arrives.
+
+    The wire contract says ``choice`` is boolean for a noul question, but a
+    lenient read costs nothing: boolean JSON, or the usual string spellings
+    ("true"/"false"/"yes"/"no"). Anything else is not a verdict.
+    """
+    choice = answer.get("choice")
+    if isinstance(choice, bool):
+        return choice
+    if isinstance(choice, str):
+        lowered = choice.strip().lower()
+        if lowered in ("true", "yes"):
+            return True
+        if lowered in ("false", "no"):
+            return False
+    return None
+
+
+def _d3_confidence(answer: Dict[str, Any]) -> float:
+    """The model's certainty in its answer, clamped into 0..1.
+
+    A missing or malformed confidence reads as certain: the reject decision
+    keys on a *strong* no, and an answer without a stated confidence was
+    not a hedge the model chose to publish — treating it as weak would let
+    every malformed verdict through. The 0..1 clamp also accepts a
+    percentage that slipped through the service.
+    """
+    try:
+        confidence = float(answer.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if confidence > 1.0:
+        confidence /= 100.0
+    return min(max(confidence, 0.0), 1.0)
+
+
+def _d3_choice_str(answer: Dict[str, Any]) -> Optional[str]:
+    """A choice answer as a plain string, or None when not a real pick."""
+    choice = answer.get("choice")
+    if isinstance(choice, str):
+        stripped = choice.strip()
+        # "None" is the model spelling its own no-cause option, not a cause.
+        return None if stripped.lower() in ("", "none") else stripped
+    return None
+
+
+async def _classify_with_d3(description: str) -> Optional[_D3Verdict]:
+    """Ask the decision model to judge a reset description.
+
+    Sends the three production questions (a concrete-task check, a work-type
+    classification, a rejection cause) over the jevcompat wire contract the
+    model-selection path already uses. Returns ``None`` — never raises —
+    when the gate is disabled or the verdict is unusable: an unreachable
+    judge must not hold a user's budget hostage, so every failure mode
+    funnels into the fail-open approve path. The URL, key and Host header
+    come from the deployment env; the key is never logged.
+    """
+    url = envs.D3_DECISION_URL
+    if not url:
+        return None
+    data = {
+        "state": {"messages": [{"role": "user", "content": description}]},
+        "questions": _D3_QUESTIONS,
+        "model": "d3",
+    }
+    headers = {"Authorization": f"Bearer {envs.D3_DECISION_API_KEY}"}
+    if envs.D3_DECISION_HOST:
+        headers["Host"] = envs.D3_DECISION_HOST
+    try:
+        async with httpx.AsyncClient(trust_env=True) as client:
+            response = await client.post(
+                url, json=data, headers=headers, timeout=envs.D3_DECISION_TIMEOUT
+            )
+            response.raise_for_status()
+            verdict = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning(
+            "reset decision model unavailable, approving reset: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    answers = verdict.get("answers") if isinstance(verdict, dict) else None
+    answered_answer = answers.get("answered") if isinstance(answers, dict) else None
+    answered = (
+        _d3_answer_bool(answered_answer) if isinstance(answered_answer, dict) else None
+    )
+    if answered is None:
+        logger.warning(
+            "reset decision model returned no usable answered verdict, "
+            "approving reset: %s",
+            str(verdict)[:200],
+        )
+        return None
+    work_type_answer = answers.get("WorkType") if isinstance(answers, dict) else None
+    reason_answer = (
+        answers.get("rejection_reason") if isinstance(answers, dict) else None
+    )
+    return _D3Verdict(
+        answered=answered,
+        confidence=(
+            _d3_confidence(answered_answer)
+            if isinstance(answered_answer, dict)
+            else 1.0
+        ),
+        work_type=(
+            _d3_choice_str(work_type_answer)
+            if isinstance(work_type_answer, dict)
+            else None
+        ),
+        rejection_reason=(
+            _d3_choice_str(reason_answer) if isinstance(reason_answer, dict) else None
+        ),
+    )
+
+
 async def _ready_model_names(session, target: User) -> List[str]:
     """The ready routes the target can reach, by name.
 
@@ -156,6 +412,8 @@ async def _reset_status(
     Only self-service presses count against the quota: an admin resetting
     on the user's behalf (``reset_by_user_id`` pointing at someone else)
     is a support action and never consumes the user's own allowance.
+    Rejected presses are audit rows the decision model produced — they
+    cleared nothing, so they never consume either.
     """
     window = timedelta(seconds=RESET_WINDOW_SECONDS[kind])
     counted = (
@@ -165,6 +423,7 @@ async def _reset_status(
                 GatewayRateLimitReset.user_id == target_id,
                 GatewayRateLimitReset.kind == kind,
                 GatewayRateLimitReset.reset_at > now - window,
+                GatewayRateLimitReset.outcome == RESET_OUTCOME_APPROVED,
                 or_(
                     GatewayRateLimitReset.reset_by_user_id.is_(None),
                     GatewayRateLimitReset.reset_by_user_id == target_id,
@@ -343,6 +602,13 @@ async def reset_rate_limit(
     restarts from zero on the next request), records the press in
     ``gateway_rate_limit_resets`` and returns the fresh quota state.
 
+    A self-service press is first judged by the decision model: a
+    description the model confidently rejects ("no concrete work task")
+    leaves the counters alone and is recorded as a rejected audit row —
+    the response carries ``status=rejected`` with the model's rejection
+    reason. An unreachable decision model approves the press (fail-open);
+    an admin pressing on a user's behalf is not gated.
+
     Scoping mirrors ``get_rate_limits``: self by default, a foreign
     ``user_id`` only for a platform-wide admin. An admin bypasses the
     floating quota — their press is a support action, recorded with
@@ -399,6 +665,40 @@ async def reset_rate_limit(
     if not is_platform_wide(user, ctx) and status.available <= 0:
         raise BadRequestException(message="Reset quota exhausted for this period")
 
+    # The decision-model gate only judges the person whose budget it is: the
+    # description question ("what task are you working on?") is addressed to
+    # the requester, and an admin pressing on someone's behalf is a trusted
+    # support action already exempt from the quota. A None verdict (gate
+    # disabled, unreachable, or a non-self press) approves unconditionally —
+    # the gate may never hold a budget hostage to its own availability.
+    verdict = None
+    if user.id == target.id:
+        verdict = await _classify_with_d3(body.description.strip())
+
+    if verdict is not None and (
+        not verdict.answered and verdict.confidence > D3_REJECT_CONFIDENCE
+    ):
+        # A confident "no real task": record the refusal, touch nothing. The
+        # counters stay and the quota stays — only the audit trail is kept,
+        # and the caller gets the verdict to phrase for the user.
+        await GatewayRateLimitReset.create(
+            session,
+            GatewayRateLimitReset(
+                user_id=target.id,
+                kind=body.kind,
+                reset_at=now,
+                reset_by_user_id=None,
+                description=body.description.strip(),
+                outcome=RESET_OUTCOME_REJECTED,
+                work_type=verdict.work_type,
+                rejection_reason=verdict.rejection_reason,
+            ),
+        )
+        fresh = await _reset_status(session, target.id, body.kind, now)
+        fresh.status = RESET_OUTCOME_REJECTED
+        fresh.rejection_reason = verdict.rejection_reason
+        return fresh
+
     # The row lands before the counters are deleted: the counter rebuild
     # keys its cutoff off this table, so a rebuild that races the delete
     # must never see deleted counters without their cutoff.
@@ -410,6 +710,8 @@ async def reset_rate_limit(
             reset_at=now,
             reset_by_user_id=user.id if user.id != target.id else None,
             description=body.description.strip(),
+            outcome=RESET_OUTCOME_APPROVED,
+            work_type=verdict.work_type if verdict is not None else None,
         ),
     )
 

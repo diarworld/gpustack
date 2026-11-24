@@ -9,6 +9,7 @@ directly.
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from redis.exceptions import RedisError
 from zoneinfo import ZoneInfoNotFoundError
@@ -31,6 +32,16 @@ from gpustack.schemas.users import User
 # A fixed instant with a 12h elapsed UTC day, so calendar boundaries are
 # exact regardless of when the suite runs.
 FIXED_NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _d3_gate_off(monkeypatch):
+    """The decision-model gate defaults to off for this suite: no URL, no
+    key. Tests that exercise the gate switch it on with their own
+    monkeypatches, which layer over this one."""
+    monkeypatch.setattr(rate_limits.envs, "D3_DECISION_URL", "")
+    monkeypatch.setattr(rate_limits.envs, "D3_DECISION_API_KEY", "")
+    monkeypatch.setattr(rate_limits.envs, "D3_DECISION_HOST", "")
 
 
 def _cfg(**overrides) -> GatewayRateLimitConfig:
@@ -154,7 +165,7 @@ class FakeSession:
             return str(statement)
 
     def _matching_resets(self, text):
-        """Rows the reset-status query would fetch: the kind and user
+        """Rows the reset-status query would fetch: the kind / user / outcome
         filters read off the compiled statement, the self-service filter
         (an admin's press never counts) mirrored in Python."""
         matched = [
@@ -162,6 +173,10 @@ class FakeSession:
             for row in self._resets
             if f"kind = '{row.kind}'" in text
             and f"user_id = {row.user_id}" in text
+            and (
+                getattr(row, "outcome", "approved")
+                == rate_limits.RESET_OUTCOME_APPROVED
+            )
             and (row.reset_by_user_id is None or row.reset_by_user_id == row.user_id)
         ]
         matched.sort(key=lambda r: r.reset_at)
@@ -814,9 +829,13 @@ async def test_reader_failure_surfaces_only_the_class_name(
         assert window.reset_seconds is None
 
 
-def _reset(user_id, kind, at, by=None):
-    """A recorded reset row, aware UTC as UTCDateTime returns it."""
-    return SimpleNamespace(user_id=user_id, kind=kind, reset_at=at, reset_by_user_id=by)
+def _reset(user_id, kind, at, by=None, outcome="approved"):
+    """A recorded reset row, aware UTC as UTCDateTime returns it. Rows
+    written before the outcome column existed were unconditional approvals,
+    which is what the default encodes."""
+    return SimpleNamespace(
+        user_id=user_id, kind=kind, reset_at=at, reset_by_user_id=by, outcome=outcome
+    )
 
 
 @pytest.mark.asyncio
@@ -975,6 +994,259 @@ async def test_reset_validations(frozen_now, monkeypatch):
             body=RateLimitResetCreate(kind="weekly", description="x"),
         )
     assert session.added == [] and reader.deleted == []
+
+
+def _d3_payload(answered, confidence, work_type=None, reason=None):
+    """A decision-model verdict body in the jevcompat answer shape. The
+    ``None`` reason travels as the literal string — the model's own
+    no-cause spelling."""
+    return {
+        "answers": {
+            "answered": {"choice": answered, "confidence": confidence},
+            "WorkType": {"choice": work_type},
+            "rejection_reason": {"choice": reason if reason else "None"},
+        }
+    }
+
+
+def _d3_client(monkeypatch, handler):
+    """Swap httpx.AsyncClient for one served by ``handler``, recording every
+    request the gate makes (url, headers, body)."""
+    calls = []
+    real_client = httpx.AsyncClient
+
+    def record(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return handler(request)
+
+    def factory(**kwargs):
+        return real_client(transport=httpx.MockTransport(record), **kwargs)
+
+    monkeypatch.setattr(rate_limits.httpx, "AsyncClient", factory)
+    return calls
+
+
+def _gate_on(monkeypatch, url="http://d3.test/v1/systemone"):
+    monkeypatch.setattr(rate_limits.envs, "D3_DECISION_URL", url)
+    monkeypatch.setattr(rate_limits.envs, "D3_DECISION_API_KEY", "key-d3")
+
+
+def _reset_call(cfg, session, reader, user, description):
+    return rate_limits.reset_rate_limit(
+        session=session,
+        user=user,
+        ctx=_ctx(10),
+        request=_request(cfg),
+        body=RateLimitResetCreate(kind="weekly", description=description),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reset_fail_open_when_d3_unreachable(frozen_now, monkeypatch):
+    """An unreachable decision model approves the press: the gate may never
+    hold a budget hostage to its own availability."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+
+    def handler(request):
+        raise httpx.ConnectError("connection refused")
+
+    _d3_client(monkeypatch, handler)
+
+    status = await _reset_call(cfg, session, reader, user, "data pipeline work")
+
+    assert status.status == "reset" and status.available == 1
+    (row,) = session.added
+    assert row.outcome == "approved" and row.work_type is None
+    assert reader.deleted, "the counters must clear on the fail-open path"
+
+
+@pytest.mark.asyncio
+async def test_reset_rejected_on_confident_no(frozen_now, monkeypatch):
+    """A confident "no concrete task" verdict rejects the press: audit row
+    with the model's reason, counters untouched, quota untouched."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    _d3_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, json=_d3_payload(False, 0.8, "Unknown", "BypassAttempt")
+        ),
+    )
+
+    status = await _reset_call(cfg, session, reader, user, "для работы")
+
+    assert status.status == "rejected"
+    assert status.rejection_reason == "BypassAttempt"
+    # The quota state answers as-it-was: a rejected press consumes nothing.
+    assert status.available == 2 and status.next_available_at is None
+    (row,) = session.added
+    assert row.outcome == "rejected" and row.rejection_reason == "BypassAttempt"
+    assert row.work_type == "Unknown"
+    assert reader.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_reset_approved_on_low_confidence_no(frozen_now, monkeypatch):
+    """A "no" below the confidence bar is not a verdict the gate acts on:
+    the press goes through and the classification still lands."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    _d3_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, json=_d3_payload(False, 0.4, "Unknown", "TooVague")
+        ),
+    )
+
+    status = await _reset_call(cfg, session, reader, user, "что-то для проекта")
+
+    assert status.status == "reset" and status.available == 1
+    (row,) = session.added
+    assert row.outcome == "approved" and row.work_type == "Unknown"
+    assert reader.deleted, "an approved press clears the counters"
+
+
+@pytest.mark.asyncio
+async def test_reset_saves_work_type_on_approval(frozen_now, monkeypatch):
+    """An approved press records the decision model's work-type verdict —
+    the classification the budget was spent on."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    calls = _d3_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, json=_d3_payload(True, 0.95, "SoftwareDevelopment", None)
+        ),
+    )
+
+    status = await _reset_call(
+        cfg, session, reader, user, "пишу бэкенд для интеграции с 1С"
+    )
+
+    assert status.status == "reset" and status.available == 1
+    (row,) = session.added
+    assert row.outcome == "approved" and row.work_type == "SoftwareDevelopment"
+    assert row.rejection_reason is None
+    # The gate calls the configured service with the description as the
+    # only user message and the bearer key in the header.
+    (request,) = calls
+    assert request.url == "http://d3.test/v1/systemone"
+    assert request.headers["Authorization"] == "Bearer key-d3"
+    body = request.read()
+    assert b"SoftwareDevelopment" in body and b"backfill" not in body
+    assert b'"d3"' in body
+
+
+@pytest.mark.asyncio
+async def test_reset_rejected_without_reason_leaves_it_unset(frozen_now, monkeypatch):
+    """A confident no that names no cause still rejects, and the response
+    carries no reason — the UI falls back to its generic wording."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    _d3_client(
+        monkeypatch,
+        lambda request: httpx.Response(200, json=_d3_payload(False, 0.9)),
+    )
+
+    status = await _reset_call(cfg, session, reader, user, "asdkjh 12321")
+
+    assert status.status == "rejected" and status.rejection_reason is None
+    assert reader.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_reset_gate_off_makes_no_call(frozen_now, monkeypatch):
+    """With the gate unconfigured the reset is unconditional and no HTTP
+    request is spent on it."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    calls = _d3_client(
+        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(True, 1.0))
+    )
+
+    status = await _reset_call(cfg, session, reader, user, "anything")
+
+    assert status.status == "reset" and status.available == 1
+    assert calls == []
+    (row,) = session.added
+    assert row.outcome == "approved" and row.work_type is None
+
+
+@pytest.mark.asyncio
+async def test_reset_quota_ignores_rejected_rows(frozen_now, monkeypatch):
+    """Rejected presses are audit rows, not quota spend: two rejections in
+    the window leave both presses available."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=2), outcome="rejected"),
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=1), outcome="rejected"),
+    ]
+    session = FakeSession(users=[user], resets=resets)
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+
+    response = await rate_limits.get_rate_limits(
+        session=session, user=user, ctx=_ctx(10), request=_request(cfg)
+    )
+
+    weekly = response.user.resets["weekly"]
+    assert weekly.available == 2 and weekly.next_available_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_reset_skips_the_gate(frozen_now, monkeypatch):
+    """An admin pressing on a user's behalf is not judged: no HTTP call is
+    made, the row records plain approval."""
+    cfg = _redis_cfg()
+    admin = _user(1, is_admin=True, weekly=50_000, monthly=90_000)
+    target = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[admin, target])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    calls = _d3_client(
+        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(True, 1.0))
+    )
+
+    status = await rate_limits.reset_rate_limit(
+        session=session,
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        body=RateLimitResetCreate(
+            kind="weekly", description="support escalation", user_id=7
+        ),
+    )
+
+    assert status.status == "reset"
+    assert calls == []
+    (row,) = session.added
+    assert row.outcome == "approved" and row.work_type is None
 
 
 class TestFreeWindowBadge:
