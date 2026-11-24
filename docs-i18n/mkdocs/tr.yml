@@ -51,6 +51,7 @@ nav_translations:
   User Management: Kullanıcı Yönetimi
   Usage: Kullanım
   Quotas: Kotalar
+  Rate Limiting: Hız Sınırlandırma
   Single Sign-On (SSO) Authentication: Tek Oturum Açma (SSO) Kimlik Doğrulaması
   Observability: Gözlemlenebilirlik
   Benchmarking: Performans Ölçümü

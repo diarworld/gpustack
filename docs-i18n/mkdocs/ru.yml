@@ -51,6 +51,7 @@ nav_translations:
   User Management: Управление пользователями
   Usage: Использование
   Quotas: Квоты
+  Rate Limiting: Ограничение частоты запросов
   Single Sign-On (SSO) Authentication: Аутентификация с помощью единого входа (SSO)
   Observability: Наблюдаемость
   Benchmarking: Бенчмаркинг
