@@ -100,16 +100,20 @@ Rules:
 
 ## Tests
 
-- `make test` (i.e. `uv run pytest`). `tests/` mirrors the `gpustack/` package layout;
-  put a new test next to its module's mirror directory.
-- On Windows, do not treat a local full-suite run as a baseline: it fails on CRLF in the
-  log tests, the cp1251 locale in `test_watch_entry_points`, and UI assets. Run the
-  suite in the cluster's Linux pod instead —
+- Full-suite runs go to the cluster's Linux pod, not to a local shell. From Windows run
   `gpustack-ops/deploy/test-k8s/run-tests.ps1` (see the ops runbook, "Запуск тестов
-  gpustack в кластере"); keep local pytest runs targeted at the files you touched.
-- Tests that call model hubs live are marked `network` in `pytest.ini`; deselect them
-  with `-m "not network"` when a deterministic baseline matters (a shared egress IP gets
-  rate-limited by ModelScope with 403 that a normal client IP never sees).
+  gpustack в кластере"). The run takes ~15 min and is the only baseline that counts: a
+  local full-suite run fails on CRLF in the log tests, the cp1251 locale in
+  `test_watch_entry_points`, and UI assets, so its red/green carries no signal.
+- `make test` (i.e. `uv run pytest`) is for quick targeted iteration on single test
+  files while writing code (e.g. `uv run pytest tests/utils/test_search.py -q`). It is
+  never a pass/fail verdict on the branch — before finishing, verify with the cluster
+  runner.
+- `tests/` mirrors the `gpustack/` package layout; put a new test next to its module's
+  mirror directory.
+- Tests that call model hubs live are marked `network` in `pytest.ini`; the cluster
+  runner deselects them with `-m "not network"` (a shared egress IP gets rate-limited
+  by ModelScope with 403 that a normal client IP never sees).
 - Async tests use `@pytest.mark.asyncio` explicitly — there is no `asyncio_mode = auto`.
 - Root `conftest.py` provides module-scoped `temp_dir` and `config` fixtures (the latter
   calls `set_global_config`); `tests/conftest.py` puts the repo root first on `sys.path`
