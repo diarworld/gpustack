@@ -108,7 +108,10 @@ Rules:
 - `make test` (i.e. `uv run pytest`) is for quick targeted iteration on single test
   files while writing code (e.g. `uv run pytest tests/utils/test_search.py -q`). It is
   never a pass/fail verdict on the branch — before finishing, verify with the cluster
-  runner.
+  runner. Caveat: files that are platform-sensitive themselves (log formatting,
+  encodings, path handling — e.g. the worker serving-log tests) fail locally no matter
+  what the code says, so verify changes to those areas in the cluster even when
+  targeted.
 - `tests/` mirrors the `gpustack/` package layout; put a new test next to its module's
   mirror directory.
 - Tests that call model hubs live are marked `network` in `pytest.ini`; the cluster
