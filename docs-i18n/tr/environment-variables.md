@@ -78,6 +78,16 @@ Bu ortam değişkenleri genellikle üçüncü taraf hizmet entegrasyonları içi
 | ----------------------------------- | ---------------------------- | ------- | ---------- |
 | `GPUSTACK_SERVER_CACHE_TTL_SECONDS` | Saniyeler içinde sunucu önbelleği TTL. | `600`   | Sunucu |
 
+### Sunucu Koordinasyonu (HA) { #server-coordination-ha }
+
+| Değişken | Açıklama | Varsayılan | Şunlar için geçerlidir: |
+| --- | --- | --- | --- |
+| `GPUSTACK_COORDINATOR_MODE` | `local` (varsayılan) veya `redis`. `redis`, sunucu örnekleri genelinde (çok replikalı HA) zamanlayıcı ve denetleyiciler için tek bir lider seçer ve örnekler arası olayları taşır; her replika API ve UI'yi sunmaya devam eder. `GPUSTACK_COORDINATOR_REDIS_URL` gerektirir. | `local` | Sunucu |
+| `GPUSTACK_COORDINATOR_REDIS_URL` | Koordinatörün lider seçimi ve örnekler arası olaylar için kullandığı Redis'in URL'si. `redis://` veya `rediss://`; kimlik bilgilerine izin verilir (`GPUSTACK_REDIS_URL`'den farklı olarak bu URL asla ağ geçidi CR'lerine aktarılmaz). Mod `redis` olduğunda gereklidir. | (boş) | Sunucu |
+| `GPUSTACK_COORDINATOR_LEADER_TTL_SECONDS` | Lider kirasının TTL'si. Ayrıca kontrol düzlemi devretmesinin en kötü durum süresidir: görevden alınan veya erişilemeyen bir lider süreçten çıkar ve yedek, kiranın süresi dolana kadar kirayı alamaz. | `30` | Sunucu |
+| `GPUSTACK_COORDINATOR_RENEW_INTERVAL_SECONDS` | Liderin kirasını ne sıklıkla yenilediği. | `10` | Sunucu |
+| `GPUSTACK_COORDINATOR_REDIS_MAX_CONNECTIONS` | `redis` modunda sunucu işlemi başına eşzamanlı Redis bağlantısı sınırı. Sınıra ulaşıldığında bir komut başarısız olmak yerine boş bir bağlantı bekler; dolayısıyla bu, aktarım hızını değil Redis tarafındaki bağlantı ayak izini sınırlar. | `100` | Sunucu |
+
 ### Kimlik Doğrulama ve Güvenlik { #authentication-security }
 
 | Değişken | Açıklama | Varsayılan | Şunlar için geçerlidir: |
@@ -94,6 +104,8 @@ Bu ortam değişkenleri genellikle üçüncü taraf hizmet entegrasyonları içi
 | `GPUSTACK_GATEWAY_AUTH_RECONCILE_INTERVAL_SECONDS` | Sunucunun, ağ geçidinin yerel olarak doğruladığı API anahtarlarını veritabanından yeniden hesaplama aralığı. ORM'yi atlayan silmeler olay üretmez; bu nedenle genel bir rotada silinmiş bir anahtarın çalışmaya devam edebileceği en uzun süre budur. | `30`      | Sunucu |
 | `GPUSTACK_GATEWAY_AUTH_ALLOW_CUSTOM_KEYS`          | Özel bir API anahtarının (kullanıcının sırrını sağladığı anahtar) ağ geçidinde doğrulanıp doğrulanamayacağı. Kapalı, çalışmaya devam ediyor ancak her istekte sunucuya soruyor. Açık olduğunda, anahtar, sırrın tuzsuz hızlı karması tarafından indekslenen ağ geçidinin yapılandırmasında yayınlanır; dağıtımlar arasında aynıdır, bu nedenle zayıf bir sır, önceden hesaplanmış bir tabloya düşer. `custom` hiçbir entropi gereksinimi getirmez, bu nedenle kullanıcıların kendi anahtarlarını seçmeleri durumunda bunu kapatın; her mutabakat sırasında yeniden okunur, böylece yalnızca yeni anahtarları değil, açıkken yayınlanan özel anahtarları da geri çeker. | `true`    | Sunucu |
 | `GPUSTACK_GATEWAY_AUTH_MAX_CR_BYTES`               | Sunucunun ağ geçidinin kimlik doğrulama eklentisine yazdığı anahtar tablolar ve genel rota kuralları için bayt bütçesi. Etcd'nin ~1,5 MiB nesne sınırının altında boyutlandırılmıştır; onu geçen anahtarlar, her istekte sunucu aracılığıyla kimlik doğrulaması yapar. | `1100000` | Sunucu |
+| `GPUSTACK_GATEWAY_RATE_LIMIT_RECONCILE_INTERVAL_SECONDS` | Sunucunun, ağ geçidinin hız sınırı eklentisine yazılan anahtar başına ve kullanıcı başına hız sınırı kombinasyonlarını veritabanından yeniden hesaplama sıklığı. | `30` | Sunucu |
+| `GPUSTACK_RATE_LIMIT_MAX_CR_BYTES` | Sunucunun ağ geçidinin hız sınırı eklentisine yazdığı hız sınırı kombinasyonları için bayt bütçesi. Bütçeyi aşan kombinasyonlar, bütçe izin verene kadar dağıtımın varsayılan değerini korur. | `1100000` | Sunucu |
 | `GPUSTACK_GATEWAY_TLS_MIN_PROTOCOL_VERSION`        | Ağ geçidinin HTTPS dinleyicilerinin kabul ettiği en düşük TLS protokolü sürümü. `TLSv1.0`, `TLSv1.1`, `TLSv1.2`, `TLSv1.3`'den biri; başlangıçta başka herhangi bir şey reddedilir. Boş, TLS 1.0 ve 1.1'i kabul eden varsayılan ayarda Higress bırakır. `incluster` modunda yoksayıldı — aşağıya bakın. | (boş) | Sunucu |
 | `GPUSTACK_GATEWAY_TLS_MAX_PROTOCOL_VERSION`        | Dinleyicilerin kabul ettiği en yüksek versiyon. Aynı değerler ve aynı kapsam; nadiren ihtiyaç duyulur. | (boş) | Sunucu |
 

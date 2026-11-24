@@ -88,6 +88,7 @@ gpustack start [OPTIONS]
 | `--oidc-client-id` 値                         | （空）                                          | OpenID ConnectのクライアントID。 |
 | `--oidc-client-secret` 値                     | （空）                                          | OpenID Connectのクライアントシークレット。 |
 | `--oidc-redirect-uri` 値                      | （空）                                          | OIDCアプリケーションに設定したリダイレクトURI。`<server-url>/auth/oidc/callback`に設定する必要があります。 |
+| `--oidc-scopes` 値                            | （空）                                          | OIDC 認可エンドポイントで要求する、空白またはカンマ区切りのスコープ（例：`openid profile email org_id`）。デフォルトは `openid profile email` です。IdP が任意とマークしているスコープの背後にあるクレームは、ここで要求した場合にのみ返されます。 |
 | `--external-auth-post-logout-redirect-key` 値 | （空）                                          | 各IdPのログアウト後リダイレクトに使用する共通のパラメーター名。OIDCとSAMLの両方に適用されます。 |
 | `--oidc-skip-userinfo`                           | `False`                                          | OIDCのuserinfo_endpointへのリクエストを省略し、代わりにヘッダーから直接解析を試みます。 |
 | `--oidc-use-userinfo`                            | （空）                                          | ［非推奨］認証後にUserInfoエンドポイントを使用してユーザー情報を取得します。 |
@@ -111,6 +112,8 @@ gpustack start [OPTIONS]
 | `--external-auth-name` 値                     | （空）                                          | 外部認証のユーザー情報をユーザー名に対応付けるマッピング（例：preferred_username）。 |
 | `--external-auth-full-name` 値                | （空）                                          | 外部認証のユーザー情報をユーザーの氏名に対応付けるマッピング。`name`や`firstName+lastName`のように複数の要素を組み合わせることができます。 |
 | `--external-auth-avatar-url` 値               | （空）                                          | 外部認証のユーザー情報をユーザーのアバターURLに対応付けるマッピング。 |
+| `--external-auth-claims` 値                   | （空）                                          | SSO ログインのたびにユーザーの `external_attributes` に保存される、カンマ区切りのクレーム/属性名（例：`title,org_id,division`）。IdP を正とし、値はログインのたびに書き換えられます。 |
+| `--external-auth-attribute-groups`               | `False`                                          | SSO ログインのたびに、保存されたクレームからユーザーのグループを導出します：`title/<title in lower case>`、`dept/<department_id>`、`store/<store_name>`。メンバーシップはログインのたびに IdP を正として再計算されます。管理者が管理するグループには手を加えません。元のクレームを取得するには `--external-auth-claims` が必要です。 |
 | `--external-auth-default-inactive`               | `False`                                          | 新規ユーザーをデフォルトで無効にする場合はTrue。 |
 | `--external-auth-insecure-skip-tls-verify`       | `False`                                          | 外部認証IdPとのハンドシェイク（OIDC/CAS）のTLS検証を省略します。自己署名IdPに対するテスト専用です。本番環境では使用しないでください。 |
 | `--server-external-url` 値                    | （空）                                          | ワーカー登録に使用するサーバーの外部URL。クラウドプロバイダー経由でワーカーをプロビジョニングする場合に必要で、ワーカーがサーバーに正しく接続できるようにします。 |

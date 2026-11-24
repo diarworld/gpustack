@@ -45,6 +45,10 @@ Kullanıcı arayüzü ayrıca şifreleri 6-64 karakterle sınırlandırır.
 4. Nitelikleri gerektiği gibi güncelleyin.
 5. `Save` düğmesine tıklayın.
 
+### Token Bütçeleri { #token-budgets }
+
+Bir kullanıcı hesabı, kullanıcının tüm API anahtarlarında ve arayüz oturumlarında paylaşılan, ağ geçidinde uygulanan haftalık ve aylık token bütçeleri taşıyabilir. Bunları kullanıcının düzenleme formunda ayarlayın; uygulama ayrıntıları için [Hız Sınırlandırma](rate-limiting.md) bölümüne bakın.
+
 ## Kullanıcıyı Devre Dışı Bırak { #deactivate-user }
 
 1. `Users` sayfasına gidin.

@@ -181,6 +181,38 @@ helm install gpustack oci://registry-1.docker.io/gpustack/gpustack-chart \
   --set server.externalDatabaseURL="postgresql://user:password@host:port/dbname"
 ```
 
+### 高可用性（複数のサーバーレプリカ） { #high-availability-multiple-server-replicas }
+
+`server.replicas: 2+` を指定すると、各レプリカが API と UI を提供し（アクティブ・アクティブ）、スケジューラーとコントローラーは Redis で選出された単一のリーダーで動作します（アクティブ・パッシブ）。リーダーがダウンすると、スタンバイがリース TTL（デフォルト 30 秒）に自身の起動時間を加えた時間内で引き継ぎます。モデル推論はいずれの場合も影響を受けません。推論トラフィックはゲートウェイからワーカーへ直接ルーティングされます。
+
+前提条件として、これらがないとチャートは `replicas > 1` の生成を拒否します。
+
+- `server.externalDatabaseURL` による外部データベース：レプリカは 1 つのデータベースを共有する必要があり、デプロイ全体を高可用にするにはデータベース自体も高可用である必要があります。
+- `server.environmentConfig` に `GPUSTACK_COORDINATOR_MODE=redis`、および共有 Redis を指す `GPUSTACK_COORDINATOR_REDIS_URL`（認証情報と TLS も可）。このモードでは Redis はコントロールプレーンの重要な依存関係です。Redis に到達できないとレプリカは起動を拒否し、リーダーは退避するため、Redis 自体もHA 構成にしてください。専用の論理データベース（`/1`、`/2`、...）により、コーディネーターのキーを同じ Redis の他のテナントから分離できます。
+- `server.environmentConfig` に `GPUSTACK_JWT_SECRET_KEY`：レプリカは 1 つの JWT 署名シークレットを共有する必要があります。
+
+```yaml
+# values.yaml
+server:
+  replicas: 2
+  externalDatabaseURL: postgresql://user:password@host:port/dbname
+  environmentConfig:
+    GPUSTACK_COORDINATOR_MODE: redis
+    GPUSTACK_COORDINATOR_REDIS_URL: redis://redis.example.com:6379/1
+    GPUSTACK_JWT_SECRET_KEY: change-me
+```
+
+```bash
+helm install gpustack oss-gpustack/gpustack-chart \
+  --namespace gpustack-system -f values.yaml
+```
+
+注意事項：
+
+- デフォルトでは、レプリカは厳密な pod anti-affinity によってノードに分散されます。レプリカ数よりスケジュール可能なノードが少ないクラスターでは、`server.affinity` を上書きしてください。
+- リーダーの再起動中も、API は生存しているレプリカから応答します。ゲートウェイが自ら検証できる認証情報によるモデル呼び出しは動作し続け、生の API キーの検証にサーバーを必要とする呼び出しは新しいリーダーを待ちます。
+- 設計上、2 つのリーダーが同時に稼働することはありません。リースを失った、または確認できないリーダーはプロセスを終了し、スタンバイとして再起動します。
+
 ### カスタム証明書による HTTPS の有効化 { #enabling-https-with-a-custom-certificate }
 
 `server.ingress.tls` で PEM 形式の証明書と秘密鍵の内容を指定します。両方を指定すると、Ingress のスキームが HTTPS になります。

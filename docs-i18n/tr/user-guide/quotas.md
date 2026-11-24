@@ -19,7 +19,9 @@ Her kartta kullanılan / limit değeri, bir ilerleme çubuğu ve sıfırlama ger
 | **Hafta** | 7 günlük kayan penceredeki token'lar — tüm API anahtarlarınız ve arayüz oturumlarınız tarafından paylaşılır. | Bir haftalık kullanım pencereden çıkarken sürekli. |
 | **Ay**    | Takvim ayındaki token'lar.                                                                  | Dağıtım saat diliminde ay sınırında.              |
 
-Limite ulaşıldığında, sonraki istekler herhangi bir model örneğine ulaşmadan önce ağ geçidinde `429 Too Many Requests` ile reddedilir — pencerede yer açılana kadar. Reddedilme gövdesi hangi limitin tetiklendiğini adıyla belirtir (örneğin `Too many requests per minute`, `Monthly token quota limit reached, reset in usage overview` veya `Too many concurrent requests for this model`) ve kayan ile takvim pencereleri, pencerenin boşalmasına kalan saniyeyi taşıyan bir `Retry-After` başlığı içerir.
+Limite ulaşıldığında, sonraki istekler herhangi bir model örneğine ulaşmadan önce ağ geçidinde `429 Too Many Requests` ile reddedilir — pencerede yer açılana kadar. Reddedilme gövdesi hangi limitin tetiklendiğini adıyla belirtir (örneğin `Too many requests per minute`, `Monthly token quota limit reached,
+reset in usage overview` or `Too many concurrent requests for this model`)
+ve kayan ile takvim pencereleri, pencerenin boşalmasına kalan saniyeyi taşıyan bir `Retry-After` başlığı içerir.
 
 RPM ve TPM kısa patlamalara karşı korur; haftalık ve aylık bütçeler sürekli tüketimi sınırlar. Bir istek, dokunabileceği her pencereye sayılır: API anahtar trafiğiniz ve arayüz oturumlarınız aynı kullanıcı düzeyi hakkı kullanır.
 
@@ -39,6 +41,7 @@ Varsayılan ve model başına geçersiz kılmalar, yönetici tarafından hesabı
 
 - **Dağıtım varsayılanları** — yönetici tarafından herkes için ayarlanır: RPM, TPM, aylık token'lar ve model başına eşzamanlılık sınırı. Ayarlanmamış bir varsayılan, o pencerenin sınırlandırılmadığı anlamına gelir.
 - **Kullanıcı düzeyi limitler** — yöneticinin hesabınıza ayarladığı haftalık ve aylık token bütçeleri ile RPM ve TPM; tüm anahtarlarınız ve oturumlarınız tarafından paylaşılır.
+- **Grup kotaları** — grup düzeyinde aynı alanlar; yönetici bunları Gruplar sayfasından (**Manage limits**) ayarlar. Her alan bağımsız olarak çözümlenir: hesabınızın açık limiti önceliklidir; yoksa gruplarınız arasındaki en küçük değer uygulanır; o da yoksa dağıtım varsayılanı geçerlidir. Ayrıntılar için [Grup Kotaları](rate-limiting.md#group-quotas) bölümüne bakın.
 
 Bu dağıtım şu varsayılanları kullanır (yöneticiler Limits sekmesinde düzenler; bkz. [Dağıtım varsayılanlarını düzenleme](#editing-the-deployment-defaults)):
 

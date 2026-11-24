@@ -1,3 +1,7 @@
+---
+translation_status: translated
+---
+
 # シングルサインオン（SSO）認証 { #single-sign-on-sso-authentication }
 
 GPUStack は OIDC、SAML、CAS などのシングルサインオン（SSO）認証に対応しています。ユーザーは、外部の ID プロバイダーの既存の認証情報でログインできます。
@@ -18,10 +22,13 @@ OIDC の構成には、次の CLI フラグを使用できます。
 | `--oidc-client-id` | OIDC クライアント ID。 |
 | `--oidc-client-secret` | OIDC クライアントシークレット。 |
 | `--oidc-redirect-uri` | OIDC アプリケーションに設定したリダイレクト URI。`<server-url>/auth/oidc/callback` に設定する必要があります。 |
+| `--oidc-scopes`（任意） | 認可エンドポイントで要求する、スペースまたはカンマ区切りのスコープ（`openid profile email org_id` など）。既定は `openid profile email` です。 |
 | `--external-auth-provider-name`（任意） | ログインページの SSO ボタンに表示する ID プロバイダー名（`Okta` など）。未設定時は `OIDC` です。 |
 | `--external-auth-name`（任意） | OIDC ユーザー情報からユーザー名へのマッピング（`preferred_username` など）。既定では、存在する場合は `email` クレームを使用します。 |
-| `--external-auth-full-name`（任意） | OIDC ユーザー情報から氏名へのマッピング。`name` や `firstName+lastName` のように複数の要素を組み合わせられます。既定では `name` クレームを使用します。 |
+| `--external-auth-full-name`（任意） | OIDC ユーザー情報から表示名へのマッピング。`name` や `given_name+family_name` のように `+` で複数の要素を組み合わせられます。送信されないクレームはスキップされます。表示名は SSO ログインのたびにこれらのクレームから更新されます。既定では `name` クレームを使用します。 |
 | `--external-auth-avatar-url`（任意） | OIDC ユーザー情報からアバター URL へのマッピング。既定では、存在する場合は `picture` クレームを使用します。 |
+| `--external-auth-claims`（任意） | ログインのたびにユーザーの `external_attributes` に保存される、カンマ区切りのクレーム名（`title,org_id,division` など）。[IdP クレームの取得](#capturing-idp-claims) を参照してください。 |
+| `--external-auth-attribute-groups`（任意） | ログインのたびに、取得したクレームからユーザー グループを導出します: `title/…`、`dept/…`、`store/…` のグループ。メンバーシップは権限のある情報として再計算されます。[IdP 属性からのグループ](#groups-from-idp-attributes) を参照してください。 |
 | `--external-auth-default-inactive`（任意） | 新しい SSO ユーザーが既定で有効になることを防ぎます。 |
 | `--external-auth-post-logout-redirect-key`（任意） | IdP ごとのログアウト後リダイレクトに使用する汎用パラメーター名（Auth0 の `returnTo` など）。OIDC と SAML の両方に適用します。 |
 
@@ -39,7 +46,47 @@ GPUSTACK_EXTERNAL_AUTH_FULL_NAME="name"
 GPUSTACK_EXTERNAL_AUTH_AVATAR_URL="picture"
 GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
 GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo"  # e.g., for Auth0
+GPUSTACK_OIDC_SCOPES="openid profile email"
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division"
 ```
+
+### IdP クレームの取得 { #capturing-idp-claims }
+
+既定では、GPUStack は IdP からユーザー名、氏名、アバターのみを読み取ります。たとえば役職や組織の部門に基づいてユーザーごとのクォータを自動化するなど、追加のユーザー情報を GPUStack のユーザー レコードに保持するには、`--external-auth-claims` でクレーム名を列挙します:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division,cost_center,shop_id"
+```
+
+SSO ログインのたびに、GPUStack はこれらのクレームの現在値を userinfo レスポンスからユーザーの `external_attributes` にコピーし（`GET /users/{id}` で確認できます）、前回のログインが保存した内容を上書きします。IdP が信頼できる情報源です。クレームは、IdP がそのクライアントに対して送信している場合にのみ届きます: *オプション* のクライアント スコープの背後にあるクレームは `--oidc-scopes` で要求する必要があり、*既定* のクライアント スコープの背後にあるクレームは常に含まれます。
+
+### ユーザー表示名 { #user-display-name }
+
+ユーザーの表示名（UI 全体で表示され、クライアント側の検索で使用されます）は `--external-auth-full-name` から取得され、`external_attributes` と同じように SSO ログインのたびに IdP から更新されます。`+` で結合されたクレームはスペースで連結されます。IdP が送信しなかったクレームはスキップされ、どのクレームも届かなかった場合は既存の表示名がそのまま維持されます。
+
+realm のクライアント スコープをカスタマイズしている場合は、既定の `name` よりも明示的なクレームを推奨します。カスタム クライアント スコープ（たとえば、`profile` の横に追加した API 用のスコープ）には、標準クレームを覆い隠すマッパーが含まれることがあります — `name` を出力する LDAP ログイン マッパーがあると、新しくプロビジョニングされたすべてのユーザーの表示名がそのユーザーの LDAP ログインになります。表示名を自分で制御できる要素から構成すれば、この衝突を回避できます:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_FULL_NAME="preferred_username+given_name+family_name"
+```
+
+これは `login FirstName LastName` のように表示されるため、LDAP ログイン、氏名、メールアドレスのいずれで検索しても一致します。
+
+### IdP 属性からのグループ { #groups-from-idp-attributes }
+
+クレームを取得したら（上記を参照）、`--external-auth-attribute-groups` を有効にすると、SSO ログインのたびに GPUStack がそれらからグループを維持します。相互に、また管理者が作成したグループと決して衝突しないように、接頭辞付きの名前で 3 種類のグループが導出されます:
+
+| 種類 | グループ名 | 表示名 |
+| --- | --- | --- |
+| 役職 | `title/<title in lower case>` | IdP が報告した通りの役職 |
+| 部門 | `dept/<department_id>` | 部門名 |
+| 店舗 / 拠点 | `store/<store_name>` | 店舗名 |
+
+役職はグループ名内で小文字化されるため、IdP での大文字/小文字の違い（"Developer" と "developer"）は同じグループにまとまります。部門は安定した `department_id` でキー付けされるため、部門の名前変更はグループを孤立させるのではなく、グループのラベルを付け直します。店舗名はそのまま保持されます。
+
+属性が一度も届かないユーザーや、マッピングされたすべての属性値が空のユーザーは、共有の `unknown/users` グループ（表示名 "Unknown Users"）に置かれます。後のログインで実際の属性が届くと、同じ同期によってそのグループから移動されます。SSO を使わずにサインインするユーザーのメンバーシップは維持されます。
+
+メンバーシップはログインのたびに権限のある情報として再計算されます。ユーザーは現在の属性に一致するグループに参加し、合わなくなったグループからは外れます。管理者が作成したメンバーシップ（UI で作成）と管理者が作成したグループに手を付けることはなく、この同期によって作成されたグループには `oidc-attrs` ソースが付きます。ネストしたグループとも組み合わせられます。管理者は `title/developer` と `title/analyst` を `SDLC users` のような手動グループに入れることができ、`SDLC users` に付与されたすべての権限やクォータはメンバーに推移的に適用されます。
 
 ### 例：Auth0 OIDC との連携 { #example-integrate-with-auth0-oidc }
 

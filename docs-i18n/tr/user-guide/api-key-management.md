@@ -89,6 +89,10 @@ Değişiklik, kaydedildikten birkaç saniye sonra ağ geçidine ulaşır; kaynak
 
     Kaynağı düzenlemek, ağ geçidinin çalıştığı kümeye erişim gerektirir ve yukarıdaki `higress-system` varsayılan ağ geçidi ad alanıdır; değiştirilmişse sizinkiyle değiştirin. GPUStack veritabanını doğrudan değiştirmek desteklenen bir alternatif değildir ve dağıtımın tutarsız olmasına neden olabilir.
 
+## Hız Sınırlandırma { #rate-limits }
+
+Bir API anahtarı kendi hız limitlerini taşıyabilir — dakika başına istek, dakika başına token ve günlük token bütçesi; bunlar, trafik bir modele ulaşmadan önce ağ geçidinde uygulanır. Bunları anahtar üzerinde ayarlayın ya da dağıtım genelinde varsayılanları yapılandırın; limitlerin kullanıcı başına bütçelerle nasıl etkileştiği hakkında [Hız Sınırlandırma](rate-limiting.md) bölümüne bakın.
+
 !!! warning "Bu ad alanını kimler okuyabilir?"
 
     Aynı kaynak, ağ geçidinin dahili kimlik token'larını imzaladığı anahtarı da içerir. Ağ geçidinin ad alanındaki kaynakları okuyabilen biri böyle bir token üretip herhangi bir kullanıcı olarak kabul edilebilir. Bu nedenle buradaki okuma erişimini platform düzeyinde yetki olarak değerlendirin ve buna göre verin.

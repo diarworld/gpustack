@@ -181,6 +181,38 @@ helm install gpustack oci://registry-1.docker.io/gpustack/gpustack-chart \
   --set server.externalDatabaseURL="postgresql://user:password@host:port/dbname"
 ```
 
+### Yüksek Kullanılabilirlik (Birden Fazla Sunucu Replikası) { #high-availability-multiple-server-replicas }
+
+`server.replicas: 2+` ile her replika API'ye ve kullanıcı arayüzüne hizmet verir (aktif-aktif); zamanlayıcı ve denetleyiciler ise Redis ile seçilen tek bir lider üzerinde çalışır (aktif-pasif). Lider öldüğünde, yedek bir replika kira TTL'i (varsayılan 30 sn) ve kendi başlama süresi içinde görevi devralır. Model çıkarımı her iki durumda da etkilenmez: servis trafiği ağ geçidi tarafından doğrudan çalışanlara yönlendirilir.
+
+Önkoşullar — bunlar olmadan chart `replicas > 1` oluşturmayı reddeder:
+
+- `server.externalDatabaseURL` üzerinden harici bir veritabanı: replikalar tek bir veritabanını paylaşmalıdır ve dağıtımın yüksek kullanılabilirliğe sahip olması için veritabanının kendisi de HA olmalıdır.
+- `server.environmentConfig` içinde `GPUSTACK_COORDINATOR_MODE=redis`, ayrıca paylaşılan bir Redis'i gösteren `GPUSTACK_COORDINATOR_REDIS_URL` (kimlik bilgilerine ve TLS'ye izin verilir). Bu modda Redis, kontrol düzleminin kritik bir bağımlılığıdır: erişilemez olduğunda replikalar başlamayı reddeder ve lider görevi bırakır; bu nedenle Redis'i de HA ile çalıştırın. Ayrılmış bir mantıksal veritabanı (`/1`, `/2`, ...), koordinatörün anahtarlarını aynı Redis'in diğer kiracılarından ayırır.
+- `server.environmentConfig` içinde `GPUSTACK_JWT_SECRET_KEY`: replikalar tek bir JWT imzalama sırrını paylaşmalıdır.
+
+```yaml
+# values.yaml
+server:
+  replicas: 2
+  externalDatabaseURL: postgresql://user:password@host:port/dbname
+  environmentConfig:
+    GPUSTACK_COORDINATOR_MODE: redis
+    GPUSTACK_COORDINATOR_REDIS_URL: redis://redis.example.com:6379/1
+    GPUSTACK_JWT_SECRET_KEY: change-me
+```
+
+```bash
+helm install gpustack oss-gpustack/gpustack-chart \
+  --namespace gpustack-system -f values.yaml
+```
+
+Notlar:
+
+- Replikalar varsayılan olarak katı bir pod anti-affinity ile düğümlere dağıtılır; replika sayısından daha az zamanlanabilir düğümü olan kümeler için `server.affinity`'yi geçersiz kılın.
+- Liderin yeniden başlatılması sırasında API, hayatta kalan replikadan yanıt verir. Kimlik bilgilerini ağ geçidinin kendisi doğrulayabilen model çağrıları çalışmaya devam eder; ham API anahtarının sunucu tarafından doğrulanmasını gerektiren çağrılar yeni lideri bekler.
+- Tasarım gereği iki lider asla aynı anda çalışmaz: kirasını kaybeden veya doğrulayamayan lider süreçten çıkar ve yedek olarak yeniden başlar.
+
 ### HTTPS'yi Özel Sertifikayla Etkinleştirme { #enabling-https-with-a-custom-certificate }
 
 Sertifikayı ve anahtar içeriklerini (PEM) `server.ingress.tls` aracılığıyla sağlayın. Her ikisi de ayarlandığında giriş şeması HTTPS olur:

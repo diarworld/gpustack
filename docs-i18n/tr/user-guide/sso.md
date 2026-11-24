@@ -22,10 +22,13 @@ OIDC yapılandırması için aşağıdaki CLI bayrakları mevcuttur:
 | `--oidc-client-id` | OIDC istemci kimliği.                                                                                                                                                      |
 | `--oidc-client-secret` | OIDC istemci sırrı.                                                                                                                                                  |
 | `--oidc-redirect-uri` | OIDC uygulamanızda yapılandırılan yönlendirme URI'si. Bu `<server-url>/auth/oidc/callback` olarak ayarlanmalıdır.                                                         |
+| `--oidc-scopes` (İsteğe bağlı) | Yetkilendirme uç noktasında istenen, boşluk veya virgülle ayrılmış scope'lar, örneğin, `openid profile email org_id`. Varsayılan: `openid profile email`.                   |
 | `--external-auth-provider-name` (İsteğe bağlı) | Giriş sayfasının SSO düğmesinde gösterilen kimlik sağlayıcının adı, ör. `Okta`. Ayarlanmadığında varsayılan olarak `OIDC` olur.                                                     |
 | `--external-auth-name` (İsteğe bağlı) | OIDC kullanıcı bilgilerinin kullanıcı adına eşlenmesi, örneğin, `preferred_username`. Varsayılan olarak, varsa `email` talebi kullanılır.                                        |
-| `--external-auth-full-name` (İsteğe bağlı) | OIDC kullanıcı bilgilerinin kullanıcının tam adıyla eşleştirilmesi. Birden fazla öğe birleştirilebilir, örneğin `name` veya `firstName+lastName`. Varsayılan olarak `name` talebi kullanılır. |
+| `--external-auth-full-name` (İsteğe bağlı) | OIDC kullanıcı bilgilerinin kullanıcının görüntülenen adına eşleştirilmesi. Birden fazla öğe `+` ile birleştirilebilir, örneğin `name` veya `given_name+family_name`; eksik talepler atlanır. Görüntülenen ad, her SSO girişinde bu taleplerden yenilenir. Varsayılan olarak `name` talebi kullanılır. |
 | `--external-auth-avatar-url` (İsteğe bağlı) | OIDC kullanıcı bilgilerinin kullanıcının avatar URL'sine eşlenmesi. Varsayılan olarak, varsa `picture` talebi kullanılır.                                                         |
+| `--external-auth-claims` (İsteğe bağlı) | Her girişte kullanıcının `external_attributes` alanına kaydedilen, virgülle ayrılmış talep adları, örneğin, `title,org_id,division`. [IdP taleplerini yakalama](#capturing-idp-claims) bölümüne bakın. |
+| `--external-auth-attribute-groups` (İsteğe bağlı) | Her girişte yakalanan taleplerden kullanıcı Grupları türetilir: `title/…`, `dept/…` ve `store/…` grupları; üyelik kesin olarak yeniden hesaplanır. [IdP özniteliklerinden gruplar](#groups-from-idp-attributes) bölümüne bakın. |
 | `--external-auth-default-inactive` (İsteğe bağlı) | Yeni SSO kullanıcılarının varsayılan olarak etkinleştirilmesini engeller.                                                                                                              |
 | `--external-auth-post-logout-redirect-key` (İsteğe bağlı) | Farklı IdP'ler arasında oturum kapatma sonrası yeniden yönlendirme için genel parametre adı (ör. Auth0 `returnTo`). Hem OIDC hem de SAML'ye uygulanır.                                    |
 
@@ -43,7 +46,47 @@ GPUSTACK_EXTERNAL_AUTH_FULL_NAME="name"
 GPUSTACK_EXTERNAL_AUTH_AVATAR_URL="picture"
 GPUSTACK_EXTERNAL_AUTH_DEFAULT_INACTIVE="true"
 GPUSTACK_EXTERNAL_AUTH_POST_LOGOUT_REDIRECT_KEY="returnTo"  # e.g., for Auth0
+GPUSTACK_OIDC_SCOPES="openid profile email"
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division"
 ```
+
+### IdP taleplerini yakalama { #capturing-idp-claims }
+
+Varsayılan olarak GPUStack, IdP'den yalnızca kullanıcı adını, tam adını ve avatarını okur. GPUStack kullanıcı kaydında ek kullanıcı bilgilerini tutmak için — örneğin, iş unvanına veya kurum birimine göre kullanıcı başına kotaları otomatikleştirmek için — talep adlarını `--external-auth-claims` ile listeleyin:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_CLAIMS="title,org_id,division,cost_center,shop_id"
+```
+
+Her SSO girişinde GPUStack, bu taleplerin güncel değerlerini userinfo yanıtından kullanıcının `external_attributes` alanına kopyalar (`GET /users/{id}` içinde görünür) ve önceki girişin kaydettiklerinin üzerine yazar — IdP doğruluk kaynağıdır. Talepler yalnızca IdP bunları istemciniz için gönderiyorsa ulaşır: *isteğe bağlı* istemci scope'larının arkasındaki talepler `--oidc-scopes` aracılığıyla istenmelidir, *varsayılan* istemci scope'larının arkasındaki talepler ise her zaman dahil edilir.
+
+### Kullanıcı görüntülenen adı { #user-display-name }
+
+Kullanıcının görüntülenen adı (UI genelinde gösterilir ve istemci tarafı arama tarafından kullanılır) `--external-auth-full-name` değerinden gelir ve `external_attributes` ile aynı şekilde her SSO girişinde IdP'den yenilenir. `+` ile birleştirilen talepler boşlukla birleştirilir; IdP'nin göndermediği bir talep atlanır ve hiçbiri ulaşmazsa mevcut görüntülenen ad olduğu gibi bırakılır.
+
+Realm'inizin istemci scope'ları özelleştirilmişse varsayılan `name` yerine açık talepleri tercih edin. Özel bir istemci scope'u (örneğin, `profile` yanına eklenen API odaklı bir scope), standart bir talebi gölgeleyen bir mapper taşıyabilir — `name` üreten bir LDAP-giriş mapper'ı, yeni sağlanan her kullanıcının görüntülenen adını kullanıcının LDAP girişi yapar. Görüntülenen adı kontrol ettiğiniz parçalardan oluşturmak bu çakışmayı önler:
+
+```bash
+GPUSTACK_EXTERNAL_AUTH_FULL_NAME="preferred_username+given_name+family_name"
+```
+
+Bu, `login FirstName LastName` olarak görüntülenir; böylece LDAP girişi, gerçek ad veya e-posta ile yapılan aramaların tümü eşleşir.
+
+### IdP özniteliklerinden gruplar { #groups-from-idp-attributes }
+
+Talepler yakalandıktan sonra (yukarıya bakın), her girişte GPUStack'in bunlardan gruplar oluşturması için `--external-auth-attribute-groups` seçeneğini etkinleştirin. Birbirleriyle ve yönetici tarafından oluşturulan gruplarla asla çakışmamaları için önekli adlarla üç grup türü türetilir:
+
+| Tür | Grup adı | Görüntülenen ad |
+|---|---|---|
+| İş unvanı | `title/<title in lower case>` | IdP'nin bildirdiği şekilde unvan |
+| Departman | `dept/<department_id>` | departman adı |
+| Mağaza / konum | `store/<store_name>` | mağaza adı |
+
+Unvanlar grup adına küçük harfe çevrilerek yazılır, bu nedenle IdP'nin büyük/küçük harf varyasyonları ("Developer" ve "developer") tek bir gruba düşer. Departmanlar kararlı `department_id` ile anahtarlanır — departmanın yeniden adlandırılması, grubu yetim bırakmak yerine grubun etiketini günceller. Mağaza adları olduğu gibi korunur.
+
+Öznitelikleri hiç ulaşmayan kullanıcılar — veya eşlenen her öznitelik değeri boş olanlar — paylaşılan `unknown/users` grubuna ("Unknown Users" görüntülenen adıyla) yerleştirilir. Sonraki bir giriş gerçek öznitelikler getirdiğinde, aynı eşitleme onları bu gruptan çıkarır; SSO olmadan oturum açan kullanıcılar üyeliği korur.
+
+Üyelik her girişte kesin olarak yeniden hesaplanır: kullanıcılar geçerli öznitelikleriyle eşleşen gruplara katılır ve artık uymayanlardan ayrılır. Yönetici tarafından oluşturulan üyeliklere (UI'de oluşturulan) ve yönetici tarafından oluşturulan gruplara asla dokunulmaz; bu eşitleme tarafından oluşturulan gruplar `oidc-attrs` kaynağıyla etiketlenir. İç içe gruplar bununla birleşir: bir yönetici, `title/developer` ve `title/analyst` öğelerini `SDLC users` gibi manuel bir grubun içine koyabilir ve `SDLC users`'a verilen her hak veya kota, üyelere dolaylı olarak ulaşır.
 
 ### Örnek: Auth0 OIDC ile entegrasyon { #example-integrate-with-auth0-oidc }
 
