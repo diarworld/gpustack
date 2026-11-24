@@ -194,9 +194,13 @@ _D3_QUESTIONS = {
 class _D3Verdict:
     """One classification round: the answers the decision model gave.
 
-    ``rejection_reason`` is ``None`` when the model named no cause (or
-    answered the literal string "None", its own way of saying none); the
-    reject decision itself rides on ``answered`` + ``confidence``.
+    ``confidence`` is the confidence of whichever yes/no class won the
+    concrete-task question (the service's own ``confidence`` field carries
+    P(yes) regardless of the verdict, so the pair is recomputed from the
+    probability pair). ``rejection_reason`` is ``None`` when the model
+    named no cause (or answered the literal string "None", its own way of
+    saying none); the reject decision itself rides on ``answered`` +
+    ``confidence``.
     """
 
     answered: bool
@@ -264,33 +268,52 @@ def _reader(request: Request, cfg: Config):
     return reader
 
 
-def _d3_answer_bool(answer: Dict[str, Any]) -> Optional[bool]:
-    """The yes/no the model returned, in whatever clothing it arrives.
+def _d3_answered(answer: Dict[str, Any]) -> Optional[Any]:
+    """The yes/no verdict on the concrete-task question, with the
+    confidence of the class that was picked.
 
-    The wire contract says ``choice`` is boolean for a noul question, but a
-    lenient read costs nothing: boolean JSON, or the usual string spellings
-    ("true"/"false"/"yes"/"no"). Anything else is not a verdict.
+    The service answers a noul question without a ``choice`` field: the
+    verdict is the ``yes``/``no`` probability pair, and the ``confidence``
+    field carries P(yes) — not the confidence of whichever class won. A
+    "no" answered with P(yes)=0.2 is a *strong* no (P(no)=0.8), so the
+    confidence of the verdict is the larger of the two. A boolean
+    ``choice`` (or its string spellings) is still accepted as a fallback;
+    anything else is not a verdict.
     """
+    probabilities = answer.get("probabilities")
+    if isinstance(probabilities, dict):
+        p_yes = _as_probability(probabilities.get("yes"))
+        p_no = _as_probability(probabilities.get("no"))
+        if p_yes is not None and p_no is not None:
+            return p_yes >= p_no, max(p_yes, p_no)
     choice = answer.get("choice")
     if isinstance(choice, bool):
-        return choice
+        return choice, _d3_confidence(answer)
     if isinstance(choice, str):
         lowered = choice.strip().lower()
         if lowered in ("true", "yes"):
-            return True
+            return True, _d3_confidence(answer)
         if lowered in ("false", "no"):
-            return False
+            return False, _d3_confidence(answer)
     return None
 
 
-def _d3_confidence(answer: Dict[str, Any]) -> float:
-    """The model's certainty in its answer, clamped into 0..1.
+def _as_probability(value: Any) -> Optional[float]:
+    """A probability in 0..1, or None when the value is not one."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0.0 <= number <= 1.0 else None
 
-    A missing or malformed confidence reads as certain: the reject decision
-    keys on a *strong* no, and an answer without a stated confidence was
-    not a hedge the model chose to publish — treating it as weak would let
-    every malformed verdict through. The 0..1 clamp also accepts a
-    percentage that slipped through the service.
+
+def _d3_confidence(answer: Dict[str, Any]) -> float:
+    """The model's stated confidence, clamped into 0..1.
+
+    Used for the boolean-choice fallback; a missing or malformed
+    confidence reads as certain — an answer without a stated confidence
+    was not a hedge the model chose to publish. The 0..1 clamp also
+    accepts a percentage that slipped through the service.
     """
     try:
         confidence = float(answer.get("confidence", 1.0))
@@ -350,7 +373,7 @@ async def _classify_with_d3(description: str) -> Optional[_D3Verdict]:
     answers = verdict.get("answers") if isinstance(verdict, dict) else None
     answered_answer = answers.get("answered") if isinstance(answers, dict) else None
     answered = (
-        _d3_answer_bool(answered_answer) if isinstance(answered_answer, dict) else None
+        _d3_answered(answered_answer) if isinstance(answered_answer, dict) else None
     )
     if answered is None:
         logger.warning(
@@ -359,17 +382,14 @@ async def _classify_with_d3(description: str) -> Optional[_D3Verdict]:
             str(verdict)[:200],
         )
         return None
+    answered_flag, answered_confidence = answered
     work_type_answer = answers.get("WorkType") if isinstance(answers, dict) else None
     reason_answer = (
         answers.get("rejection_reason") if isinstance(answers, dict) else None
     )
     return _D3Verdict(
-        answered=answered,
-        confidence=(
-            _d3_confidence(answered_answer)
-            if isinstance(answered_answer, dict)
-            else 1.0
-        ),
+        answered=answered_flag,
+        confidence=answered_confidence,
         work_type=(
             _d3_choice_str(work_type_answer)
             if isinstance(work_type_answer, dict)

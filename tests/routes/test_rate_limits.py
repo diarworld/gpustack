@@ -996,15 +996,30 @@ async def test_reset_validations(frozen_now, monkeypatch):
     assert session.added == [] and reader.deleted == []
 
 
-def _d3_payload(answered, confidence, work_type=None, reason=None):
-    """A decision-model verdict body in the jevcompat answer shape. The
+def _d3_payload(p_yes, work_type=None, reason=None):
+    """A decision-model verdict body in the service's real answer shape:
+    the noul question carries a yes/no probability pair (no ``choice``), the
+    choice questions carry ``choice`` plus the probability mass. The
     ``None`` reason travels as the literal string — the model's own
     no-cause spelling."""
+    p_no = round(1.0 - p_yes, 10)
     return {
         "answers": {
-            "answered": {"choice": answered, "confidence": confidence},
-            "WorkType": {"choice": work_type},
-            "rejection_reason": {"choice": reason if reason else "None"},
+            "answered": {
+                "type": "noul",
+                "probabilities": {"yes": p_yes, "no": p_no},
+                "confidence": p_yes,
+            },
+            "WorkType": {
+                "type": "choice",
+                "choice": work_type,
+                "confidence": 0.9 if work_type else None,
+            },
+            "rejection_reason": {
+                "type": "choice",
+                "choice": reason if reason else "None",
+                "confidence": 0.9,
+            },
         }
     }
 
@@ -1078,7 +1093,7 @@ async def test_reset_rejected_on_confident_no(frozen_now, monkeypatch):
     _d3_client(
         monkeypatch,
         lambda request: httpx.Response(
-            200, json=_d3_payload(False, 0.8, "Unknown", "BypassAttempt")
+            200, json=_d3_payload(0.2, "Unknown", "BypassAttempt")
         ),
     )
 
@@ -1095,9 +1110,10 @@ async def test_reset_rejected_on_confident_no(frozen_now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reset_approved_on_low_confidence_no(frozen_now, monkeypatch):
-    """A "no" below the confidence bar is not a verdict the gate acts on:
-    the press goes through and the classification still lands."""
+async def test_reset_approved_on_unconfident_no(frozen_now, monkeypatch):
+    """A bare boolean "no" without the probability pair is trusted only as
+    far as its stated confidence: below the bar the press goes through and
+    the classification still lands."""
     cfg = _redis_cfg()
     user = _user(7, weekly=100_000, monthly=200_000)
     session = FakeSession(users=[user])
@@ -1107,7 +1123,14 @@ async def test_reset_approved_on_low_confidence_no(frozen_now, monkeypatch):
     _d3_client(
         monkeypatch,
         lambda request: httpx.Response(
-            200, json=_d3_payload(False, 0.4, "Unknown", "TooVague")
+            200,
+            json={
+                "answers": {
+                    "answered": {"choice": False, "confidence": 0.4},
+                    "WorkType": {"type": "choice", "choice": "Unknown"},
+                    "rejection_reason": {"type": "choice", "choice": "TooVague"},
+                }
+            },
         ),
     )
 
@@ -1117,6 +1140,31 @@ async def test_reset_approved_on_low_confidence_no(frozen_now, monkeypatch):
     (row,) = session.added
     assert row.outcome == "approved" and row.work_type == "Unknown"
     assert reader.deleted, "an approved press clears the counters"
+
+
+@pytest.mark.asyncio
+async def test_reset_approved_on_tied_probabilities(frozen_now, monkeypatch):
+    """A 50/50 split of the concrete-task question is not a confident no:
+    the tie resolves to yes and the press goes through."""
+    cfg = _redis_cfg()
+    user = _user(7, weekly=100_000, monthly=200_000)
+    session = FakeSession(users=[user])
+    reader = FakeReader()
+    monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
+    _gate_on(monkeypatch)
+    _d3_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, json=_d3_payload(0.5, "Unknown", "TooVague")
+        ),
+    )
+
+    status = await _reset_call(cfg, session, reader, user, "задача на грани")
+
+    assert status.status == "reset" and status.available == 1
+    (row,) = session.added
+    assert row.outcome == "approved"
+    assert reader.deleted
 
 
 @pytest.mark.asyncio
@@ -1132,7 +1180,7 @@ async def test_reset_saves_work_type_on_approval(frozen_now, monkeypatch):
     calls = _d3_client(
         monkeypatch,
         lambda request: httpx.Response(
-            200, json=_d3_payload(True, 0.95, "SoftwareDevelopment", None)
+            200, json=_d3_payload(0.95, "SoftwareDevelopment", None)
         ),
     )
 
@@ -1166,7 +1214,7 @@ async def test_reset_rejected_without_reason_leaves_it_unset(frozen_now, monkeyp
     _gate_on(monkeypatch)
     _d3_client(
         monkeypatch,
-        lambda request: httpx.Response(200, json=_d3_payload(False, 0.9)),
+        lambda request: httpx.Response(200, json=_d3_payload(0.1)),
     )
 
     status = await _reset_call(cfg, session, reader, user, "asdkjh 12321")
@@ -1185,7 +1233,7 @@ async def test_reset_gate_off_makes_no_call(frozen_now, monkeypatch):
     reader = FakeReader()
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
     calls = _d3_client(
-        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(True, 1.0))
+        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(1.0))
     )
 
     status = await _reset_call(cfg, session, reader, user, "anything")
@@ -1230,7 +1278,7 @@ async def test_admin_reset_skips_the_gate(frozen_now, monkeypatch):
     monkeypatch.setattr(rate_limits, "_reader_factory", lambda cfg: reader)
     _gate_on(monkeypatch)
     calls = _d3_client(
-        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(True, 1.0))
+        monkeypatch, lambda request: httpx.Response(200, json=_d3_payload(1.0))
     )
 
     status = await rate_limits.reset_rate_limit(
