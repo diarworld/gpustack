@@ -3,7 +3,7 @@ import re
 import pytest
 from unittest.mock import MagicMock
 
-from gpustack.config.config import GatewayRateLimitConfig
+from gpustack.config.config import GatewayModeEnum, GatewayRateLimitConfig
 from gpustack.gateway.rate_limit import WEEK_IN_SECONDS
 from gpustack.server.gateway_rate_limit_reconciler import (
     fit_combinations,
@@ -18,6 +18,12 @@ def make_cfg(**kwargs):
     # A real dict: a MagicMock here would leak a MagicMock image_pull_policy
     # into plugin_spec_overrides and collide with the spec's own value.
     cfg.gateway_plugin = {}
+    # The rejection-report block resolves the server registry and token from
+    # the config; pin them so the rendered endpoint is deterministic.
+    cfg.gateway_mode = GatewayModeEnum.external
+    cfg.get_advertise_address.return_value = "10.0.0.2"
+    cfg.get_api_port.return_value = 8080
+    cfg.get_derived_gateway_token.return_value = "test-gateway-token"
     return cfg
 
 

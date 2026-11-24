@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 from pydantic import ValidationError
 
 from gpustack.config.config import (
+    GatewayModeEnum,
     GatewayPluginEntry,
     GatewayRateLimitConfig,
     GatewayRateLimitRedis,
@@ -15,6 +16,13 @@ def make_cfg(gateway_rate_limit: GatewayRateLimitConfig) -> MagicMock:
     cfg.gateway_plugin_server_url = "http://127.0.0.1"
     cfg.gateway_plugin = {}
     cfg.gateway_rate_limit = gateway_rate_limit
+    # The rejection-report block resolves the server registry and the derived
+    # token from the config; pin them so the rendered endpoint is asserted
+    # deterministically.
+    cfg.gateway_mode = GatewayModeEnum.external
+    cfg.get_advertise_address.return_value = "10.0.0.2"
+    cfg.get_api_port.return_value = 8080
+    cfg.get_derived_gateway_token.return_value = "test-gateway-token"
     return cfg
 
 
@@ -124,6 +132,29 @@ class TestRateLimitPlugin:
     def test_no_redis_section_means_local_mode(self):
         _, spec = build(enabled=True, default_rpm=60)
         assert "redis" not in spec.defaultConfig
+
+    def test_rejection_report_endpoint_rides_the_base_config(self):
+        """The plugin needs a server address and the derived gateway token to
+        report rejections; both render into the base config the same way the
+        token-usage plugin's report endpoint does."""
+        from gpustack.gateway.rate_limit import RATE_LIMIT_REPORT_PATH
+
+        _, spec = build(enabled=True, default_rpm=60)
+        endpoint = spec.defaultConfig["endpoint"]
+        assert endpoint["path"] == RATE_LIMIT_REPORT_PATH
+        # External gateway mode addresses the server through the static
+        # McpBridge registry entry.
+        assert endpoint["service_name"] == "gpustack.static"
+        assert endpoint["service_port"] == 80
+        header = spec.defaultConfig["header_add"]
+        assert list(header.values()) == ["test-gateway-token"]
+
+    def test_report_events_opt_out_drops_the_endpoint_block(self):
+        """``report_events: false`` removes the block entirely, so an older
+        plugin (or an operator who wants the gateway silent) never POSTs."""
+        _, spec = build(enabled=True, default_rpm=60, report_events=False)
+        assert "endpoint" not in spec.defaultConfig
+        assert "header_add" not in spec.defaultConfig
 
 
 class TestRateLimitRedisRegistry:

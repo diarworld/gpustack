@@ -27,7 +27,6 @@ from sqlmodel import Field, SQLModel
 from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import JSON, UTCDateTime
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -36,6 +35,9 @@ from gpustack.schemas.common import JSON, UTCDateTime
 RESOURCE_TYPE_GPU_INSTANCE = "gpu_instance"
 RESOURCE_TYPE_CPU_INSTANCE = "cpu_instance"
 RESOURCE_TYPE_PERSISTENT_VOLUME = "persistent_volume"
+# Rate-limit rejections reported by the gateway plugin. The "resource" is the
+# user whose limit tripped: resource_id / resource_name carry the user.
+RESOURCE_TYPE_LIMIT = "limit"
 
 # event_type
 # Lifecycle (also drive the collectors' state machine):
@@ -47,6 +49,19 @@ EVENT_TYPE_PHASE_LEFT_METERED = "phase_left_metered"
 EVENT_TYPE_UPDATED = "updated"
 EVENT_TYPE_ATTACHED = "attached"
 EVENT_TYPE_DETACHED = "detached"
+
+# Rate-limit rejections (resource_type == RESOURCE_TYPE_LIMIT). Every one is
+# the same kind of thing — a limit tripping ("Срабатывание") — the axis that
+# tripped is the enum. ``limit_event`` is the fallback for plugin (kind,
+# period) pairs this table does not map yet, so an unknown future axis
+# degrades to a generic row instead of a dropped one.
+EVENT_TYPE_LIMIT_RATE_REQUESTS = "limit_rate_requests"
+EVENT_TYPE_LIMIT_RATE_TOKENS = "limit_rate_tokens"
+EVENT_TYPE_LIMIT_CONCURRENCY = "limit_concurrency"
+EVENT_TYPE_LIMIT_QUOTA_DAILY = "limit_quota_daily"
+EVENT_TYPE_LIMIT_QUOTA_MONTHLY = "limit_quota_monthly"
+EVENT_TYPE_LIMIT_QUOTA_YEARLY = "limit_quota_yearly"
+EVENT_TYPE_LIMIT_EVENT = "limit_event"
 
 
 # ---------------------------------------------------------------------------

@@ -61,11 +61,10 @@ from gpustack.gateway.rate_limit import (
     rate_limit_redis_registry,
     rate_limit_spec,
 )
+from gpustack.gateway.server_registry import get_gpustack_higress_registry
 from gpustack.routes.plugins import route_plugins
 
 logger = logging.getLogger(__name__)
-
-mcp_registry_port = 80
 
 # The caller identity every Higress plugin agrees on by constant, ext-auth
 # included. Named here because two plugins below have to spell it identically:
@@ -134,35 +133,6 @@ def wait_for_apiserver_ready(cfg: Config, timeout: int = 60, interval: int = 5):
         asyncio.run(get_api_resources())
     except asyncio.CancelledError:
         raise
-
-
-def get_gpustack_higress_registry(cfg: Config) -> McpBridgeRegistry:
-    registry_type = "dns"
-    domain = f"{cfg.service_discovery_name}.{cfg.get_namespace()}.svc"
-    mcp_port = cfg.get_api_port()
-    if cfg.gateway_mode != GatewayModeEnum.incluster:
-        registry_type = "static"
-        mcp_port = mcp_registry_port
-        port = cfg.get_api_port()
-        if cfg.gateway_mode == GatewayModeEnum.external:
-            address = cfg.get_advertise_address()
-        elif cfg.gateway_mode == GatewayModeEnum.embedded:
-            address = "127.0.0.1"
-        domain = f"{address}:{port}"
-
-    mcp_registry_name = (
-        "gpustack"
-        if cfg.server_role() != Config.ServerRole.WORKER
-        else "gpustack-worker"
-    )
-    registry = McpBridgeRegistry(
-        type=registry_type,
-        name=mcp_registry_name,
-        port=mcp_port,
-        protocol="http",
-        domain=domain,
-    )
-    return registry
 
 
 def _redis_registry_from_config(

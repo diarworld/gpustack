@@ -186,6 +186,12 @@ class GatewayRateLimitConfig(BaseModel):
     # allowlist of the fields the server itself acts on.
     plugin_config: Dict[str, Any] = {}
 
+    # Publish the report endpoint into the plugin config so every rejection
+    # is POSTed back to the server and lands in the resource-events UI. Off
+    # removes the endpoint block entirely -- the plugin stays a passthrough
+    # for reporting and writes nothing.
+    report_events: bool = True
+
 
 class WorkerConfig(PredefinedConfig):
     # common config which should be dynamic or not configurable

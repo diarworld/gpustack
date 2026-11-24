@@ -657,6 +657,17 @@ USAGE_EVENTS_RETENTION_MONTHS = int(
 USAGE_EVENTS_ARCHIVE_CRON = os.getenv(
     "GPUSTACK_USAGE_EVENTS_ARCHIVE_CRON", "30 3 * * *"
 )
+
+# Hard cap on the in-memory rate-limit rejection buffer (per-rejection rows
+# held between flushes). Rejections cost the gateway nothing, so a retry
+# storm or an authenticated DDoS can produce them far faster than rows
+# should be written; once the cap trips, ingest stops buffering individual
+# events and the flush writes one overflow row per (user, axis, model) with
+# the suppressed count instead. Bounds both the memory and the row rate
+# regardless of the input rate.
+LIMIT_EVENTS_BUFFER_MAX_SIZE = int(
+    os.getenv("GPUSTACK_LIMIT_EVENTS_BUFFER_MAX_SIZE", 10000)
+)
 USAGE_EVENTS_ARCHIVE_BATCH_SIZE = int(
     os.getenv("GPUSTACK_USAGE_EVENTS_ARCHIVE_BATCH_SIZE", 5000)
 )

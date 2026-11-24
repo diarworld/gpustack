@@ -93,6 +93,7 @@ from gpustack.server.system_load import SystemLoadCollector
 from gpustack.server.sources.probe import SourceRefresher
 from gpustack.server.update_check import UpdateChecker
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
+from gpustack.server.limit_event_collector import flush_limit_events_to_db
 from gpustack.server.metrics_collector import flush_gateway_metrics_to_db
 from gpustack.server.usage_details_archiver import UsageDetailsArchiver
 from gpustack.server.resource_event_logger import ResourceEventLogger
@@ -604,6 +605,10 @@ class Server:
         # ModelUsageMiddleware feed the same buffer, so the flusher must run
         # even when the external gateway is disabled.
         self._create_async_task(flush_gateway_metrics_to_db())
+        # Same for the rate-limit rejection reports: the plugin posts to the
+        # report endpoint only when the feature is on, but the flusher itself
+        # is unconditional so the endpoint never buffers without a drain.
+        self._create_async_task(flush_limit_events_to_db())
 
         logger.debug("Gateway metrics flusher started.")
 

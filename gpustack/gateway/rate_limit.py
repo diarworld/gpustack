@@ -16,12 +16,20 @@ Combination semantics worth restating, because the reconciler leans on both:
 
 from typing import Any, Dict, List, Optional
 
+from gpustack.api.auth import GATEWAY_AUTH_TOKEN_HEADER
 from gpustack.config.config import Config, GatewayRateLimitConfig
 from gpustack.gateway.client import McpBridgeRegistry, WasmPluginSpec
 from gpustack.gateway.plugins import plugin_spec_overrides
 from gpustack.gateway.rate_limit_settings import FreeWindow
+from gpustack.gateway.server_registry import get_gpustack_higress_registry
 
 rate_limit_plugin_name = "gpustack-rate-limit"
+
+# The server path rejection reports are POSTed to. The gateway addresses the
+# server through the McpBridge registry (see ``server_registry``), and the
+# endpoint authenticates with the same derived gateway token the token-usage
+# metrics report uses.
+RATE_LIMIT_REPORT_PATH = "/v2/usage/gateway-limit-events"
 
 # The McpBridge registry that carries the rate-limit redis service. This
 # gateway publishes no Kubernetes services on its own -- every cluster it
@@ -182,6 +190,21 @@ def rate_limit_base_config(
         config["rejected_code"] = rlc.rejected_code
     if rlc.rejected_msg:
         config["rejected_msg"] = rlc.rejected_msg
+    if rlc.report_events:
+        # Rejection reports ride the same channel as token-usage metrics: a
+        # POST to the server registry path, authenticated by the derived
+        # gateway token. The server folds bursts, so the plugin reports one
+        # event per rejected request. Placed before the operator pass-through
+        # so ``plugin_config`` can override either block.
+        registry = get_gpustack_higress_registry(cfg=cfg)
+        config["endpoint"] = {
+            "path": RATE_LIMIT_REPORT_PATH,
+            "service_name": registry.get_service_name(),
+            "service_port": registry.port,
+        }
+        config["header_add"] = {
+            GATEWAY_AUTH_TOKEN_HEADER: cfg.get_derived_gateway_token(),
+        }
     # Operator pass-through fields apply last: they override the base.
     config.update(rlc.plugin_config)
     if rlc.redis is not None:
