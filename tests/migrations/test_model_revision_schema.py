@@ -229,9 +229,10 @@ def test_v231_indexes_run_for_databases_already_at_v230():
         str(Path(__file__).resolve().parents[2] / "gpustack/migrations"),
     )
     scripts = ScriptDirectory.from_config(cfg)
-    pending = list(
-        scripts.iterate_revisions(scripts.get_current_head(), "a7e2c9d4f681")
-    )
+    # The v2.3.0 -> v2.3.1 step is exactly the shipped bundle: no revision may
+    # be inserted between them (later, v2.3.2-development revisions stack on
+    # top of the bundle and are out of scope for this contract).
+    pending = list(scripts.iterate_revisions("c8d3e6f1a902", "a7e2c9d4f681"))
     assert [step.revision for step in pending] == ["c8d3e6f1a902"]
 
 
