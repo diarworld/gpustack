@@ -45,8 +45,8 @@ def test_complete_source_inventory(language):
 @pytest.mark.parametrize("language", ["ru", "tr"])
 @pytest.mark.parametrize("relative", PAGES, ids=str)
 def test_translated_document_contract(language, relative):
-    english = (ROOT / "docs" / relative).read_text()
-    translated = (ROOT / f"docs-i18n/{language}" / relative).read_text()
+    english = (ROOT / "docs" / relative).read_text(encoding="utf-8")
+    translated = (ROOT / f"docs-i18n/{language}" / relative).read_text(encoding="utf-8")
     if relative.as_posix() == "index.md":
         assert translated == english
         return
@@ -152,9 +152,9 @@ def test_redirect_text_changes_without_changing_destinations(tmp_path, language)
         '<body>You\'re being redirected to a '
         '<a href="../../requirements/">new destination</a>.</body></html>'
     )
-    page.write_text(original)
+    page.write_text(original, encoding="utf-8")
     i18n.localize_redirects(tmp_path, language)
-    translated = page.read_text()
+    translated = page.read_text(encoding="utf-8")
     assert f'lang="{language}"' in translated
     assert i18n.REDIRECT_MESSAGES[language][0] in translated
     assert 'href="../../requirements/"' in translated
