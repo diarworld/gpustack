@@ -13,16 +13,22 @@ apart in shape while claiming to be the same feature.
 
 import contextlib
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
 
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 
 from gpustack import envs
-from gpustack.schemas.usage import USAGE_EXPORT_FORMAT_XLSX
+from gpustack.schemas.usage import (
+    USAGE_EXPORT_FORMAT_XLSX,
+    USAGE_EXPORT_SPLIT_AUTO,
+)
 from gpustack.utils.export_limits import (
     attachment_headers,
+    effective_export_format,
     export_split_plan,
+    export_too_large,
     split_member_name,
     split_too_many_parts,
 )
@@ -52,6 +58,20 @@ class ExportSheetPlan:
     rows: Callable[[], AsyncIterator[Sequence[Any]]]
 
 
+def export_stamp(request) -> str:
+    """The filename's period stamp: the requested range, or the export day.
+
+    The breakdown exports stamp the range they filtered by. The single-table
+    list exports have no range — their filename stamps the day the file was
+    produced, so two downloads of the same table stay distinguishable.
+    """
+    start = getattr(request, "start_date", None)
+    end = getattr(request, "end_date", None)
+    if start is None or end is None:
+        return date.today().isoformat()
+    return f"{start}_{end}"
+
+
 def trailer_context(effective_scope: str, organization_id: Optional[int]) -> str:
     """What every file's trailer says about the query behind it.
 
@@ -75,7 +95,7 @@ async def export_response(
     context: str,
 ) -> Response:
     """One sheet becomes a file, several become an archive or a workbook."""
-    stamp = f"{request.start_date}_{request.end_date}"
+    stamp = export_stamp(request)
 
     if export_format == USAGE_EXPORT_FORMAT_XLSX:
         payload = await build_xlsx(
@@ -175,9 +195,56 @@ def split_export_response(
                         ),
                     )
 
-    stamp = f"{request.start_date}_{request.end_date}"
+    stamp = export_stamp(request)
     return StreamingResponse(
         stream_zip(members()),
         media_type="application/zip",
         headers=attachment_headers(f"{prefix}_{stamp}_split.zip"),
+    )
+
+
+async def single_sheet_export_response(
+    plan: ExportSheetPlan,
+    *,
+    request,
+    prefix: str,
+    context: str,
+) -> Response:
+    """Deliver one fixed-table export under the shared row limit.
+
+    The single-table list exports (the rate-limit tables, resource events)
+    are the breakdown exports with one plan and no sheet choice, so the
+    verdicts must be the same ones: refuse an over-limit result unless the
+    caller asked for it split, downgrade a worksheet-overflowing one to CSV,
+    and stream otherwise. Routing the routes through here keeps those
+    decisions next to the code that implements them.
+    """
+    total = plan.total
+    if total > envs.USAGE_EXPORT_MAX_ROWS:
+        if request.split == USAGE_EXPORT_SPLIT_AUTO:
+            return split_export_response(
+                [plan],
+                request=request,
+                prefix=prefix,
+                context=context,
+                limit=envs.USAGE_EXPORT_MAX_ROWS,
+            )
+        members = sum(
+            export_split_plan({plan.key: total}, envs.USAGE_EXPORT_MAX_ROWS).values()
+        )
+        raise export_too_large(
+            request,
+            plan.key,
+            total,
+            envs.USAGE_EXPORT_MAX_ROWS,
+            split_parts=(
+                members if members <= envs.USAGE_EXPORT_MAX_SPLIT_MEMBERS else None
+            ),
+        )
+    return await export_response(
+        [plan],
+        request=request,
+        prefix=prefix,
+        export_format=effective_export_format(request.format, [total]),
+        context=context,
     )

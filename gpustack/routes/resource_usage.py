@@ -66,6 +66,7 @@ from gpustack.schemas.principals import (
 )
 from gpustack.schemas.usage import (
     USAGE_EXPORT_SPLIT_AUTO,
+    TableExportRequest,
     UsageExportEstimateResponse,
     UsageExportShape,
     UsageExportSheet,
@@ -84,6 +85,7 @@ from gpustack.server.services import bulk_user_attribute_labels
 from gpustack.utils.export_delivery import (
     ExportSheetPlan,
     export_response,
+    single_sheet_export_response,
     split_export_response,
     trailer_context,
 )
@@ -99,6 +101,9 @@ from gpustack.utils.tabular_export import ExportStageTimer
 from gpustack.utils.usage_export import (
     UNTRACKED_ORGANIZATION_NAME,
     build_resource_export_columns,
+    list_export_columns,
+    list_export_row,
+    resource_events_export_column_keys,
     resource_export_column_keys,
     resource_export_row,
 )
@@ -2288,6 +2293,57 @@ async def _principal_display_names(session, ids: List[int]) -> Dict[int, str]:
     return {pid: name for pid, name in rows if name}
 
 
+def _resource_events_statement(
+    *,
+    user_id: int,
+    org_id: Optional[int],
+    effective_scope: str,
+    start_date: Optional[date],
+    end_date: Optional[date],
+    resource_type: Optional[str],
+    resource_name: Optional[str],
+    event_type_list: Optional[List[str]],
+    creator_id_list: Optional[List[int]],
+    organization_id_list: Optional[List[int]],
+    group_member_ids: Optional[List[int]],
+):
+    """The events list's query — the one predicate the page, its export and
+    the export estimate all read from, so a file and the table it was
+    clicked on agree row for row."""
+    stmt = select(ResourceEvent)
+    if effective_scope == USAGE_SCOPE_SELF:
+        stmt = stmt.where(ResourceEvent.creator_id == user_id)
+    if org_id is not None:
+        # Tenant scope follows the consumer, same as metered_usage.
+        stmt = stmt.where(ResourceEvent.consumer_principal_id == org_id)
+    if creator_id_list:
+        stmt = stmt.where(ResourceEvent.creator_id.in_(creator_id_list))
+    if organization_id_list:
+        stmt = stmt.where(ResourceEvent.consumer_principal_id.in_(organization_id_list))
+    if group_member_ids is not None:
+        stmt = stmt.where(ResourceEvent.creator_id.in_(group_member_ids))
+    if resource_type:
+        stmt = stmt.where(ResourceEvent.resource_type == resource_type)
+    if event_type_list:
+        stmt = stmt.where(ResourceEvent.event_type.in_(event_type_list))
+    if resource_name and resource_name.strip():
+        # Case-insensitive substring ("fuzzy") match on the resource name —
+        # func.lower(...) LIKE keeps it portable across PostgreSQL and MySQL.
+        needle = f"%{resource_name.strip().lower()}%"
+        stmt = stmt.where(func.lower(ResourceEvent.resource_name).like(needle))
+    # Filter by the rollup-tz calendar day, matching how occurred_at is
+    # displayed (and the breakdown buckets) — NOT the raw UTC day. Otherwise an
+    # event at 2026-05-26 20:00 UTC, shown as 2026-05-27 04:00+08:00, would be
+    # missed by a 2026-05-27 filter and wrongly returned by a 2026-05-26 one
+    # (the #5523 cross-boundary bug). Half-open UTC window, no per-row cast.
+    ev_start, ev_end = _rollup_day_window(start_date, end_date)
+    if ev_start is not None:
+        stmt = stmt.where(ResourceEvent.occurred_at >= ev_start)
+    if ev_end is not None:
+        stmt = stmt.where(ResourceEvent.occurred_at < ev_end)
+    return stmt
+
+
 @router.get("/resource-events")
 async def resource_events(  # noqa: C901
     session: SessionDep,
@@ -2328,37 +2384,19 @@ async def resource_events(  # noqa: C901
         else None
     )
 
-    stmt = select(ResourceEvent)
-    if effective_scope == USAGE_SCOPE_SELF:
-        stmt = stmt.where(ResourceEvent.creator_id == user.id)
-    if org_id is not None:
-        # Tenant scope follows the consumer, same as metered_usage.
-        stmt = stmt.where(ResourceEvent.consumer_principal_id == org_id)
-    if creator_id_list:
-        stmt = stmt.where(ResourceEvent.creator_id.in_(creator_id_list))
-    if organization_id_list:
-        stmt = stmt.where(ResourceEvent.consumer_principal_id.in_(organization_id_list))
-    if group_member_ids is not None:
-        stmt = stmt.where(ResourceEvent.creator_id.in_(group_member_ids))
-    if resource_type:
-        stmt = stmt.where(ResourceEvent.resource_type == resource_type)
-    if event_type_list:
-        stmt = stmt.where(ResourceEvent.event_type.in_(event_type_list))
-    if resource_name and resource_name.strip():
-        # Case-insensitive substring ("fuzzy") match on the resource name —
-        # func.lower(...) LIKE keeps it portable across PostgreSQL and MySQL.
-        needle = f"%{resource_name.strip().lower()}%"
-        stmt = stmt.where(func.lower(ResourceEvent.resource_name).like(needle))
-    # Filter by the rollup-tz calendar day, matching how occurred_at is
-    # displayed (and the breakdown buckets) — NOT the raw UTC day. Otherwise an
-    # event at 2026-05-26 20:00 UTC, shown as 2026-05-27 04:00+08:00, would be
-    # missed by a 2026-05-27 filter and wrongly returned by a 2026-05-26 one
-    # (the #5523 cross-boundary bug). Half-open UTC window, no per-row cast.
-    ev_start, ev_end = _rollup_day_window(start_date, end_date)
-    if ev_start is not None:
-        stmt = stmt.where(ResourceEvent.occurred_at >= ev_start)
-    if ev_end is not None:
-        stmt = stmt.where(ResourceEvent.occurred_at < ev_end)
+    stmt = _resource_events_statement(
+        user_id=user.id,
+        org_id=org_id,
+        effective_scope=effective_scope,
+        start_date=start_date,
+        end_date=end_date,
+        resource_type=resource_type,
+        resource_name=resource_name,
+        event_type_list=event_type_list,
+        creator_id_list=creator_id_list,
+        organization_id_list=organization_id_list,
+        group_member_ids=group_member_ids,
+    )
 
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total = (await session.exec(count_stmt)).first() or 0
@@ -2408,6 +2446,199 @@ async def resource_events(  # noqa: C901
             for r in rows
         ],
     }
+
+
+class ResourceEventsExportRequest(TableExportRequest):
+    """``/resource-events/export`` payload.
+
+    The same filters as the ``GET /resource-events`` list — the file and
+    the table must come from one predicate — with ``event_types`` as a
+    list, the body spelling of the GET's comma-separated query parameter.
+    """
+
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    scope: str = USAGE_SCOPE_ALL
+    resource_type: Optional[str] = None
+    resource_name: Optional[str] = None
+    event_types: Optional[List[str]] = None
+    creator_ids: Optional[List[int]] = None
+    organization_ids: Optional[List[int]] = None
+    user_group_ids: Optional[List[int]] = None
+
+
+async def _events_export_statement(
+    session, user, ctx, request: ResourceEventsExportRequest
+):
+    """The events export's shared entry with its estimate: resolve the
+    scope the way the list does, gate the cross-tenant filters, and build
+    the statement both run.
+
+    Returns:
+        (statement, effective_scope, organization_id): the query and the
+        two values the file's trailer reports — the EFFECTIVE scope, so a
+        file exported by a user whose ``all`` was answered with their own
+        rows says so.
+    """
+    effective_scope = _resolve_effective_scope(user, ctx, request.scope)
+    org_id = ctx.current_principal_id if ctx is not None else None
+    _check_resource_filter_permission(
+        user,
+        ctx,
+        effective_scope,
+        organization_ids=request.organization_ids,
+        user_group_ids=request.user_group_ids,
+    )
+    group_member_ids = None
+    if request.user_group_ids:
+        group_member_ids = await _group_member_user_ids(session, request.user_group_ids)
+    stmt = _resource_events_statement(
+        user_id=user.id,
+        org_id=org_id,
+        effective_scope=effective_scope,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        resource_type=request.resource_type,
+        resource_name=request.resource_name,
+        event_type_list=request.event_types,
+        creator_id_list=request.creator_ids,
+        organization_id_list=request.organization_ids,
+        group_member_ids=group_member_ids,
+    )
+    return stmt, effective_scope, org_id
+
+
+def _resource_event_export_item(
+    row: ResourceEvent,
+    display_names: Dict[int, str],
+    attribute_labels: Dict[int, Dict[str, str]],
+    aware_tz,
+) -> Dict[str, Any]:
+    """One export row for the events list, keyed by the column schema —
+    the same resolution the GET items apply: the live display name
+    falling back to the login-name snapshot, the attribute-derived labels
+    beside them."""
+    labels = attribute_labels.get(row.creator_id, {})
+    return {
+        "occurred_at": to_rollup_aware(row.occurred_at, aware_tz),
+        "resource_type": row.resource_type,
+        "resource_name": row.resource_name,
+        "event_type": row.event_type,
+        "event_message": row.event_message,
+        "phase": row.phase,
+        "phase_message": _phase_message_of(row.spec_snapshot),
+        "creator_id": row.creator_id,
+        "creator_name": row.creator_name,
+        "creator_full_name": display_names.get(row.creator_id) or row.creator_name,
+        "creator_business_unit": labels.get("business_unit"),
+        "creator_department": labels.get("department"),
+        "creator_profession": labels.get("profession"),
+    }
+
+
+async def _stream_resource_event_rows(
+    session, stmt, total: int
+) -> AsyncIterator[List[Any]]:
+    """Stream the events export's rows in hydrated chunks.
+
+    Each chunk reads one page, resolves its creators' display names and
+    attribute labels in bulk (the same hydration the GET's page applies,
+    but per chunk — a 100k-row export cannot hold every creator's labels
+    at once) and yields the flattened rows. The ORDER BY carries the id as
+    its tiebreak so a same-instant pair cannot swap places between chunks,
+    which would duplicate a row across the files of a split.
+    """
+    aware_tz = resolve_rollup_tz()  # resolved once, not per row
+    keys = resource_events_export_column_keys()
+    offset = 0
+    while offset < total:
+        page = (
+            await session.exec(
+                stmt.order_by(desc(ResourceEvent.occurred_at), desc(ResourceEvent.id))
+                .offset(offset)
+                .limit(envs.USAGE_EXPORT_STREAM_CHUNK_ROWS)
+            )
+        ).all()
+        if not page:
+            # Rows deleted mid-export: the stale total ran past the data.
+            break
+        creator_ids = [r.creator_id for r in page if r.creator_id is not None]
+        attribute_labels = await bulk_user_attribute_labels(session, creator_ids)
+        display_names = await _principal_display_names(session, creator_ids)
+        for row in page:
+            yield list_export_row(
+                _resource_event_export_item(
+                    row, display_names, attribute_labels, aware_tz
+                ),
+                keys,
+            )
+        offset += len(page)
+
+
+@router.post("/resource-events/export")
+async def export_resource_events(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: ResourceEventsExportRequest,
+):
+    """The resource-events list as a file — the same rows in the same
+    newest-first order the list serves, with the name column's tooltip
+    fields (Full Name / Business Unit / Department / Profession) spelled
+    out as columns.
+
+    The scope rules are the list's: a member's ``all`` degrades to their
+    own events (and the trailer says so), the cross-tenant filters stay
+    platform-wide.
+    """
+    stmt, effective_scope, org_id = await _events_export_statement(
+        session, user, ctx, request
+    )
+    total = int(
+        (await session.exec(select(func.count()).select_from(stmt.subquery()))).first()
+        or 0
+    )
+    keys = resource_events_export_column_keys()
+    plan = ExportSheetPlan(
+        key="events",
+        name=None,
+        columns=list_export_columns(keys),
+        total=total,
+        rows=lambda: _stream_resource_event_rows(session, stmt, total),
+    )
+    return await single_sheet_export_response(
+        plan,
+        request=request,
+        prefix="resource-events",
+        context=trailer_context(effective_scope, org_id),
+    )
+
+
+@router.post(
+    "/resource-events/export/estimate",
+    response_model=UsageExportEstimateResponse,
+)
+async def estimate_resource_events_export(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: ResourceEventsExportRequest,
+):
+    """Size the events export before the click — the shared preflight."""
+    stmt, _, _ = await _events_export_statement(session, user, ctx, request)
+    total = int(
+        (await session.exec(select(func.count()).select_from(stmt.subquery()))).first()
+        or 0
+    )
+    keys = resource_events_export_column_keys()
+    estimate = UsageExportSheetEstimate(
+        key="events",
+        name=None,
+        total=total,
+        available=True,
+        columns=export_columns_payload(keys, list_export_columns(keys)),
+    )
+    return build_export_estimate(request, [estimate], total)
 
 
 def _series_bucket_label(value: Any, granularity: str) -> str:

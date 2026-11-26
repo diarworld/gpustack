@@ -88,8 +88,26 @@ def effective_export_format(requested: str, totals) -> str:
     return requested
 
 
+def request_has_date_range(request) -> bool:
+    """Whether the request carries the start/end dates the range remedies need.
+
+    The breakdown exports always do — the range IS their primary filter. The
+    single-table list exports (the rate-limit tables) have no range at all:
+    their rows are not selected by date, so "narrow the range" is not advice
+    anyone can follow.
+    """
+    start = getattr(request, "start_date", None)
+    end = getattr(request, "end_date", None)
+    return start is not None and end is not None
+
+
 def shorten_range_days(request, total: int, limit: int) -> int:
     """How many days would fit under ``limit`` at the current row density."""
+    if not request_has_date_range(request):
+        # No range to shorten — the caller should not have asked (the
+        # suggestion is omitted for range-less requests), so answer 0 rather
+        # than crash on the arithmetic.
+        return 0
     days = (request.end_date - request.start_date).days + 1
     if total <= 0:
         return days
@@ -132,12 +150,14 @@ def export_suggestions(
     # the rows. A coarser granularity would collapse 30 daily rows into one,
     # and sitting next to two lossless options it would be picked without the
     # user noticing the data changed — so it is not offered.
-    suggestions: List[Dict[str, Any]] = [
-        {
-            "action": "shorten_range",
-            "max_days": shorten_range_days(request, total, limit),
-        }
-    ]
+    suggestions: List[Dict[str, Any]] = []
+    if request_has_date_range(request):
+        suggestions.append(
+            {
+                "action": "shorten_range",
+                "max_days": shorten_range_days(request, total, limit),
+            }
+        )
     # Offered for every grouping — parts are row slices, so none is excluded —
     # but only when the split path would accept it.
     if split_parts:
@@ -185,7 +205,7 @@ def build_export_estimate(
         exceeds_hard_limit=exceeds_hard,
         suggested_max_days=(
             shorten_range_days(request, over, envs.USAGE_EXPORT_MAX_ROWS)
-            if exceeds_hard
+            if exceeds_hard and request_has_date_range(request)
             else None
         ),
         # The remedies are computed here, not in the client, so the advice

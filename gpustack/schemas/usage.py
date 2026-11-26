@@ -371,18 +371,14 @@ class UsageExportSheet(BaseModel):
         return value
 
 
-class UsageExportShape(BaseModel):
-    """The file-shape knobs every export payload carries, validated once.
+class UsageExportFileShape(BaseModel):
+    """The file-format knobs every export payload carries, validated once.
 
-    The token and resource exports produce the same kinds of file from the
-    same three decisions — one table or several, which format, whether an
-    over-large result may be split — and the checks behind them are not
-    cosmetic: two sheets sharing a key overwrite each other's row counts and
-    parts, and land in the archive as two members with one name. Defining them
-    here is what stops one endpoint from being validated less than the other.
-
-    Subclasses redeclare ``group_by`` to validate it, since which dimension
-    names are legal is endpoint-specific.
+    The exports produce the same kinds of file from the same two decisions —
+    which format, whether an over-large result may be split — and the checks
+    behind them are not cosmetic: an unrecognized value must not silently
+    read as a working default. Defining them on one base is what stops one
+    endpoint from being validated less than the other.
     """
 
     # xlsx by default: that is what these exports have always produced. The
@@ -392,6 +388,35 @@ class UsageExportShape(BaseModel):
     # ``"auto"`` slices an over-large result into files inside one archive
     # instead of rejecting it.
     split: Optional[str] = None
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        if value not in USAGE_EXPORT_FORMATS:
+            raise ValueError(
+                f"Unsupported format: {value}. "
+                f"Expected one of: {', '.join(sorted(USAGE_EXPORT_FORMATS))}"
+            )
+        return value
+
+    @field_validator("split")
+    @classmethod
+    def validate_split(cls, value: Optional[str]) -> Optional[str]:
+        # An unrecognized value must not read as "no split": the caller asked
+        # for a way around the row limit and would otherwise get a plain
+        # over-limit refusal with nothing pointing at the word it sent.
+        if value is not None and value not in USAGE_EXPORT_SPLITS:
+            raise ValueError(f"Unsupported split: {value}")
+        return value
+
+
+class UsageExportShape(UsageExportFileShape):
+    """The multi-table export shape on top of the format knobs.
+
+    Subclasses redeclare ``group_by`` to validate it, since which dimension
+    names are legal is endpoint-specific.
+    """
+
     # Exactly one of ``sheets`` and ``group_by``. ``group_by`` is the
     # single-table form and keeps the payload identical to ``/breakdown``; it
     # is declared here as well as in the subclasses so the shape check below
@@ -466,6 +491,17 @@ class UsageExportShape(BaseModel):
                 sort_by=self.default_sheet_sort_by(),
             )
         ]
+
+
+class TableExportRequest(UsageExportFileShape):
+    """``/export`` payload for the single-table list exports.
+
+    The rate-limit tables and the resource-events list are plain lists, not
+    breakdowns: one fixed table, so there is no ``sheets`` / ``group_by``
+    choice to make. The payload is the list endpoint's own filters (declared
+    by the subclass each route defines) plus the same file-shape knobs, so
+    every export enforces the same format and split rules.
+    """
 
 
 class UsageExportRequest(UsageBaseRequest, UsageExportShape):

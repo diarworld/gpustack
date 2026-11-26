@@ -111,6 +111,47 @@ EXPORT_COLUMN_TITLES: Dict[str, str] = {
     "active_instances": "Active Instances",
     "active_volumes": "Active Volumes",
     "active_users": "Active Users",
+    # The single-table list exports (rate limits / resets / resource events).
+    # The name column expands into the user fields the on-screen tooltip
+    # carries — the file has no hover to hide them in.
+    "full_name": "Full Name",
+    "business_unit": "Business Unit",
+    "department": "Department",
+    "profession": "Profession",
+    # The limits table's four axes, each split into its cap and its live
+    # counter. "Used" rides on the axis name the page shows (RPM / TPM /
+    # Weekly / Monthly); the token axes say Tokens so the numbers are not
+    # mistaken for request counts.
+    "rpm_limit": "RPM Limit",
+    "rpm_used": "RPM Used",
+    "tpm_limit": "TPM Limit",
+    "tpm_used": "TPM Used",
+    "weekly_limit": "Weekly Token Limit",
+    "weekly_used": "Weekly Tokens Used",
+    "monthly_limit": "Monthly Token Limit",
+    "monthly_used": "Monthly Tokens Used",
+    # The resets audit table.
+    "reset_at": "Reset At",
+    "limit_kind": "Limit Kind",
+    "outcome": "Outcome",
+    "work_type": "Work Type",
+    "rejection_reason": "Rejection Reason",
+    "description": "Description",
+    # The resource-events list. The creator fields keep the API's ``creator_``
+    # spelling — the same names the JSON rows already use.
+    "occurred_at": "Time",
+    "resource_type": "Resource Type",
+    "resource_name": "Resource",
+    "event_type": "Event",
+    "event_message": "Message",
+    "phase": "Phase",
+    "phase_message": "Phase Message",
+    "creator_id": "User ID",
+    "creator_name": "User",
+    "creator_full_name": "Full Name",
+    "creator_business_unit": "Business Unit",
+    "creator_department": "Department",
+    "creator_profession": "Profession",
 }
 
 
@@ -533,3 +574,92 @@ def build_resource_export_columns(
             group_by, metric_keys, carries_organization
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Single-table list exports (rate limits / resets / resource events)
+# ---------------------------------------------------------------------------
+
+# These tables export one fixed sheet apiece, so unlike the breakdown exports
+# there is no group_by to derive a layout from — the schema is a constant list
+# of keys per table, defined HERE and versioned with the API for the same
+# reason the ones above are: a reconciliation script must not break because a
+# column moved on screen. Every table leads with the user fields (login, full
+# name, the attribute-derived org labels) — the tooltip the UI hides behind a
+# hover, which a flat file has nowhere to put.
+
+
+def rate_limit_users_export_column_keys() -> List[str]:
+    """Column keys for the cross-user limits table's export, in file order.
+
+    Each axis expands to its cap and its live counter; a user without an
+    effective limit on an axis leaves both cells empty (the UI renders a
+    dash — the file prefers an empty cell, see ``_dimension_values``).
+    """
+    return [
+        "user_id",
+        "user_name",
+        "full_name",
+        "business_unit",
+        "department",
+        "profession",
+        "rpm_limit",
+        "rpm_used",
+        "tpm_limit",
+        "tpm_used",
+        "weekly_limit",
+        "weekly_used",
+        "monthly_limit",
+        "monthly_used",
+    ]
+
+
+def rate_limit_resets_export_column_keys() -> List[str]:
+    """Column keys for the rate-limit resets table's export, in file order."""
+    return [
+        "user_id",
+        "user_name",
+        "full_name",
+        "business_unit",
+        "department",
+        "profession",
+        "reset_at",
+        "limit_kind",
+        "outcome",
+        "work_type",
+        "rejection_reason",
+        "description",
+    ]
+
+
+def resource_events_export_column_keys() -> List[str]:
+    """Column keys for the resource-events list's export, in file order."""
+    return [
+        "occurred_at",
+        "resource_type",
+        "resource_name",
+        "event_type",
+        "event_message",
+        "phase",
+        "phase_message",
+        "creator_id",
+        "creator_name",
+        "creator_full_name",
+        "creator_business_unit",
+        "creator_department",
+        "creator_profession",
+    ]
+
+
+def list_export_columns(column_keys: Sequence[str]) -> List[str]:
+    """The header row for a list-table export, in file order."""
+    return [export_column_title(key) for key in column_keys]
+
+
+def list_export_row(item: Dict[str, Any], column_keys: Sequence[str]) -> List[Any]:
+    """Flatten one prepared dict into a row matching ``list_export_columns``.
+
+    The route builds the dict — resolving names and org labels the way its
+    JSON items do — so the file and the table cannot disagree about a value.
+    """
+    return [item.get(key) for key in column_keys]

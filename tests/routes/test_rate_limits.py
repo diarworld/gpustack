@@ -6,6 +6,7 @@ like the ones ``tests/routes/test_api_keys.py`` uses to call route handlers
 directly.
 """
 
+import csv
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -152,6 +153,10 @@ class FakeSession:
             # a fresh fake session should look like.
             return SimpleNamespace(first=lambda: None)
         if "gateway_rate_limit_resets" in text:
+            if "count(" in text:
+                # The export estimate's COUNT over the table's predicate:
+                # the same filter parsing as the listing below.
+                return SimpleNamespace(first=lambda: len(self._table_resets(text)))
             if "reset_at >" in text:
                 # The floating-quota read: kind / user / outcome /
                 # self-service filters (see _matching_resets).
@@ -1970,3 +1975,377 @@ async def test_resets_table_rejects_unknown_outcome():
             ctx=_ctx(None),
             outcome="pending",
         )
+
+
+# --------------------------------------------------------------------------
+# Table exports (the users limits table and the resets table)
+# --------------------------------------------------------------------------
+
+
+async def _collect(response) -> bytes:
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+    return b"".join(chunks)
+
+
+def _csv_rows(text: str):
+    """(header, data rows, trailer) of one streamed CSV export — the
+    trailer comment line is part of the file, not one of its rows."""
+    lines = text.strip().splitlines()
+    header = next(csv.reader([lines[0]]))
+    return header, list(csv.reader(lines[1:-1])), lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_users_export_requires_platform_wide_admin():
+    """Same gate as the list: the file is the cross-tenant table, so a
+    plain user and an Org-pinned admin are both refused outright."""
+    for caller, ctx in (
+        (_principal(7, name="plain"), _ctx(10)),
+        (_principal(9, name="admin", is_admin=True), _ctx(10)),
+        (_principal(7, name="plain"), _ctx(None)),
+    ):
+        with pytest.raises(ForbiddenException):
+            await rate_limits.export_user_rate_limits(
+                session=FakeSession(),
+                user=caller,
+                ctx=ctx,
+                request=_request(_redis_cfg()),
+                body=rate_limits.UserRateLimitsExportRequest(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_users_export_is_the_table_plus_the_tooltip(frozen_now, monkeypatch):
+    """The file serves the table's rows in the served order and expands
+    the name column into the user fields the tooltip hides — Full Name /
+    Business Unit / Department / Profession — and each axis into its cap
+    and its live counter."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", display_name="Alpha One", monthly=100),
+        _principal(2, name="beta", monthly=200),
+    ]
+    _seed_table(
+        monkeypatch,
+        principals,
+        monthly_used={2: 30},
+        labels={
+            1: {
+                "business_unit": "BU One",
+                "department": "Dep One",
+                "profession": "Prof One",
+            }
+        },
+    )
+    admin = _principal(9, name="admin", is_admin=True)
+
+    response = await rate_limits.export_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        body=rate_limits.UserRateLimitsExportRequest(format="csv"),
+    )
+    header, data, _trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+
+    assert response.media_type.startswith("text/csv")
+    assert header == [
+        "User ID",
+        "User",
+        "Full Name",
+        "Business Unit",
+        "Department",
+        "Profession",
+        "RPM Limit",
+        "RPM Used",
+        "TPM Limit",
+        "TPM Used",
+        "Weekly Token Limit",
+        "Weekly Tokens Used",
+        "Monthly Token Limit",
+        "Monthly Tokens Used",
+    ]
+    # Busiest monthly burn first: beta (used=30) leads the idle alpha.
+    assert [row[1] for row in data] == ["beta", "alpha"]
+    by_name = {row[1]: dict(zip(header, row)) for row in data}
+    beta = by_name["beta"]
+    assert beta["User ID"] == "2"
+    assert beta["Full Name"] == ""
+    assert beta["Monthly Token Limit"] == "200"
+    assert beta["Monthly Tokens Used"] == "30"
+    alpha = by_name["alpha"]
+    assert alpha["Full Name"] == "Alpha One"
+    assert alpha["Business Unit"] == "BU One"
+    assert alpha["Department"] == "Dep One"
+    assert alpha["Profession"] == "Prof One"
+    assert alpha["Monthly Token Limit"] == "100"
+    assert alpha["Monthly Tokens Used"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_users_export_follows_the_requested_sort(frozen_now, monkeypatch):
+    """The export sorts the way the table does — the same ``sort_by``
+    token, the same composite key — so a file is the page without the
+    slicing."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(3, name="gamma", monthly=200),
+        _principal(4, name="delta", monthly=50),
+    ]
+    _seed_table(monkeypatch, principals, monthly_used={4: 30})
+    admin = _principal(9, name="admin", is_admin=True)
+
+    async def _export(**fields):
+        response = await rate_limits.export_user_rate_limits(
+            session=FakeSession(),
+            user=admin,
+            ctx=_ctx(None),
+            request=_request(cfg),
+            body=rate_limits.UserRateLimitsExportRequest(format="csv", **fields),
+        )
+        _header, data, _trailer = _csv_rows(
+            (await _collect(response)).decode("utf-8-sig")
+        )
+        return [row[1] for row in data]
+
+    # The username column sorts alphabetically.
+    assert await _export(sort_by="username") == ["alpha", "delta", "gamma"]
+    # No sort token = the table's landing order (busiest monthly burn).
+    assert await _export() == ["delta", "gamma", "alpha"]
+
+
+@pytest.mark.asyncio
+async def test_users_export_disabled_mode_is_an_empty_table():
+    """The limiter being off leaves the export an empty file — the same
+    empty-page answer the list gives, not an error."""
+    response = await rate_limits.export_user_rate_limits(
+        session=FakeSession(),
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        request=_request(SimpleNamespace(gateway_rate_limit=None)),
+        body=rate_limits.UserRateLimitsExportRequest(format="csv"),
+    )
+    _header, data, trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+    assert data == []  # header only
+    assert trailer.startswith("# rows=0 ")
+
+
+@pytest.mark.asyncio
+async def test_users_export_estimate_skips_the_counter_read(frozen_now, monkeypatch):
+    """The size of the users export is the active-principal count — every
+    principal is one row whatever the sort — so the preflight must not pay
+    for the Redis read the file itself needs."""
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(2, name="beta", monthly=200),
+        _principal(3, name="gamma", monthly=50),
+    ]
+    _seed_table(monkeypatch, principals)
+
+    def _boom(cfg):
+        raise AssertionError("the estimate must not construct a reader")
+
+    monkeypatch.setattr(rate_limits, "_reader_factory", _boom)
+    result = await rate_limits.estimate_user_rate_limits_export(
+        session=FakeSession(),
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.UserRateLimitsExportRequest(),
+    )
+    assert result.total == 3
+    assert result.sheets[0].total == 3
+    assert result.exceeds_hard_limit is False
+    assert [column.key for column in result.sheets[0].columns] == (
+        rate_limits.rate_limit_users_export_column_keys()
+    )
+
+
+@pytest.mark.asyncio
+async def test_resets_export_requires_platform_wide_admin():
+    """Same gate as the list: audit rows are cross-tenant by construction."""
+    for caller, ctx in (
+        (_principal(7, name="plain"), _ctx(10)),
+        (_principal(9, name="admin", is_admin=True), _ctx(10)),
+        (_principal(7, name="plain"), _ctx(None)),
+    ):
+        with pytest.raises(ForbiddenException):
+            await rate_limits.export_rate_limit_resets(
+                session=FakeSession(),
+                user=caller,
+                ctx=ctx,
+                body=rate_limits.RateLimitResetsExportRequest(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_resets_export_is_the_table_plus_the_tooltip(monkeypatch):
+    """The file serves the list's rows newest-first and expands the name
+    column into the user fields; a deleted owner's row keeps its audit
+    fields with the names and labels left empty."""
+    session = FakeSession(
+        resets=[
+            _reset(
+                7,
+                "weekly",
+                FIXED_NOW - timedelta(days=3),
+                id=1,
+                description="migration",
+            ),
+            _reset(
+                8,
+                "monthly",
+                FIXED_NOW - timedelta(days=1),
+                id=2,
+                outcome="rejected",
+                description="for work",
+                work_type="Unknown",
+                rejection_reason="TooVague",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        rate_limits,
+        "_reset_user_names",
+        _fake_names({7: ("olga", "Olga Ivanova"), 9: ("ghost", "Gone")}),
+    )
+    monkeypatch.setattr(
+        rate_limits,
+        "bulk_user_attribute_labels",
+        _fake_labels({7: {"business_unit": "BU 7", "profession": "Prof 7"}}),
+    )
+
+    response = await rate_limits.export_rate_limit_resets(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.RateLimitResetsExportRequest(format="csv"),
+    )
+    header, data, trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+
+    assert header == [
+        "User ID",
+        "User",
+        "Full Name",
+        "Business Unit",
+        "Department",
+        "Profession",
+        "Reset At",
+        "Limit Kind",
+        "Outcome",
+        "Work Type",
+        "Rejection Reason",
+        "Description",
+    ]
+    # Newest press first.
+    assert [row[0] for row in data] == ["8", "7"]
+    by_id = {row[0]: dict(zip(header, row)) for row in data}
+    rejected = by_id["8"]
+    # Owner 8 is absent from the name mapping: the audit fields survive,
+    # the name and label cells stay empty.
+    assert rejected["User"] == ""
+    assert rejected["Full Name"] == ""
+    assert rejected["Outcome"] == "rejected"
+    assert rejected["Work Type"] == "Unknown"
+    assert rejected["Rejection Reason"] == "TooVague"
+    assert rejected["Description"] == "for work"
+    approved = by_id["7"]
+    assert approved["User"] == "olga"
+    assert approved["Full Name"] == "Olga Ivanova"
+    assert approved["Business Unit"] == "BU 7"
+    assert approved["Department"] == ""
+    assert approved["Limit Kind"] == "weekly"
+    assert approved["Outcome"] == "approved"
+    assert approved["Work Type"] == ""
+    assert trailer.startswith("# rows=2 scope=all organization=*")
+
+
+@pytest.mark.asyncio
+async def test_resets_export_applies_the_table_filters(monkeypatch):
+    """The file runs the list's predicate: user_id, outcome and work_type
+    narrow it exactly as they narrow the page."""
+    session = FakeSession(
+        resets=[
+            _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+            _reset(
+                8,
+                "monthly",
+                FIXED_NOW - timedelta(days=1),
+                id=2,
+                outcome="rejected",
+                description="for work",
+                work_type="Unknown",
+            ),
+            _reset(
+                8,
+                "weekly",
+                FIXED_NOW - timedelta(days=2),
+                id=3,
+                description="release",
+            ),
+        ]
+    )
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+
+    response = await rate_limits.export_rate_limit_resets(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.RateLimitResetsExportRequest(
+            format="csv", user_id=8, outcome="rejected", work_type="Unknown"
+        ),
+    )
+    _header, data, _trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+    # Exactly the one rejected Unknown press of user 8.
+    assert len(data) == 1
+    assert data[0][0] == "8"  # the User ID column, not the press's id
+    assert data[0][-1] == "for work"
+
+
+@pytest.mark.asyncio
+async def test_resets_export_rejects_unknown_outcome():
+    """The export validates the verdict filter against the same two
+    verdicts the list does."""
+    with pytest.raises(InvalidException):
+        await rate_limits.export_rate_limit_resets(
+            session=FakeSession(),
+            user=_principal(9, name="admin", is_admin=True),
+            ctx=_ctx(None),
+            body=rate_limits.RateLimitResetsExportRequest(outcome="pending"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resets_export_estimate_counts_the_filtered_rows(monkeypatch):
+    """The preflight sizes the same predicate the file will stream, and
+    its columns are the file's schema."""
+    session = FakeSession(
+        resets=[
+            _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+            _reset(
+                8,
+                "monthly",
+                FIXED_NOW - timedelta(days=1),
+                id=2,
+                outcome="rejected",
+                work_type="Unknown",
+            ),
+        ]
+    )
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+    result = await rate_limits.estimate_rate_limit_resets_export(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.RateLimitResetsExportRequest(outcome="rejected"),
+    )
+    assert result.total == 1
+    assert result.sheets[0].total == 1
+    assert result.exceeds_hard_limit is False
+    assert [column.key for column in result.sheets[0].columns] == (
+        rate_limits.rate_limit_resets_export_column_keys()
+    )

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlmodel import select
 
 from gpustack import envs
@@ -68,9 +68,27 @@ from gpustack.schemas.rate_limits import (
     UserRateLimits,
     UsersRateLimitsResponse,
 )
+from gpustack.schemas.usage import (
+    USAGE_SCOPE_ALL,
+    TableExportRequest,
+    UsageExportEstimateResponse,
+    UsageExportSheetEstimate,
+)
 from gpustack.schemas.users import User
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
 from gpustack.server.services import bulk_user_attribute_labels
+from gpustack.utils.export_delivery import (
+    ExportSheetPlan,
+    single_sheet_export_response,
+    trailer_context,
+)
+from gpustack.utils.export_limits import build_export_estimate, export_columns_payload
+from gpustack.utils.usage_export import (
+    list_export_columns,
+    list_export_row,
+    rate_limit_resets_export_column_keys,
+    rate_limit_users_export_column_keys,
+)
 
 router = APIRouter()
 
@@ -686,71 +704,44 @@ async def _active_user_principals(session, user_id: Optional[int]) -> List[Princ
     return list((await session.exec(stmt)).all())
 
 
-@router.get(
-    "/rate-limits/users",
-    response_model=UsersRateLimitsResponse,
-    response_model_exclude_none=True,
-)
-async def list_user_rate_limits(
-    session: SessionDep,
-    user: CurrentUserDep,
-    ctx: TenantContextDep,
+async def _user_limit_rows(
+    session,
     request: Request,
-    page: int = 1,
-    perPage: int = 10,
-    sort_by: Optional[str] = None,
-    user_id: Optional[int] = None,
-):
-    """The admin's cross-user limits table, one row per active user.
+    user_id: Optional[int],
+    sort_by: Optional[str],
+) -> Tuple[
+    List[Tuple[Principal, List[RateLimitWindowUsage]]],
+    str,
+    datetime,
+    Optional[str],
+]:
+    """Every cross-user table row — principal plus its windows — sorted.
 
-    Platform-wide admins only (``is_platform_wide`` — the gate the
-    single-user expansion applies): the rows carry every account's
-    effective limits and live counters, cross-Org data by construction.
-
-    Answers ``page`` / ``perPage`` / ``sort_by`` like the other list
-    endpoints, plus the UI picker's ``user_id`` filter. Usage columns
-    sort on the live counter first; the limit breaks ties between equal
-    counters, so idle rows order by quota size. ``username`` sorts
-    alphabetically. Sorting must see every
-    row's counter, so counters are read for the whole filtered set in
-    one batched Redis pipeline and the page is sliced in memory; the
-    attribute hydration runs for the returned rows only.
+    The shared body of the users list endpoint and its export: one filter,
+    one counter read, one sort, so a file and the page it was clicked on
+    cannot disagree about the rows or their order. Sorting must see every
+    row's counter, so counters are read for the whole filtered set in one
+    batched Redis pipeline; the export consumes all of the rows, the list
+    slices a page off them.
 
     Args:
         session: async DB session.
-        user: the authenticated caller.
-        ctx: the request's tenant context; gates the endpoint entirely.
         request: the FastAPI request; the server config lives on app.state.
-        page: 1-based page number (clamped to >= 1).
-        perPage: rows per page, clamped to 1..200.
+        user_id: restrict the rows to one user (the picker filter).
         sort_by: one column token, ``-`` prefix for descending; empty =
             the default (busiest monthly budget first).
-        user_id: restrict the table to one user (the picker filter).
 
     Returns:
-        UsersRateLimitsResponse: the page of rows with limits and live
-        counters in redis mode, limits without counters in local mode,
-        and an empty page when rate limiting is disabled.
+        (rows, mode, now, usage_error): the sorted (principal, windows)
+        pairs, the limiter mode they were read under, the shared instant
+        every counter describes, and the counter-read failure if there was
+        one. Mode ``disabled`` answers no rows — there is nothing to read.
     """
-    if not is_platform_wide(user, ctx):
-        raise ForbiddenException(
-            message="Only platform-wide admins may list user rate limits"
-        )
-    # Plain scalar params arrive unvalidated from hand-rolled callers;
-    # clamp here so a bad page just answers an empty page.
-    page = max(1, page)
-    perPage = max(1, min(perPage, 200))
     cfg: Config = request.app.state.server_config
     mode = _mode(cfg.gateway_rate_limit)
     now = datetime.now(timezone.utc)
-
     if mode == "disabled":
-        return UsersRateLimitsResponse(
-            items=[],
-            pagination=Pagination(page=page, perPage=perPage, total=0, totalPage=0),
-            mode=mode,
-            generated_at=now,
-        )
+        return [], mode, now, None
 
     field, descending = _user_table_sort_token(sort_by)
     principals = await _active_user_principals(session, user_id)
@@ -809,6 +800,73 @@ async def list_user_rate_limits(
             key=lambda row: _user_table_value(field, row[1]),
             reverse=descending,
         )
+    return rows, mode, now, usage_error
+
+
+@router.get(
+    "/rate-limits/users",
+    response_model=UsersRateLimitsResponse,
+    response_model_exclude_none=True,
+)
+async def list_user_rate_limits(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: Request,
+    page: int = 1,
+    perPage: int = 10,
+    sort_by: Optional[str] = None,
+    user_id: Optional[int] = None,
+):
+    """The admin's cross-user limits table, one row per active user.
+
+    Platform-wide admins only (``is_platform_wide`` — the gate the
+    single-user expansion applies): the rows carry every account's
+    effective limits and live counters, cross-Org data by construction.
+
+    Answers ``page`` / ``perPage`` / ``sort_by`` like the other list
+    endpoints, plus the UI picker's ``user_id`` filter. Usage columns
+    sort on the live counter first; the limit breaks ties between equal
+    counters, so idle rows order by quota size. ``username`` sorts
+    alphabetically. Sorting must see every
+    row's counter, so counters are read for the whole filtered set in
+    one batched Redis pipeline and the page is sliced in memory; the
+    attribute hydration runs for the returned rows only.
+
+    Args:
+        session: async DB session.
+        user: the authenticated caller.
+        ctx: the request's tenant context; gates the endpoint entirely.
+        request: the FastAPI request; the server config lives on app.state.
+        page: 1-based page number (clamped to >= 1).
+        perPage: rows per page, clamped to 1..200.
+        sort_by: one column token, ``-`` prefix for descending; empty =
+            the default (busiest monthly budget first).
+        user_id: restrict the table to one user (the picker filter).
+
+    Returns:
+        UsersRateLimitsResponse: the page of rows with limits and live
+        counters in redis mode, limits without counters in local mode,
+        and an empty page when rate limiting is disabled.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may list user rate limits"
+        )
+    # Plain scalar params arrive unvalidated from hand-rolled callers;
+    # clamp here so a bad page just answers an empty page.
+    page = max(1, page)
+    perPage = max(1, min(perPage, 200))
+    rows, mode, now, usage_error = await _user_limit_rows(
+        session, request, user_id, sort_by
+    )
+    if mode == "disabled":
+        return UsersRateLimitsResponse(
+            items=[],
+            pagination=Pagination(page=page, perPage=perPage, total=0, totalPage=0),
+            mode=mode,
+            generated_at=now,
+        )
 
     total = len(rows)
     start = (page - 1) * perPage
@@ -861,6 +919,35 @@ async def _reset_user_names(
     stmt = select(Principal).where(Principal.id.in_(ids))
     principals = (await session.exec(stmt)).all()
     return {p.id: (p.name, p.display_name) for p in principals}
+
+
+def _validate_resets_outcome(outcome: Optional[str]) -> None:
+    """The verdict filter's vocabulary, shared by the list and its export."""
+    if outcome is not None and outcome not in (
+        RESET_OUTCOME_APPROVED,
+        RESET_OUTCOME_REJECTED,
+    ):
+        raise InvalidException(
+            message="outcome must be one of "
+            f"{sorted((RESET_OUTCOME_APPROVED, RESET_OUTCOME_REJECTED))}"
+        )
+
+
+def _resets_statement(
+    user_id: Optional[int],
+    outcome: Optional[str],
+    work_type: Optional[str],
+):
+    """The resets table's query — the shared predicate of the list and its
+    export, so a file and the page it was clicked on agree row for row."""
+    stmt = select(GatewayRateLimitReset)
+    if user_id is not None:
+        stmt = stmt.where(GatewayRateLimitReset.user_id == user_id)
+    if outcome is not None:
+        stmt = stmt.where(GatewayRateLimitReset.outcome == outcome)
+    if work_type is not None:
+        stmt = stmt.where(GatewayRateLimitReset.work_type == work_type)
+    return stmt
 
 
 @router.get(
@@ -916,23 +1003,11 @@ async def list_rate_limit_resets(
     # clamp here so a bad page just answers an empty page.
     page = max(1, page)
     perPage = max(1, min(perPage, 200))
-    if outcome is not None and outcome not in (
-        RESET_OUTCOME_APPROVED,
-        RESET_OUTCOME_REJECTED,
-    ):
-        raise InvalidException(
-            message="outcome must be one of "
-            f"{sorted((RESET_OUTCOME_APPROVED, RESET_OUTCOME_REJECTED))}"
-        )
+    _validate_resets_outcome(outcome)
 
-    stmt = select(GatewayRateLimitReset)
-    if user_id is not None:
-        stmt = stmt.where(GatewayRateLimitReset.user_id == user_id)
-    if outcome is not None:
-        stmt = stmt.where(GatewayRateLimitReset.outcome == outcome)
-    if work_type is not None:
-        stmt = stmt.where(GatewayRateLimitReset.work_type == work_type)
-    rows = list((await session.exec(stmt)).all())
+    rows = list(
+        (await session.exec(_resets_statement(user_id, outcome, work_type))).all()
+    )
     # Newest press first; the id breaks ties so a same-second pair keeps
     # its insertion order under the reverse sort.
     rows.sort(key=lambda row: (row.reset_at, row.id or 0), reverse=True)
@@ -975,6 +1050,257 @@ async def list_rate_limit_resets(
             totalPage=ceil(total / perPage) if total else 0,
         ),
     )
+
+
+class UserRateLimitsExportRequest(TableExportRequest):
+    """``/rate-limits/users/export`` payload.
+
+    The users table's filters — the picker's ``user_id`` and the ``sort_by``
+    the column arrows set — plus the shared file-shape knobs. There is no
+    date range to narrow: the table is one row per active user, not a
+    period query.
+    """
+
+    user_id: Optional[int] = None
+    sort_by: Optional[str] = None
+
+
+class RateLimitResetsExportRequest(TableExportRequest):
+    """``/rate-limits/resets/export`` payload: the table's filters plus the
+    shared file-shape knobs."""
+
+    user_id: Optional[int] = None
+    outcome: Optional[str] = None
+    work_type: Optional[str] = None
+
+
+def _limit_axis_cells(
+    windows: List[RateLimitWindowUsage], axis: str
+) -> Tuple[Optional[int], Optional[int]]:
+    """(limit, used) for one table axis, or (None, None) without a window.
+
+    The same (kind, period) identities the table's sort reads — a user with
+    no effective limit on an axis has no window there, and both cells stay
+    empty in the file where the UI renders a dash.
+    """
+    kind, period = _USER_TABLE_WINDOWS[axis]
+    for window in windows:
+        if window.kind == kind and window.period == period:
+            return window.limit, window.used
+    return None, None
+
+
+def _user_limit_export_item(
+    principal: Principal,
+    windows: List[RateLimitWindowUsage],
+    labels: Dict[int, Dict[str, str]],
+) -> Dict[str, Any]:
+    """One export row for the limits table, keyed by the column schema."""
+    item: Dict[str, Any] = {
+        "user_id": principal.id,
+        "user_name": principal.name,
+        "full_name": principal.display_name,
+        "business_unit": labels.get(principal.id, {}).get("business_unit"),
+        "department": labels.get(principal.id, {}).get("department"),
+        "profession": labels.get(principal.id, {}).get("profession"),
+    }
+    for axis in _USER_TABLE_WINDOWS:
+        limit, used = _limit_axis_cells(windows, axis)
+        item[f"{axis}_limit"] = limit
+        item[f"{axis}_used"] = used
+    return item
+
+
+def _resets_export_item(
+    row: GatewayRateLimitReset,
+    names: Dict[int, Tuple[Optional[str], Optional[str]]],
+    labels: Dict[int, Dict[str, str]],
+) -> Dict[str, Any]:
+    """One export row for the resets table, keyed by the column schema."""
+    login, full_name = names.get(row.user_id, (None, None))
+    attrs = labels.get(row.user_id, {})
+    return {
+        "user_id": row.user_id,
+        "user_name": login,
+        "full_name": full_name,
+        "business_unit": attrs.get("business_unit"),
+        "department": attrs.get("department"),
+        "profession": attrs.get("profession"),
+        "reset_at": row.reset_at,
+        "limit_kind": row.kind,
+        "outcome": row.outcome,
+        "work_type": row.work_type,
+        "rejection_reason": row.rejection_reason,
+        "description": row.description,
+    }
+
+
+@router.post("/rate-limits/users/export")
+async def export_user_rate_limits(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: Request,
+    body: UserRateLimitsExportRequest,
+):
+    """The cross-user limits table as a file — the same rows in the same
+    order the list serves, with the tooltip's user fields spelled out as
+    columns (Full Name / Business Unit / Department / Profession).
+
+    Platform-wide admins only, like the list. The row limit and its split
+    remedy are the shared export ones; a disabled limiter answers an empty
+    table the way the list answers an empty page.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may export user rate limits"
+        )
+    rows, _, _, _ = await _user_limit_rows(session, request, body.user_id, body.sort_by)
+    keys = rate_limit_users_export_column_keys()
+    # The file has no pages, so the tooltip's labels hydrate for every row.
+    labels = await bulk_user_attribute_labels(session, [p.id for p, _ in rows])
+
+    async def row_stream():
+        for principal, windows in rows:
+            yield list_export_row(
+                _user_limit_export_item(principal, windows, labels), keys
+            )
+
+    plan = ExportSheetPlan(
+        key="users",
+        name=None,
+        columns=list_export_columns(keys),
+        total=len(rows),
+        rows=lambda: row_stream(),
+    )
+    return await single_sheet_export_response(
+        plan,
+        request=body,
+        prefix="rate-limit-users",
+        context=trailer_context(
+            USAGE_SCOPE_ALL, getattr(ctx, "current_principal_id", None)
+        ),
+    )
+
+
+@router.post(
+    "/rate-limits/users/export/estimate",
+    response_model=UsageExportEstimateResponse,
+)
+async def estimate_user_rate_limits_export(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    body: UserRateLimitsExportRequest,
+):
+    """Size the users export before the click — the shared preflight.
+
+    The row count is the active-principal count: every principal is one row
+    whatever the sort, so the sizing skips the counter read the export
+    itself needs.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may export user rate limits"
+        )
+    principals = await _active_user_principals(session, body.user_id)
+    total = len(principals)
+    keys = rate_limit_users_export_column_keys()
+    estimate = UsageExportSheetEstimate(
+        key="users",
+        name=None,
+        total=total,
+        available=True,
+        columns=export_columns_payload(keys, list_export_columns(keys)),
+    )
+    return build_export_estimate(body, [estimate], total)
+
+
+@router.post("/rate-limits/resets/export")
+async def export_rate_limit_resets(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    body: RateLimitResetsExportRequest,
+):
+    """The resets audit table as a file — the same rows the list serves
+    (newest press first, the id breaking same-second ties), with the
+    tooltip's user fields spelled out as columns.
+
+    Platform-wide admins only, like the list; the ``outcome`` filter
+    validates against the same two verdicts.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may export rate-limit resets"
+        )
+    _validate_resets_outcome(body.outcome)
+    rows = list(
+        (
+            await session.exec(
+                _resets_statement(body.user_id, body.outcome, body.work_type)
+            )
+        ).all()
+    )
+    rows.sort(key=lambda row: (row.reset_at, row.id or 0), reverse=True)
+
+    names = await _reset_user_names(session, [row.user_id for row in rows])
+    labels = await bulk_user_attribute_labels(
+        session, list({row.user_id for row in rows})
+    )
+    keys = rate_limit_resets_export_column_keys()
+
+    async def row_stream():
+        for row in rows:
+            yield list_export_row(_resets_export_item(row, names, labels), keys)
+
+    plan = ExportSheetPlan(
+        key="resets",
+        name=None,
+        columns=list_export_columns(keys),
+        total=len(rows),
+        rows=lambda: row_stream(),
+    )
+    return await single_sheet_export_response(
+        plan,
+        request=body,
+        prefix="rate-limit-resets",
+        context=trailer_context(
+            USAGE_SCOPE_ALL, getattr(ctx, "current_principal_id", None)
+        ),
+    )
+
+
+@router.post(
+    "/rate-limits/resets/export/estimate",
+    response_model=UsageExportEstimateResponse,
+)
+async def estimate_rate_limit_resets_export(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    body: RateLimitResetsExportRequest,
+):
+    """Size the resets export before the click — the shared preflight."""
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may export rate-limit resets"
+        )
+    _validate_resets_outcome(body.outcome)
+    stmt = _resets_statement(body.user_id, body.outcome, body.work_type)
+    total = int(
+        (await session.exec(select(func.count()).select_from(stmt.subquery()))).first()
+        or 0
+    )
+    keys = rate_limit_resets_export_column_keys()
+    estimate = UsageExportSheetEstimate(
+        key="resets",
+        name=None,
+        total=total,
+        available=True,
+        columns=export_columns_payload(keys, list_export_columns(keys)),
+    )
+    return build_export_estimate(body, [estimate], total)
 
 
 @router.post("/rate-limits/reset", response_model=RateLimitResetStatus)
