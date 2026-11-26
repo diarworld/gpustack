@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from gpustack.schemas.common import Pagination
+
 
 class RateLimitWindowUsage(BaseModel):
     """One enforced window: which counter it tracks and where it stands.
@@ -117,6 +119,45 @@ class UserRateLimits(BaseModel):
     # ``monthly``), only in redis mode -- in local mode there are no
     # counters a reset could clear.
     resets: Optional[Dict[str, RateLimitResetStatus]] = None
+
+
+class UserRateLimitUsage(BaseModel):
+    """One user's row in the admin's cross-user limits table.
+
+    Served by ``GET /usage/rate-limits/users``: the effective limits (the
+    same resolution the single-user endpoint and the reconciler apply,
+    groups and deployment defaults included) paired with the live window
+    counters, plus the identity fields the table's name tooltip renders.
+    """
+
+    user_id: int
+    username: str
+    # The human-readable name (``Principal.display_name``); ``None`` when
+    # the account carries none and the login is all there is.
+    full_name: Optional[str] = None
+    is_admin: bool = False
+    # Attribute-derived labels for the tooltip, resolved the same way the
+    # users list resolves them; ``None`` = the user holds no group of
+    # that kind.
+    profession: Optional[str] = None
+    department: Optional[str] = None
+    business_unit: Optional[str] = None
+    # The user limit combo verbatim: requests and tokens per minute, the
+    # weekly rolling budget and the monthly calendar quota. An axis the
+    # user has no effective limit for simply has no window here.
+    windows: List[RateLimitWindowUsage] = Field(default_factory=list)
+
+
+class UsersRateLimitsResponse(BaseModel):
+    """One page of the admin's cross-user limits table."""
+
+    items: List[UserRateLimitUsage] = Field(default_factory=list)
+    pagination: Pagination
+    # Counter backend, ``generated_at`` and ``usage_error`` carry the same
+    # semantics as :class:`RateLimitsResponse`.
+    mode: str
+    generated_at: datetime
+    usage_error: Optional[str] = None
 
 
 class RateLimitResetCreate(BaseModel):

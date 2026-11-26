@@ -15,7 +15,8 @@ as an audit-only row.
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from math import ceil
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
@@ -25,6 +26,7 @@ from sqlmodel import select
 from gpustack import envs
 from gpustack.api.exceptions import (
     BadRequestException,
+    ForbiddenException,
     InvalidException,
     NotFoundException,
 )
@@ -45,12 +47,14 @@ from gpustack.gateway.rate_limit_usage import (
     user_limit_windows,
 )
 from gpustack.gateway.rate_limit_settings import effective_rate_limit
+from gpustack.schemas.common import Pagination
 from gpustack.schemas.gateway_rate_limit_resets import (
     RESET_OUTCOME_APPROVED,
     RESET_OUTCOME_REJECTED,
     GatewayRateLimitReset,
 )
 from gpustack.schemas.model_routes import MyModel
+from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.schemas.rate_limits import (
     FreeWindowUsage,
     ModelConcurrencyUsage,
@@ -58,10 +62,13 @@ from gpustack.schemas.rate_limits import (
     RateLimitResetStatus,
     RateLimitWindowUsage,
     RateLimitsResponse,
+    UserRateLimitUsage,
     UserRateLimits,
+    UsersRateLimitsResponse,
 )
 from gpustack.schemas.users import User
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
+from gpustack.server.services import bulk_user_attribute_labels
 
 router = APIRouter()
 
@@ -605,6 +612,228 @@ async def get_rate_limits(
             model_concurrency=model_usage,
             resets=resets,
         ),
+    )
+
+
+# The cross-user table's usage columns, mapped to the window each one
+# reads off a row (kind, period) — the same identities the single-user
+# endpoint emits. A user with no effective limit for an axis has no
+# window there, and the column sorts them as zero.
+_USER_TABLE_WINDOWS = {
+    "rpm": ("query", "60s"),
+    "tpm": ("token_rolling", "60s"),
+    "weekly": ("token_rolling", "604800s"),
+    "monthly": ("token_calendar", "each_month"),
+}
+# The table's landing order: the busiest monthly budget first (a user
+# burning their quota is the row an admin is looking for), ties and the
+# name column alphabetically.
+_USER_TABLE_DEFAULT_SORT = "-monthly"
+_USER_TABLE_SORTABLE = ("username",) + tuple(_USER_TABLE_WINDOWS)
+
+
+def _user_table_sort_token(sort_by: Optional[str]) -> Tuple[str, bool]:
+    """The validated (field, descending) pair the table sorts on.
+
+    One click is one column, so a multi-key string is refused rather than
+    silently truncated; an empty value falls back to the default order.
+    """
+    token = (sort_by or "").strip() or _USER_TABLE_DEFAULT_SORT
+    descending = token.startswith("-")
+    field = token[1:] if descending else token
+    if field not in _USER_TABLE_SORTABLE:
+        raise InvalidException(
+            message=f"sort_by must be one of {sorted(_USER_TABLE_SORTABLE)}"
+        )
+    return field, descending
+
+
+def _user_table_value(field: str, windows: List[RateLimitWindowUsage]) -> int:
+    """One row's sort value for a usage column.
+
+    The live counter while it is non-zero, the limit once the user idles
+    (the "0 reads as limit" rule the column hints document), 0 for an
+    axis with no window at all. A ``None`` count — local mode, or a
+    failed Redis read — reads as idle: the cap is real, only the counter
+    is missing.
+    """
+    kind, period = _USER_TABLE_WINDOWS[field]
+    for window in windows:
+        if window.kind == kind and window.period == period:
+            return window.used if window.used else window.limit
+    return 0
+
+
+async def _active_user_principals(session, user_id: Optional[int]) -> List[Principal]:
+    """The active USER principals behind the table's rows.
+
+    Module-level indirection like ``_reader_factory``: tests call the
+    handler directly against session fakes, and standing this query in
+    keeps those fakes free of SQLModel row-selection logic.
+    """
+    stmt = select(Principal).where(
+        Principal.kind == PrincipalType.USER,
+        Principal.is_active.is_(True),
+    )
+    if user_id is not None:
+        stmt = stmt.where(Principal.id == user_id)
+    return list((await session.exec(stmt)).all())
+
+
+@router.get(
+    "/rate-limits/users",
+    response_model=UsersRateLimitsResponse,
+    response_model_exclude_none=True,
+)
+async def list_user_rate_limits(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    request: Request,
+    page: int = 1,
+    perPage: int = 10,
+    sort_by: Optional[str] = None,
+    user_id: Optional[int] = None,
+):
+    """The admin's cross-user limits table, one row per active user.
+
+    Platform-wide admins only (``is_platform_wide`` — the gate the
+    single-user expansion applies): the rows carry every account's
+    effective limits and live counters, cross-Org data by construction.
+
+    Answers ``page`` / ``perPage`` / ``sort_by`` like the other list
+    endpoints, plus the UI picker's ``user_id`` filter. Usage columns
+    sort on the live counter and fall back to the limit when a user
+    idles; ``username`` sorts alphabetically. Sorting must see every
+    row's counter, so counters are read for the whole filtered set in
+    one batched Redis pipeline and the page is sliced in memory; the
+    attribute hydration runs for the returned rows only.
+
+    Args:
+        session: async DB session.
+        user: the authenticated caller.
+        ctx: the request's tenant context; gates the endpoint entirely.
+        request: the FastAPI request; the server config lives on app.state.
+        page: 1-based page number (clamped to >= 1).
+        perPage: rows per page, clamped to 1..200.
+        sort_by: one column token, ``-`` prefix for descending; empty =
+            the default (busiest monthly budget first).
+        user_id: restrict the table to one user (the picker filter).
+
+    Returns:
+        UsersRateLimitsResponse: the page of rows with limits and live
+        counters in redis mode, limits without counters in local mode,
+        and an empty page when rate limiting is disabled.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may list user rate limits"
+        )
+    # Plain scalar params arrive unvalidated from hand-rolled callers;
+    # clamp here so a bad page just answers an empty page.
+    page = max(1, page)
+    perPage = max(1, min(perPage, 200))
+    cfg: Config = request.app.state.server_config
+    mode = _mode(cfg.gateway_rate_limit)
+    now = datetime.now(timezone.utc)
+
+    if mode == "disabled":
+        return UsersRateLimitsResponse(
+            items=[],
+            pagination=Pagination(page=page, perPage=perPage, total=0, totalPage=0),
+            mode=mode,
+            generated_at=now,
+        )
+
+    field, descending = _user_table_sort_token(sort_by)
+    principals = await _active_user_principals(session, user_id)
+    rlc, _ = await effective_rate_limit(session, cfg)
+    group_snapshots = await load_group_limit_snapshots(
+        session, [p.id for p in principals]
+    )
+
+    per_user_specs: List[List[RateLimitWindowSpec]] = []
+    all_specs: List[RateLimitWindowSpec] = []
+    for principal in principals:
+        view = effective_limits_view(
+            principal,
+            group_snapshots.get(principal.id, []),
+            rlc,
+        )
+        specs = user_limit_windows(rlc, principal.id, view)
+        per_user_specs.append(specs)
+        all_specs.extend(specs)
+
+    states: List[Optional[RateLimitWindowState]]
+    usage_error = None
+    if mode == "redis" and all_specs:
+        reader = _reader(request, cfg)
+        states, usage_error = await read_windows(
+            reader, all_specs, now=now, timezone_name=rlc.timezone
+        )
+    else:
+        # Local mode keeps no counters, and an empty selection has
+        # nothing to read: windows render with limits only.
+        states = [None] * len(all_specs)
+
+    # Regroup the flat read onto its owner. Keyed by id(): the specs are
+    # plain dataclasses, so two windows of the same shape compare equal
+    # and a value-keyed dict would collapse distinct windows onto one
+    # read; identity keys cannot collide (the single-user endpoint's
+    # trick, reused so the two cannot drift).
+    state_by_spec = {id(spec): state for spec, state in zip(all_specs, states)}
+    rows = [
+        (
+            principal,
+            [_window_usage(spec, state_by_spec[id(spec)]) for spec in user_specs],
+        )
+        for principal, user_specs in zip(principals, per_user_specs)
+    ]
+
+    # Stable two-pass sort: username ascending as the tiebreak, then the
+    # requested column — reversing only the second pass keeps the
+    # tiebreak ascending under a descending column.
+    rows.sort(key=lambda row: (row[0].name or "").lower())
+    if field == "username":
+        if descending:
+            rows.reverse()
+    else:
+        rows.sort(
+            key=lambda row: _user_table_value(field, row[1]),
+            reverse=descending,
+        )
+
+    total = len(rows)
+    start = (page - 1) * perPage
+    page_rows = rows[start : start + perPage]
+
+    # Tooltip labels are page-scoped: they only render for rows the
+    # admin sees on this page.
+    labels = await bulk_user_attribute_labels(session, [p.id for p, _ in page_rows])
+    items = [
+        UserRateLimitUsage(
+            user_id=principal.id,
+            username=principal.name,
+            full_name=principal.display_name,
+            is_admin=bool(principal.is_admin),
+            profession=labels.get(principal.id, {}).get("profession"),
+            department=labels.get(principal.id, {}).get("department"),
+            business_unit=labels.get(principal.id, {}).get("business_unit"),
+            windows=windows,
+        )
+        for principal, windows in page_rows
+    ]
+    return UsersRateLimitsResponse(
+        items=items,
+        pagination=Pagination(
+            page=page,
+            perPage=perPage,
+            total=total,
+            totalPage=ceil(total / perPage) if total else 0,
+        ),
+        mode=mode,
+        generated_at=now,
+        usage_error=usage_error,
     )
 
 

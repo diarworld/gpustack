@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfoNotFoundError
 
 from gpustack.api.exceptions import (
     BadRequestException,
+    ForbiddenException,
     InvalidException,
     NotFoundException,
 )
@@ -1384,3 +1385,319 @@ class TestFreeWindowBadge:
         assert response.free.days == ["sat", "sun"]
         # The user windows still inherit the config-file defaults.
         assert response.user.concurrency_default == 1
+
+
+# --- The admin's cross-user table (GET /usage/rate-limits/users) ----------
+
+
+def _principal(
+    id,
+    *,
+    name=None,
+    display_name=None,
+    is_admin=False,
+    **limits,
+) -> User:
+    """A USER principal for the table: the shared ``_user`` shape plus the
+    tooltip fields the table hydrates."""
+    row = _user(id, is_admin=is_admin, **limits)
+    if name is not None:
+        row.name = name
+    row.display_name = display_name
+    return row
+
+
+def _seed_table(monkeypatch, principals, monthly_used=None, labels=None):
+    """Stand the table's collaborators in: the user query, the group
+    loader, the Redis reader (per-user monthly counters) and the label
+    hydration."""
+    monthly_used = monthly_used or {}
+    plugin = rate_limit_plugin_name
+
+    async def _users(session, user_id=None):
+        return [p for p in principals if user_id is None or p.id == user_id]
+
+    async def _groups(session, user_ids):
+        return {}
+
+    async def _labels_fn(session, ids):
+        return labels or {}
+
+    states = {
+        f"{plugin}|user-{p.id}|consumer=gpustack-{p.id}|t:each_month": RateLimitWindowState(
+            used=monthly_used.get(p.id, 0), reset_seconds=10
+        )
+        for p in principals
+    }
+    monkeypatch.setattr(rate_limits, "_active_user_principals", _users)
+    monkeypatch.setattr(rate_limits, "load_group_limit_snapshots", _groups)
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _labels_fn)
+    monkeypatch.setattr(
+        rate_limits, "_reader_factory", lambda cfg: FakeReader(states=states)
+    )
+
+
+def _monthly_window(row):
+    return next(w for w in row.windows if w.period == "each_month")
+
+
+@pytest.mark.asyncio
+async def test_user_table_requires_platform_wide_admin(frozen_now):
+    """The table is a cross-tenant view: a plain user and an Org-pinned
+    admin are both refused outright, no data degrades to self."""
+    cfg = _redis_cfg()
+    admin = _principal(1, name="admin", is_admin=True)
+    for caller, ctx in (
+        (_principal(7, name="plain"), _ctx(10)),
+        (admin, _ctx(10)),  # admin pinned to an Org
+        (_principal(7, name="plain"), _ctx(None)),
+    ):
+        with pytest.raises(ForbiddenException):
+            await rate_limits.list_user_rate_limits(
+                session=FakeSession(),
+                user=caller,
+                ctx=ctx,
+                request=_request(cfg),
+            )
+
+
+@pytest.mark.asyncio
+async def test_user_table_default_sort_prefers_active_then_limit(
+    frozen_now, monkeypatch
+):
+    """The composite usage key: a non-zero counter sorts on the counter,
+    a zero/missing one on the limit — so an idling user under a big
+    budget outranks an idling user under a small one, and ties break
+    alphabetically."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", display_name="Alpha", monthly=100),
+        _principal(2, name="beta", monthly=100),
+        _principal(3, name="gamma", monthly=200),
+        _principal(4, name="delta", monthly=50),
+    ]
+    # Only delta is burning the budget; the rest idle.
+    _seed_table(monkeypatch, principals, monthly_used={4: 30})
+    admin = _principal(9, name="admin", is_admin=True)
+
+    response = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+    )
+
+    # Default = -monthly: gamma (limit 200), then the 100-limit pair in
+    # name order, then delta whose counter (30) is its own key.
+    assert [row.user_id for row in response.items] == [3, 1, 2, 4]
+    assert response.pagination.total == 4
+    assert response.pagination.totalPage == 1
+    assert response.mode == "redis"
+    # The counter rides the row's monthly window; limits inherit the
+    # deployment default where the user sets none.
+    assert _monthly_window(response.items[0]).limit == 200
+    assert _monthly_window(response.items[0]).used == 0
+    assert _monthly_window(response.items[2]).limit == 100
+
+
+@pytest.mark.asyncio
+async def test_user_table_sort_directions_and_username(frozen_now, monkeypatch):
+    """Ascending usage flips the composite key, and the username column
+    sorts alphabetically either way."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(2, name="beta", monthly=100),
+        _principal(3, name="gamma", monthly=200),
+        _principal(4, name="delta", monthly=50),
+    ]
+    _seed_table(monkeypatch, principals, monthly_used={4: 30})
+    admin = _principal(9, name="admin", is_admin=True)
+
+    async def _call(**params):
+        return await rate_limits.list_user_rate_limits(
+            session=FakeSession(),
+            user=admin,
+            ctx=_ctx(None),
+            request=_request(cfg),
+            **params,
+        )
+
+    ascending = await _call(sort_by="monthly")
+    assert [row.user_id for row in ascending.items] == [4, 1, 2, 3]
+
+    by_name = await _call(sort_by="username")
+    assert [row.username for row in by_name.items] == [
+        "alpha",
+        "beta",
+        "delta",
+        "gamma",
+    ]
+
+    by_name_desc = await _call(sort_by="-username")
+    assert [row.username for row in by_name_desc.items] == [
+        "gamma",
+        "delta",
+        "beta",
+        "alpha",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_table_rejects_unknown_sort_field(frozen_now):
+    """Anything outside the table's columns is a client error, not a
+    silent fallback."""
+    admin = _principal(1, name="admin", is_admin=True)
+    with pytest.raises(InvalidException):
+        await rate_limits.list_user_rate_limits(
+            session=FakeSession(),
+            user=admin,
+            ctx=_ctx(None),
+            request=_request(_redis_cfg()),
+            sort_by="password_hash",
+        )
+
+
+@pytest.mark.asyncio
+async def test_user_table_paginates_and_filters_by_user(frozen_now, monkeypatch):
+    """The page is sliced off the fully sorted set, and the picker's
+    ``user_id`` collapses the table to that one row."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(2, name="beta", monthly=100),
+        _principal(3, name="gamma", monthly=200),
+        _principal(4, name="delta", monthly=50),
+    ]
+    _seed_table(monkeypatch, principals, monthly_used={4: 30})
+    admin = _principal(9, name="admin", is_admin=True)
+
+    page2 = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        page=2,
+        perPage=2,
+    )
+    # The default order is [3, 1, 2, 4]; the second page holds its tail.
+    assert [row.user_id for row in page2.items] == [2, 4]
+    assert page2.pagination.page == 2
+    assert page2.pagination.perPage == 2
+    assert page2.pagination.total == 4
+    assert page2.pagination.totalPage == 2
+
+    pinned = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        user_id=1,
+    )
+    assert [row.user_id for row in pinned.items] == [1]
+    assert pinned.pagination.total == 1
+
+
+@pytest.mark.asyncio
+async def test_user_table_hydrates_tooltip_fields_for_the_page(frozen_now, monkeypatch):
+    """Full name and attribute labels ride the returned rows — resolved
+    for the page's ids only."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", display_name="Alpha One", monthly=100),
+        _principal(2, name="beta", monthly=100),
+    ]
+    seen_ids = []
+
+    async def _labels(session, ids):
+        seen_ids.extend(ids)
+        return {1: {"profession": "Engineer", "department": "Platform"}}
+
+    _seed_table(monkeypatch, principals)
+    # Re-patch the label loader: _seed_table's stub would override this one.
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _labels)
+    admin = _principal(9, name="admin", is_admin=True)
+
+    response = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        perPage=1,
+    )
+
+    # Only the page's row was hydrated, with the labels the loader had.
+    assert seen_ids == [1]
+    row = response.items[0]
+    assert row.username == "alpha"
+    assert row.full_name == "Alpha One"
+    assert row.profession == "Engineer"
+    assert row.department == "Platform"
+    assert row.business_unit is None
+
+
+@pytest.mark.asyncio
+async def test_user_table_local_mode_keeps_limits_drops_counters(
+    frozen_now, monkeypatch
+):
+    """Local mode: no counters anywhere (so every usage key reads its
+    limit), no reader is ever built, and the row list is unchanged."""
+
+    def _forbid(cfg):
+        raise AssertionError("local mode must not build a reader")
+
+    monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
+
+    async def _users(session, user_id=None):
+        return [
+            _principal(1, name="alpha", monthly=100),
+            _principal(2, name="beta", monthly=300),
+        ]
+
+    async def _groups(session, user_ids):
+        return {}
+
+    async def _labels(session, ids):
+        return {}
+
+    monkeypatch.setattr(rate_limits, "_active_user_principals", _users)
+    monkeypatch.setattr(rate_limits, "load_group_limit_snapshots", _groups)
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _labels)
+
+    response = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        request=_request(_local_cfg()),
+        sort_by="monthly",
+    )
+
+    assert response.mode == "local"
+    assert response.usage_error is None
+    assert [row.user_id for row in response.items] == [1, 2]
+    for row in response.items:
+        for window in row.windows:
+            assert window.used is None
+            assert window.limit is not None
+
+
+@pytest.mark.asyncio
+async def test_user_table_disabled_mode_is_an_empty_page(frozen_now, monkeypatch):
+    """Rate limiting off: an empty page with the mode reported, and no
+    reader construction."""
+
+    def _forbid(cfg):
+        raise AssertionError("disabled mode must not build a reader")
+
+    monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
+
+    response = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        request=_request(SimpleNamespace(gateway_rate_limit=None)),
+    )
+
+    assert response.mode == "disabled"
+    assert response.items == []
+    assert response.pagination.total == 0
