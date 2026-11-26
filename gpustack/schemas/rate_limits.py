@@ -174,6 +174,11 @@ class RateLimitResetUsage(BaseModel):
     user_id: int
     username: Optional[str] = None
     full_name: Optional[str] = None
+    # The name tooltip's org lines, hydrated page-scoped like the user
+    # limits table's; ``None`` when the account has since been deleted.
+    profession: Optional[str] = None
+    department: Optional[str] = None
+    business_unit: Optional[str] = None
     # The forgiven budget: ``weekly`` or ``monthly``.
     kind: str
     # When the press took effect (the counter cutoff it produced).

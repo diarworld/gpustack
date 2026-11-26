@@ -191,9 +191,10 @@ class FakeSession:
         return matched
 
     def _table_resets(self, text):
-        """Rows the resets-table listing would fetch: the optional outcome
-        and user_id filters read off the compiled statement, the whole
-        filtered set returned (the endpoint orders and pages in memory)."""
+        """Rows the resets-table listing would fetch: the optional outcome,
+        user_id and work_type filters read off the compiled statement, the
+        whole filtered set returned (the endpoint orders and pages in
+        memory)."""
         matched = list(self._resets)
         for verdict in (
             rate_limits.RESET_OUTCOME_APPROVED,
@@ -204,6 +205,9 @@ class FakeSession:
         owner = re.search(r"user_id = (\d+)", text)
         if owner:
             matched = [row for row in matched if row.user_id == int(owner.group(1))]
+        classified = re.search(r"work_type = '([^']*)'", text)
+        if classified:
+            matched = [row for row in matched if row.work_type == classified.group(1)]
         return matched
 
     def add(self, obj):
@@ -1760,6 +1764,16 @@ def _fake_names(names):
     return _resolve
 
 
+def _fake_labels(labels):
+    """Stand-in for the resets table's tooltip hydration: the org
+    attributes the endpoint would resolve for the page's owners."""
+
+    async def _resolve(session, ids):
+        return {uid: labels[uid] for uid in ids if uid in labels}
+
+    return _resolve
+
+
 @pytest.mark.asyncio
 async def test_resets_table_requires_platform_wide_admin():
     """The resets table is cross-tenant audit data: anyone short of a
@@ -1809,6 +1823,19 @@ async def test_resets_table_lists_newest_first_with_names(monkeypatch):
         "_reset_user_names",
         _fake_names({7: ("alpha", "Alpha One"), 8: ("beta", None)}),
     )
+    monkeypatch.setattr(
+        rate_limits,
+        "bulk_user_attribute_labels",
+        _fake_labels(
+            {
+                7: {
+                    "profession": "инфраструктурный архитектор",
+                    "department": "ПК Платформенная инфраструктура",
+                    "business_unit": "Офис ЛМ ТЕХ",
+                }
+            }
+        ),
+    )
 
     response = await rate_limits.list_rate_limit_resets(
         session=session,
@@ -1825,6 +1852,12 @@ async def test_resets_table_lists_newest_first_with_names(monkeypatch):
     ]
     assert response.items[0].username == "alpha"
     assert response.items[0].full_name == "Alpha One"
+    # The tooltip's org lines hydrate with the names, page-scoped.
+    assert response.items[0].profession == "инфраструктурный архитектор"
+    assert response.items[0].department == "ПК Платформенная инфраструктура"
+    assert response.items[0].business_unit == "Офис ЛМ ТЕХ"
+    # An owner with no directory labels answers empty, not missing.
+    assert response.items[1].profession is None
     # The rejected row carries the decision model's verdict fields.
     assert response.items[1].work_type == "Unknown"
     assert response.items[1].rejection_reason == "TooVague"
@@ -1843,6 +1876,7 @@ async def test_resets_table_outcome_filter(monkeypatch):
     ]
     session = FakeSession(resets=resets)
     monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
     admin = _principal(9, name="admin", is_admin=True)
 
     approved = await rate_limits.list_rate_limit_resets(
@@ -1858,6 +1892,44 @@ async def test_resets_table_outcome_filter(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resets_table_work_type_filter(monkeypatch):
+    """``work_type`` narrows the table to one decision-model
+    classification; absent, every class is returned."""
+    resets = [
+        _reset(
+            7,
+            "monthly",
+            FIXED_NOW - timedelta(days=3),
+            id=1,
+            work_type="SoftwareDevelopment",
+        ),
+        _reset(8, "monthly", FIXED_NOW - timedelta(days=2), id=2, work_type=None),
+        _reset(
+            7,
+            "monthly",
+            FIXED_NOW - timedelta(days=1),
+            id=3,
+            work_type="SoftwareDevelopment",
+        ),
+    ]
+    session = FakeSession(resets=resets)
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+    admin = _principal(9, name="admin", is_admin=True)
+
+    pinned = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), work_type="SoftwareDevelopment"
+    )
+    assert [row.id for row in pinned.items] == [3, 1]
+    assert pinned.pagination.total == 2
+
+    every = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None)
+    )
+    assert [row.id for row in every.items] == [3, 2, 1]
+
+
+@pytest.mark.asyncio
 async def test_resets_table_pages_and_filters_by_user(monkeypatch):
     """The picker's ``user_id`` collapses the table to that budget owner,
     and the page slices off the fully sorted set."""
@@ -1868,6 +1940,7 @@ async def test_resets_table_pages_and_filters_by_user(monkeypatch):
     ]
     session = FakeSession(resets=resets)
     monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
     admin = _principal(9, name="admin", is_admin=True)
 
     pinned = await rate_limits.list_rate_limit_resets(

@@ -876,6 +876,7 @@ async def list_rate_limit_resets(
     perPage: int = 10,
     user_id: Optional[int] = None,
     outcome: Optional[str] = None,
+    work_type: Optional[str] = None,
 ):
     """The admin's rate-limit resets table, one row per recorded press.
 
@@ -884,12 +885,14 @@ async def list_rate_limit_resets(
     construction.
 
     Answers ``page`` / ``perPage`` like the other list endpoints, plus the
-    UI's ``user_id`` and ``outcome`` filters. ``outcome`` narrows the table
-    to one verdict (``approved`` or ``rejected``); absent, every press is
-    returned — the approved-only landing view is the UI's default state,
-    not a server-side one. Rows order newest press first, ``id`` breaking
-    ties so a same-second pair keeps its insertion order. Names hydrate
-    for the returned rows only.
+    UI's ``user_id``, ``outcome`` and ``work_type`` filters. ``outcome``
+    narrows the table to one verdict (``approved`` or ``rejected``);
+    absent, every press is returned — the approved-only landing view is
+    the UI's default state, not a server-side one. ``work_type`` narrows
+    to one decision-model classification; absent, every class is
+    returned. Rows order newest press first, ``id`` breaking ties so a
+    same-second pair keeps its insertion order. Names and the tooltip's
+    org attributes hydrate for the returned rows only.
 
     Args:
         session: async DB session.
@@ -899,6 +902,7 @@ async def list_rate_limit_resets(
         perPage: rows per page, clamped to 1..200.
         user_id: restrict the table to one budget owner (the picker).
         outcome: ``approved`` or ``rejected``; None = every press.
+        work_type: one decision-model classification; None = every class.
 
     Returns:
         RateLimitResetsResponse: the page of recorded presses with the
@@ -926,6 +930,8 @@ async def list_rate_limit_resets(
         stmt = stmt.where(GatewayRateLimitReset.user_id == user_id)
     if outcome is not None:
         stmt = stmt.where(GatewayRateLimitReset.outcome == outcome)
+    if work_type is not None:
+        stmt = stmt.where(GatewayRateLimitReset.work_type == work_type)
     rows = list((await session.exec(stmt)).all())
     # Newest press first; the id breaks ties so a same-second pair keeps
     # its insertion order under the reverse sort.
@@ -936,12 +942,21 @@ async def list_rate_limit_resets(
     page_rows = rows[start : start + perPage]
 
     names = await _reset_user_names(session, [row.user_id for row in page_rows])
+    # The tooltip's org lines hydrate page-scoped, the way the user
+    # limits table's do; a deleted owner's row keeps its audit fields
+    # with the names and labels dropped.
+    labels = await bulk_user_attribute_labels(
+        session, list({row.user_id for row in page_rows})
+    )
     items = [
         RateLimitResetUsage(
             id=row.id,
             user_id=row.user_id,
             username=names.get(row.user_id, (None, None))[0],
             full_name=names.get(row.user_id, (None, None))[1],
+            profession=labels.get(row.user_id, {}).get("profession"),
+            department=labels.get(row.user_id, {}).get("department"),
+            business_unit=labels.get(row.user_id, {}).get("business_unit"),
             kind=row.kind,
             reset_at=row.reset_at,
             outcome=row.outcome,
