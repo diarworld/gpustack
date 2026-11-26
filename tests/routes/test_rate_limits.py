@@ -6,6 +6,7 @@ like the ones ``tests/routes/test_api_keys.py`` uses to call route handlers
 directly.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -151,7 +152,13 @@ class FakeSession:
             # a fresh fake session should look like.
             return SimpleNamespace(first=lambda: None)
         if "gateway_rate_limit_resets" in text:
-            return SimpleNamespace(all=lambda: self._matching_resets(text))
+            if "reset_at >" in text:
+                # The floating-quota read: kind / user / outcome /
+                # self-service filters (see _matching_resets).
+                return SimpleNamespace(all=lambda: self._matching_resets(text))
+            # The resets-table listing: optional outcome / user_id
+            # filters, ordered and paged by the endpoint in Python.
+            return SimpleNamespace(all=lambda: self._table_resets(text))
         if "non_admin_user_models" in text:
             return SimpleNamespace(all=lambda: list(self._models))
         return SimpleNamespace(all=lambda: [])
@@ -181,6 +188,22 @@ class FakeSession:
             and (row.reset_by_user_id is None or row.reset_by_user_id == row.user_id)
         ]
         matched.sort(key=lambda r: r.reset_at)
+        return matched
+
+    def _table_resets(self, text):
+        """Rows the resets-table listing would fetch: the optional outcome
+        and user_id filters read off the compiled statement, the whole
+        filtered set returned (the endpoint orders and pages in memory)."""
+        matched = list(self._resets)
+        for verdict in (
+            rate_limits.RESET_OUTCOME_APPROVED,
+            rate_limits.RESET_OUTCOME_REJECTED,
+        ):
+            if f"outcome = '{verdict}'" in text:
+                matched = [row for row in matched if row.outcome == verdict]
+        owner = re.search(r"user_id = (\d+)", text)
+        if owner:
+            matched = [row for row in matched if row.user_id == int(owner.group(1))]
         return matched
 
     def add(self, obj):
@@ -830,12 +853,31 @@ async def test_reader_failure_surfaces_only_the_class_name(
         assert window.reset_seconds is None
 
 
-def _reset(user_id, kind, at, by=None, outcome="approved"):
+def _reset(
+    user_id,
+    kind,
+    at,
+    by=None,
+    outcome="approved",
+    *,
+    id=None,
+    description="",
+    work_type=None,
+    rejection_reason=None,
+):
     """A recorded reset row, aware UTC as UTCDateTime returns it. Rows
     written before the outcome column existed were unconditional approvals,
     which is what the default encodes."""
     return SimpleNamespace(
-        user_id=user_id, kind=kind, reset_at=at, reset_by_user_id=by, outcome=outcome
+        user_id=user_id,
+        kind=kind,
+        reset_at=at,
+        reset_by_user_id=by,
+        outcome=outcome,
+        id=id,
+        description=description,
+        work_type=work_type,
+        rejection_reason=rejection_reason,
     )
 
 
@@ -1706,3 +1748,152 @@ async def test_user_table_disabled_mode_is_an_empty_page(frozen_now, monkeypatch
     assert response.mode == "disabled"
     assert response.items == []
     assert response.pagination.total == 0
+
+
+def _fake_names(names):
+    """Stand-in for the resets table's name hydration: the mapping the
+    endpoint would resolve from the directory."""
+
+    async def _resolve(session, ids):
+        return {uid: names[uid] for uid in ids if uid in names}
+
+    return _resolve
+
+
+@pytest.mark.asyncio
+async def test_resets_table_requires_platform_wide_admin():
+    """The resets table is cross-tenant audit data: anyone short of a
+    platform-wide admin is refused outright, no self-scoped fallback."""
+    for caller, ctx in (
+        (_principal(7, name="plain"), _ctx(10)),
+        (_principal(9, name="admin", is_admin=True), _ctx(10)),
+        (_principal(7, name="plain"), _ctx(None)),
+    ):
+        with pytest.raises(ForbiddenException):
+            await rate_limits.list_rate_limit_resets(
+                session=FakeSession(), user=caller, ctx=ctx
+            )
+
+
+@pytest.mark.asyncio
+async def test_resets_table_lists_newest_first_with_names(monkeypatch):
+    """Without an outcome filter every press is returned, newest first —
+    the approved-only landing view is the UI's default state, not a
+    server-side one. Names hydrate for the page's budget owners, and a
+    deleted owner's row survives with its names dropped."""
+    resets = [
+        _reset(
+            7, "weekly", FIXED_NOW - timedelta(days=3), id=1, description="migration"
+        ),
+        _reset(
+            8,
+            "monthly",
+            FIXED_NOW - timedelta(days=1),
+            id=2,
+            outcome="rejected",
+            description="for work",
+            work_type="Unknown",
+            rejection_reason="TooVague",
+        ),
+        _reset(
+            7,
+            "monthly",
+            FIXED_NOW - timedelta(hours=2),
+            id=3,
+            description="on-call fix",
+        ),
+    ]
+    session = FakeSession(resets=resets)
+    monkeypatch.setattr(
+        rate_limits,
+        "_reset_user_names",
+        _fake_names({7: ("alpha", "Alpha One"), 8: ("beta", None)}),
+    )
+
+    response = await rate_limits.list_rate_limit_resets(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+    )
+
+    # Newest press first; same-owner rows keep no other grouping.
+    assert [row.id for row in response.items] == [3, 2, 1]
+    assert [row.outcome for row in response.items] == [
+        "approved",
+        "rejected",
+        "approved",
+    ]
+    assert response.items[0].username == "alpha"
+    assert response.items[0].full_name == "Alpha One"
+    # The rejected row carries the decision model's verdict fields.
+    assert response.items[1].work_type == "Unknown"
+    assert response.items[1].rejection_reason == "TooVague"
+    assert response.items[2].description == "migration"
+    assert response.pagination.total == 3
+    assert response.pagination.totalPage == 1
+
+
+@pytest.mark.asyncio
+async def test_resets_table_outcome_filter(monkeypatch):
+    """``outcome`` narrows the table to one verdict: the UI's landing
+    state sends approved, and a rejected press never leaks into it."""
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+        _reset(8, "monthly", FIXED_NOW - timedelta(days=1), id=2, outcome="rejected"),
+    ]
+    session = FakeSession(resets=resets)
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    admin = _principal(9, name="admin", is_admin=True)
+
+    approved = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), outcome="approved"
+    )
+    assert [row.id for row in approved.items] == [1]
+    assert approved.pagination.total == 1
+
+    rejected = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), outcome="rejected"
+    )
+    assert [row.id for row in rejected.items] == [2]
+
+
+@pytest.mark.asyncio
+async def test_resets_table_pages_and_filters_by_user(monkeypatch):
+    """The picker's ``user_id`` collapses the table to that budget owner,
+    and the page slices off the fully sorted set."""
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+        _reset(8, "monthly", FIXED_NOW - timedelta(days=2), id=2),
+        _reset(7, "monthly", FIXED_NOW - timedelta(days=1), id=3),
+    ]
+    session = FakeSession(resets=resets)
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    admin = _principal(9, name="admin", is_admin=True)
+
+    pinned = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), user_id=8
+    )
+    assert [row.id for row in pinned.items] == [2]
+    assert pinned.pagination.total == 1
+
+    page2 = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), page=2, perPage=2
+    )
+    # Newest first: [3, 2] fill page one, the oldest row opens page two.
+    assert [row.id for row in page2.items] == [1]
+    assert page2.pagination.page == 2
+    assert page2.pagination.total == 3
+    assert page2.pagination.totalPage == 2
+
+
+@pytest.mark.asyncio
+async def test_resets_table_rejects_unknown_outcome():
+    """An unknown verdict is a client error, not a silent match-nothing
+    filter."""
+    with pytest.raises(InvalidException):
+        await rate_limits.list_rate_limit_resets(
+            session=FakeSession(),
+            user=_principal(9, name="admin", is_admin=True),
+            ctx=_ctx(None),
+            outcome="pending",
+        )

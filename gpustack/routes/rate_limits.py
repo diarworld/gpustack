@@ -60,6 +60,8 @@ from gpustack.schemas.rate_limits import (
     ModelConcurrencyUsage,
     RateLimitResetCreate,
     RateLimitResetStatus,
+    RateLimitResetUsage,
+    RateLimitResetsResponse,
     RateLimitWindowUsage,
     RateLimitsResponse,
     UserRateLimitUsage,
@@ -839,6 +841,124 @@ async def list_user_rate_limits(
         mode=mode,
         generated_at=now,
         usage_error=usage_error,
+    )
+
+
+async def _reset_user_names(
+    session, user_ids: List[int]
+) -> Dict[int, Tuple[Optional[str], Optional[str]]]:
+    """``user_id -> (login, display name)`` for the resets table's name
+    column.
+
+    Module-level indirection like ``_active_user_principals``: tests stub
+    it instead of standing up row selection. Deactivated accounts resolve
+    too — an audit row outlives the user's active flag — and a deleted
+    account simply drops out of the mapping.
+    """
+    ids = list(dict.fromkeys(user_ids))
+    if not ids:
+        return {}
+    stmt = select(Principal).where(Principal.id.in_(ids))
+    principals = (await session.exec(stmt)).all()
+    return {p.id: (p.name, p.display_name) for p in principals}
+
+
+@router.get(
+    "/rate-limits/resets",
+    response_model=RateLimitResetsResponse,
+    response_model_exclude_none=True,
+)
+async def list_rate_limit_resets(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+    page: int = 1,
+    perPage: int = 10,
+    user_id: Optional[int] = None,
+    outcome: Optional[str] = None,
+):
+    """The admin's rate-limit resets table, one row per recorded press.
+
+    Platform-wide admins only (``is_platform_wide`` — the gate the user
+    limits table applies): the rows are cross-Org audit data by
+    construction.
+
+    Answers ``page`` / ``perPage`` like the other list endpoints, plus the
+    UI's ``user_id`` and ``outcome`` filters. ``outcome`` narrows the table
+    to one verdict (``approved`` or ``rejected``); absent, every press is
+    returned — the approved-only landing view is the UI's default state,
+    not a server-side one. Rows order newest press first, ``id`` breaking
+    ties so a same-second pair keeps its insertion order. Names hydrate
+    for the returned rows only.
+
+    Args:
+        session: async DB session.
+        user: the authenticated caller.
+        ctx: the request's tenant context; gates the endpoint entirely.
+        page: 1-based page number (clamped to >= 1).
+        perPage: rows per page, clamped to 1..200.
+        user_id: restrict the table to one budget owner (the picker).
+        outcome: ``approved`` or ``rejected``; None = every press.
+
+    Returns:
+        RateLimitResetsResponse: the page of recorded presses with the
+        owner's display names resolved.
+    """
+    if not is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may list rate-limit resets"
+        )
+    # Plain scalar params arrive unvalidated from hand-rolled callers;
+    # clamp here so a bad page just answers an empty page.
+    page = max(1, page)
+    perPage = max(1, min(perPage, 200))
+    if outcome is not None and outcome not in (
+        RESET_OUTCOME_APPROVED,
+        RESET_OUTCOME_REJECTED,
+    ):
+        raise InvalidException(
+            message="outcome must be one of "
+            f"{sorted((RESET_OUTCOME_APPROVED, RESET_OUTCOME_REJECTED))}"
+        )
+
+    stmt = select(GatewayRateLimitReset)
+    if user_id is not None:
+        stmt = stmt.where(GatewayRateLimitReset.user_id == user_id)
+    if outcome is not None:
+        stmt = stmt.where(GatewayRateLimitReset.outcome == outcome)
+    rows = list((await session.exec(stmt)).all())
+    # Newest press first; the id breaks ties so a same-second pair keeps
+    # its insertion order under the reverse sort.
+    rows.sort(key=lambda row: (row.reset_at, row.id or 0), reverse=True)
+
+    total = len(rows)
+    start = (page - 1) * perPage
+    page_rows = rows[start : start + perPage]
+
+    names = await _reset_user_names(session, [row.user_id for row in page_rows])
+    items = [
+        RateLimitResetUsage(
+            id=row.id,
+            user_id=row.user_id,
+            username=names.get(row.user_id, (None, None))[0],
+            full_name=names.get(row.user_id, (None, None))[1],
+            kind=row.kind,
+            reset_at=row.reset_at,
+            outcome=row.outcome,
+            work_type=row.work_type,
+            rejection_reason=row.rejection_reason,
+            description=row.description,
+        )
+        for row in page_rows
+    ]
+    return RateLimitResetsResponse(
+        items=items,
+        pagination=Pagination(
+            page=page,
+            perPage=perPage,
+            total=total,
+            totalPage=ceil(total / perPage) if total else 0,
+        ),
     )
 
 

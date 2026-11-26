@@ -160,6 +160,43 @@ class UsersRateLimitsResponse(BaseModel):
     usage_error: Optional[str] = None
 
 
+class RateLimitResetUsage(BaseModel):
+    """One recorded press in the admin's rate-limit resets table.
+
+    Served by ``GET /usage/rate-limits/resets``: one row per
+    ``gateway_rate_limit_resets`` entry, approved and rejected alike (the
+    UI filters by ``outcome``). ``username`` / ``full_name`` resolve the
+    budget owner for display; they are ``None`` when the account has since
+    been deleted — the audit row outlives the user.
+    """
+
+    id: int
+    user_id: int
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+    # The forgiven budget: ``weekly`` or ``monthly``.
+    kind: str
+    # When the press took effect (the counter cutoff it produced).
+    reset_at: datetime
+    # ``approved`` (counters cleared) or ``rejected`` (decision-model
+    # refusal, audit row only).
+    outcome: str
+    # The decision model's classification of the task description, on an
+    # approved press; ``None`` when ungated or unclassifiable.
+    work_type: Optional[str] = None
+    # Why the decision model rejected the press, on a rejected one.
+    rejection_reason: Optional[str] = None
+    # The required note on what the budget was spent on.
+    description: str = ""
+
+
+class RateLimitResetsResponse(BaseModel):
+    """One page of the admin's rate-limit resets table."""
+
+    items: List[RateLimitResetUsage] = Field(default_factory=list)
+    pagination: Pagination
+
+
 class RateLimitResetCreate(BaseModel):
     """One reset-button press: which window and why it was forgiven."""
 
