@@ -1301,6 +1301,53 @@ async def test_resource_events_filters_by_event_type_and_name(session):
 
 
 @pytest.mark.asyncio
+async def test_resource_events_carry_creator_full_name(session):
+    # The name tooltip's first line: the live display name for a creator
+    # whose principal row exists, the login-name snapshot for one whose
+    # row is gone (deleted user) — never a bare id.
+    from datetime import datetime
+
+    from gpustack.routes.resource_usage import resource_events
+    from gpustack.schemas.resource_events import (
+        EVENT_TYPE_CREATED,
+        EVENT_TYPE_PHASE_TO_METERED,
+        ResourceEvent,
+    )
+
+    at = datetime(2026, 5, 26, 10, 0, 0)
+    session.add_all(
+        [
+            ResourceEvent(
+                occurred_at=at,
+                resource_type=RESOURCE_TYPE_GPU_INSTANCE,
+                resource_id=701,
+                resource_name="michelia-gpu",
+                event_type=EVENT_TYPE_PHASE_TO_METERED,
+                creator_id=7,
+            ),
+            # creator 999 has no principal row: the login snapshot is
+            # all there is.
+            ResourceEvent(
+                occurred_at=at,
+                resource_type=RESOURCE_TYPE_GPU_INSTANCE,
+                resource_id=702,
+                resource_name="other-box",
+                event_type=EVENT_TYPE_CREATED,
+                creator_id=999,
+                creator_name="bob-login",
+            ),
+        ]
+    )
+    await session.commit()
+
+    out = await resource_events(session, USER, CTX, scope="all")
+    names = {e["creator_id"]: e["creator_full_name"] for e in out["items"]}
+    # creator 7 is the seeded principal alice / "Alice".
+    assert names[7] == "Alice"
+    assert names[999] == "bob-login"
+
+
+@pytest.mark.asyncio
 async def test_breakdown_date_sub_group_splits_series(session):
     # group_by="date" + sub_group_by="instance_type" → one (date, sku) row per
     # bucket per group, so the trend chart can build one series per instance type.

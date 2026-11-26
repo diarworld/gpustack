@@ -2273,6 +2273,21 @@ def _creator_label_fields(labels: Dict[str, str]) -> Dict[str, Optional[str]]:
     }
 
 
+async def _principal_display_names(session, ids: List[int]) -> Dict[int, str]:
+    """Display name (``Principal.display_name``) per creator id — the
+    first line of the events list's name tooltip. One bulk read for the
+    page, the same hydration shape as the attribute labels beside it;
+    ids with no row (deleted principals) map to nothing."""
+    if not ids:
+        return {}
+    rows = (
+        await session.exec(
+            select(Principal.id, Principal.display_name).where(Principal.id.in_(ids))
+        )
+    ).all()
+    return {pid: name for pid, name in rows if name}
+
+
 @router.get("/resource-events")
 async def resource_events(  # noqa: C901
     session: SessionDep,
@@ -2359,9 +2374,11 @@ async def resource_events(  # noqa: C901
     aware_tz = resolve_rollup_tz()  # resolved once, not per row
     # Attribute labels for the name column's tooltip — one bulk query for the
     # page, the same hydration the users list applies.
-    attribute_labels = await bulk_user_attribute_labels(
-        session, [r.creator_id for r in rows if r.creator_id is not None]
-    )
+    creator_ids = [r.creator_id for r in rows if r.creator_id is not None]
+    attribute_labels = await bulk_user_attribute_labels(session, creator_ids)
+    # The tooltip's first line: the live display name, falling back to the
+    # login-name snapshot for creators whose principal is gone or nameless.
+    display_names = await _principal_display_names(session, creator_ids)
     return {
         "pagination": Pagination(
             page=page,
@@ -2385,6 +2402,7 @@ async def resource_events(  # noqa: C901
                 "phase_message": _phase_message_of(r.spec_snapshot),
                 "creator_id": r.creator_id,
                 "creator_name": r.creator_name,
+                "creator_full_name": display_names.get(r.creator_id) or r.creator_name,
                 **_creator_label_fields(attribute_labels.get(r.creator_id, {})),
             }
             for r in rows
