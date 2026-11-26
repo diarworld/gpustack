@@ -1465,10 +1465,10 @@ async def test_user_table_requires_platform_wide_admin(frozen_now):
 async def test_user_table_default_sort_prefers_active_then_limit(
     frozen_now, monkeypatch
 ):
-    """The composite usage key: a non-zero counter sorts on the counter,
-    a zero/missing one on the limit — so an idling user under a big
-    budget outranks an idling user under a small one, and ties break
-    alphabetically."""
+    """The composite usage key: the live counter is the primary value — a
+    user actually burning the budget leads, however small their cap — and
+    the limit only breaks ties between equal counters, so idle rows order
+    by quota size with the name as the last tiebreak."""
     cfg = _redis_cfg()
     principals = [
         _principal(1, name="alpha", display_name="Alpha", monthly=100),
@@ -1487,23 +1487,26 @@ async def test_user_table_default_sort_prefers_active_then_limit(
         request=_request(cfg),
     )
 
-    # Default = -monthly: gamma (limit 200), then the 100-limit pair in
-    # name order, then delta whose counter (30) is its own key.
-    assert [row.user_id for row in response.items] == [3, 1, 2, 4]
+    # Default = -monthly: delta's live counter (30) outranks every idle
+    # row; the idle rows follow by limit desc — gamma (200) before the
+    # 100-limit pair, ties alphabetical.
+    assert [row.user_id for row in response.items] == [4, 3, 1, 2]
     assert response.pagination.total == 4
     assert response.pagination.totalPage == 1
     assert response.mode == "redis"
     # The counter rides the row's monthly window; limits inherit the
     # deployment default where the user sets none.
-    assert _monthly_window(response.items[0]).limit == 200
-    assert _monthly_window(response.items[0]).used == 0
-    assert _monthly_window(response.items[2]).limit == 100
+    assert _monthly_window(response.items[0]).limit == 50
+    assert _monthly_window(response.items[0]).used == 30
+    assert _monthly_window(response.items[1]).limit == 200
+    assert _monthly_window(response.items[3]).limit == 100
 
 
 @pytest.mark.asyncio
 async def test_user_table_sort_directions_and_username(frozen_now, monkeypatch):
-    """Ascending usage flips the composite key, and the username column
-    sorts alphabetically either way."""
+    """Ascending usage puts idle rows (by limit, then name) ahead of the
+    live counters, descending flips that, and the username column sorts
+    alphabetically either way."""
     cfg = _redis_cfg()
     principals = [
         _principal(1, name="alpha", monthly=100),
@@ -1524,7 +1527,9 @@ async def test_user_table_sort_directions_and_username(frozen_now, monkeypatch):
         )
 
     ascending = await _call(sort_by="monthly")
-    assert [row.user_id for row in ascending.items] == [4, 1, 2, 3]
+    # Idle rows first — alpha/beta (limit 100) before gamma (200) — then
+    # the one live counter.
+    assert [row.user_id for row in ascending.items] == [1, 2, 3, 4]
 
     by_name = await _call(sort_by="username")
     assert [row.username for row in by_name.items] == [
@@ -1580,8 +1585,8 @@ async def test_user_table_paginates_and_filters_by_user(frozen_now, monkeypatch)
         page=2,
         perPage=2,
     )
-    # The default order is [3, 1, 2, 4]; the second page holds its tail.
-    assert [row.user_id for row in page2.items] == [2, 4]
+    # The default order is [4, 3, 1, 2]; the second page holds its tail.
+    assert [row.user_id for row in page2.items] == [1, 2]
     assert page2.pagination.page == 2
     assert page2.pagination.perPage == 2
     assert page2.pagination.total == 4

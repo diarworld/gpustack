@@ -625,9 +625,9 @@ _USER_TABLE_WINDOWS = {
     "weekly": ("token_rolling", "604800s"),
     "monthly": ("token_calendar", "each_month"),
 }
-# The table's landing order: the busiest monthly budget first (a user
-# burning their quota is the row an admin is looking for), ties and the
-# name column alphabetically.
+# The table's landing order: the biggest live monthly burn first (a user
+# burning their quota is the row an admin is looking for), idle rows
+# under it by quota size, ties and the name column alphabetically.
 _USER_TABLE_DEFAULT_SORT = "-monthly"
 _USER_TABLE_SORTABLE = ("username",) + tuple(_USER_TABLE_WINDOWS)
 
@@ -648,20 +648,24 @@ def _user_table_sort_token(sort_by: Optional[str]) -> Tuple[str, bool]:
     return field, descending
 
 
-def _user_table_value(field: str, windows: List[RateLimitWindowUsage]) -> int:
-    """One row's sort value for a usage column.
+def _user_table_value(
+    field: str, windows: List[RateLimitWindowUsage]
+) -> Tuple[int, int]:
+    """One row's sort key for a usage column: (current value, limit).
 
-    The live counter while it is non-zero, the limit once the user idles
-    (the "0 reads as limit" rule the column hints document), 0 for an
-    axis with no window at all. A ``None`` count — local mode, or a
-    failed Redis read — reads as idle: the cap is real, only the counter
-    is missing.
+    The live counter is the primary key — a user actually burning the
+    budget outranks every idle account, however generous their cap. The
+    limit only breaks ties between equal counters (zero-usage rows order
+    by quota size, busiest cap first under a descending sort). A
+    ``None`` count — local mode, or a failed Redis read — reads as zero:
+    without a number the row cannot claim a rank. An axis with no window
+    at all sorts as (0, 0).
     """
     kind, period = _USER_TABLE_WINDOWS[field]
     for window in windows:
         if window.kind == kind and window.period == period:
-            return window.used if window.used else window.limit
-    return 0
+            return (window.used or 0, window.limit)
+    return (0, 0)
 
 
 async def _active_user_principals(session, user_id: Optional[int]) -> List[Principal]:
@@ -703,8 +707,9 @@ async def list_user_rate_limits(
 
     Answers ``page`` / ``perPage`` / ``sort_by`` like the other list
     endpoints, plus the UI picker's ``user_id`` filter. Usage columns
-    sort on the live counter and fall back to the limit when a user
-    idles; ``username`` sorts alphabetically. Sorting must see every
+    sort on the live counter first; the limit breaks ties between equal
+    counters, so idle rows order by quota size. ``username`` sorts
+    alphabetically. Sorting must see every
     row's counter, so counters are read for the whole filtered set in
     one batched Redis pipeline and the page is sliced in memory; the
     attribute hydration runs for the returned rows only.
