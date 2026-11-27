@@ -22,6 +22,8 @@ gpustack/
   config/         Config settings model — user-facing CLI flags / env / config file
   envs/           GPUSTACK_* operational tuning knobs, one module
   gateway/        Higress AI gateway integration, ext_auth, wasm plugins
+                     (the wasm plugins themselves live in the sibling
+                     gpustack-higress-plugin repo, branch rate-limiting)
   gpu_instances/  GPU Service: cloud GPU instances, their CRDs and controllers
   mixins/         ActiveRecordMixin, timestamp mixin
   policies/       scheduler worker_filters / scorers / candidate_selectors
@@ -127,6 +129,10 @@ Rules:
   near-duplicate test bodies, as `tests/utils/test_search.py` does.
 - Add or update tests for any behavior change. A bug fix without a regression test is
   incomplete.
+- UI behavior is verified in the browser, not inferred from code: run the
+  local dev server of the `gpustack-ui` repo and walk the affected screens
+  with Playwright MCP (recipe in its `AGENTS.md`). The pytest suite does
+  not exercise the UI.
 
 ## Documentation
 
@@ -175,8 +181,9 @@ Rules:
 ## Ops
 
 Operational artifacts for the deployed clusters are kept **outside this repository**
-in `C:\Users\dmitry\Projects\gpustack-ops\`, not here. This repo holds product source
-only; do not commit deployment material into it.
+in the sibling `gpustack-ops\` repo, not here. All GPUStack repos share one workspace
+folder, `C:\Users\dmitry\Projects\gpustack\` (see the `AGENTS.md` at its root). This
+repo holds product source only; do not commit deployment material into it.
 
 ```
 gpustack-ops/
@@ -198,6 +205,13 @@ Rules:
 - Charts are released from this repo (packaged with the version stamped from the
   placeholder) to the Artifactory Helm repo `helm-local-dataplatform`; the
   `dataplatform` Helm repo is registered locally. See the runbook for the flow.
+- After implementing a feature, do not ask whether to build and deploy:
+  pushing the release branches and running the release pipeline is the
+  default, and the green gate barrier (full suite, visual check, smoke)
+  triggers the helm deploy on its own. Ask only when a gate is red, the
+  release carries a DB migration or a chart/secret change, a
+  gateway-plugin change (lane A2 builds the plugin image first), or the
+  user asked to hold off.
 - A `.gitignore` change is intentionally **not** tracked — protection comes from the
   artifacts living outside the repo, not from ignore rules.
 
