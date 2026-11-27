@@ -65,10 +65,12 @@ from gpustack.schemas.usage import (
     UsageMetaResponse,
     UsageOption,
     UsageSummary,
+    UserAttributeOptionsResponse,
 )
 from gpustack.schemas.common import Pagination
 from gpustack.server.db import async_session
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
+from gpustack.server.services import user_attribute_label_options
 from gpustack.utils.export_delivery import (
     ExportSheetPlan,
     export_response,
@@ -1015,6 +1017,35 @@ async def get_usage_meta(  # noqa: C901
             organizations=organization_options,
             user_groups=user_group_options,
         ),
+    )
+
+
+@router.get(
+    "/user-attribute-options",
+    response_model=UserAttributeOptionsResponse,
+)
+async def get_user_attribute_options(
+    session: SessionDep,
+    user: CurrentUserDep,
+    ctx: TenantContextDep,
+):
+    """The overview tables' attribute picker options — the distinct
+    Business Unit / Department / Profession labels the OIDC attribute
+    sync carries.
+
+    Platform-wide admins only: the pickers sit on the cross-Org tables
+    (user rate limits, rate-limit resets, resource events), and the
+    label lists enumerate the whole Org structure.
+    """
+    if not _is_platform_wide(user, ctx):
+        raise ForbiddenException(
+            message="Only platform-wide admins may list user attribute options"
+        )
+    options = await user_attribute_label_options(session)
+    return UserAttributeOptionsResponse(
+        business_units=options.get("business_unit", []),
+        departments=options.get("department", []),
+        professions=options.get("profession", []),
     )
 
 

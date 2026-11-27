@@ -210,6 +210,14 @@ class FakeSession:
         owner = re.search(r"user_id = (\d+)", text)
         if owner:
             matched = [row for row in matched if row.user_id == int(owner.group(1))]
+        # The attribute filters arrive as the owner-id IN the resolver
+        # produced; SQLAlchemy renders an empty IN as a false predicate.
+        if "1 != 1" in text:
+            return []
+        pinned = re.search(r"user_id IN \(([\d, ]+)\)", text)
+        if pinned:
+            wanted = {int(v) for v in pinned.group(1).split(",") if v.strip()}
+            matched = [row for row in matched if row.user_id in wanted]
         classified = re.search(r"work_type = '([^']*)'", text)
         if classified:
             matched = [row for row in matched if row.work_type == classified.group(1)]
@@ -1465,8 +1473,11 @@ def _seed_table(monkeypatch, principals, monthly_used=None, labels=None):
     monthly_used = monthly_used or {}
     plugin = rate_limit_plugin_name
 
-    async def _users(session, user_id=None):
-        return [p for p in principals if user_id is None or p.id == user_id]
+    async def _users(session, user_id=None, attribute_user_ids=None):
+        rows = [p for p in principals if user_id is None or p.id == user_id]
+        if attribute_user_ids is not None:
+            rows = [p for p in rows if p.id in attribute_user_ids]
+        return rows
 
     async def _groups(session, user_ids):
         return {}
@@ -1655,6 +1666,75 @@ async def test_user_table_paginates_and_filters_by_user(frozen_now, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_user_table_filters_by_attribute_labels(frozen_now, monkeypatch):
+    """The Business Unit / Department / Profession pickers narrow the table
+    to the users the labels resolve to, and a label nobody holds empties
+    it; without attribute params the resolver answers None and the picker's
+    ``user_id`` path is untouched."""
+    cfg = _redis_cfg()
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(2, name="beta", monthly=100),
+        _principal(3, name="gamma", monthly=200),
+    ]
+    _seed_table(monkeypatch, principals)
+    admin = _principal(9, name="admin", is_admin=True)
+    seen = {}
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        seen.update(
+            business_unit=business_unit, department=department, profession=profession
+        )
+        return {1, 3}
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _resolve)
+
+    narrowed = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        business_unit="Магазин 1",
+    )
+    assert seen["business_unit"] == "Магазин 1"
+    assert seen["department"] is None and seen["profession"] is None
+    # The default order (busiest monthly budget first) puts gamma ahead.
+    assert [row.user_id for row in narrowed.items] == [3, 1]
+    assert narrowed.pagination.total == 2
+
+    # A label nobody holds matches nobody: an empty page, not no filter.
+    async def _nobody(session, business_unit=None, department=None, profession=None):
+        return set()
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _nobody)
+    empty = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        business_unit="Нет такого",
+    )
+    assert empty.items == []
+    assert empty.pagination.total == 0
+
+    # No attribute param, no filter: the resolver answers None and the
+    # picker's user_id path keeps the table as it was.
+    async def _none(session, business_unit=None, department=None, profession=None):
+        assert business_unit is None and department is None and profession is None
+        return None
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _none)
+    unpinned = await rate_limits.list_user_rate_limits(
+        session=FakeSession(),
+        user=admin,
+        ctx=_ctx(None),
+        request=_request(cfg),
+        user_id=1,
+    )
+    assert [row.user_id for row in unpinned.items] == [1]
+
+
+@pytest.mark.asyncio
 async def test_user_table_hydrates_tooltip_fields_for_the_page(frozen_now, monkeypatch):
     """Full name and attribute labels ride the returned rows — resolved
     for the page's ids only."""
@@ -1704,7 +1784,7 @@ async def test_user_table_local_mode_keeps_limits_drops_counters(
 
     monkeypatch.setattr(rate_limits, "_reader_factory", _forbid)
 
-    async def _users(session, user_id=None):
+    async def _users(session, user_id=None, attribute_user_ids=None):
         return [
             _principal(1, name="alpha", monthly=100),
             _principal(2, name="beta", monthly=300),
@@ -1965,6 +2045,45 @@ async def test_resets_table_pages_and_filters_by_user(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resets_table_filters_by_attribute_labels(monkeypatch):
+    """The attribute pickers narrow the presses to the budget owners the
+    labels resolve to; a label nobody holds empties the table."""
+    resets = [
+        _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+        _reset(8, "monthly", FIXED_NOW - timedelta(days=2), id=2),
+        _reset(7, "monthly", FIXED_NOW - timedelta(days=1), id=3),
+    ]
+    session = FakeSession(resets=resets)
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+    admin = _principal(9, name="admin", is_admin=True)
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        return {7}
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _resolve)
+
+    narrowed = await rate_limits.list_rate_limit_resets(
+        session=session, user=admin, ctx=_ctx(None), department="Платформа"
+    )
+    assert [row.id for row in narrowed.items] == [3, 1]
+    assert narrowed.pagination.total == 2
+
+    async def _nobody(session, business_unit=None, department=None, profession=None):
+        return set()
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _nobody)
+    empty = await rate_limits.list_rate_limit_resets(
+        session=FakeSession(resets=resets),
+        user=admin,
+        ctx=_ctx(None),
+        department="Нет такого",
+    )
+    assert empty.items == []
+    assert empty.pagination.total == 0
+
+
+@pytest.mark.asyncio
 async def test_resets_table_rejects_unknown_outcome():
     """An unknown verdict is a client error, not a silent match-nothing
     filter."""
@@ -2164,6 +2283,34 @@ async def test_users_export_estimate_skips_the_counter_read(frozen_now, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_users_export_estimate_applies_attribute_filters(frozen_now, monkeypatch):
+    """The preflight sizes the attribute-narrowed principal set; a label
+    nobody holds sizes an empty file."""
+    principals = [
+        _principal(1, name="alpha", monthly=100),
+        _principal(2, name="beta", monthly=200),
+        _principal(3, name="gamma", monthly=50),
+    ]
+    _seed_table(monkeypatch, principals)
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        assert profession == "Инженер"
+        return {2}
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _resolve)
+    result = await rate_limits.estimate_user_rate_limits_export(
+        session=FakeSession(),
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.UserRateLimitsExportRequest(
+            format="csv", profession="Инженер"
+        ),
+    )
+    assert result.total == 1
+    assert result.sheets[0].total == 1
+
+
+@pytest.mark.asyncio
 async def test_resets_export_requires_platform_wide_admin():
     """Same gate as the list: audit rows are cross-tenant by construction."""
     for caller, ctx in (
@@ -2306,6 +2453,38 @@ async def test_resets_export_applies_the_table_filters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resets_export_applies_attribute_filters(monkeypatch):
+    """The file runs the attribute narrow exactly as the page does: the
+    body's labels resolve to owners and the shared predicate follows."""
+    session = FakeSession(
+        resets=[
+            _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+            _reset(8, "monthly", FIXED_NOW - timedelta(days=1), id=2),
+        ]
+    )
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        assert business_unit == "Магазин 1"
+        return {8}
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _resolve)
+
+    response = await rate_limits.export_rate_limit_resets(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.RateLimitResetsExportRequest(
+            format="csv", business_unit="Магазин 1"
+        ),
+    )
+    _header, data, _trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+    # Only user 8's press survives the attribute narrow.
+    assert [row[0] for row in data] == ["8"]
+
+
+@pytest.mark.asyncio
 async def test_resets_export_rejects_unknown_outcome():
     """The export validates the verdict filter against the same two
     verdicts the list does."""
@@ -2346,6 +2525,35 @@ async def test_resets_export_estimate_counts_the_filtered_rows(monkeypatch):
     assert result.total == 1
     assert result.sheets[0].total == 1
     assert result.exceeds_hard_limit is False
+
+
+@pytest.mark.asyncio
+async def test_resets_export_estimate_applies_attribute_filters(monkeypatch):
+    """The preflight sizes the attribute-narrowed predicate, so a label
+    nobody holds sizes an empty file."""
+    session = FakeSession(
+        resets=[
+            _reset(7, "weekly", FIXED_NOW - timedelta(days=3), id=1),
+            _reset(8, "monthly", FIXED_NOW - timedelta(days=1), id=2),
+        ]
+    )
+    monkeypatch.setattr(rate_limits, "_reset_user_names", _fake_names({}))
+    monkeypatch.setattr(rate_limits, "bulk_user_attribute_labels", _fake_labels({}))
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        return {8}
+
+    monkeypatch.setattr(rate_limits, "resolve_user_attribute_filter", _resolve)
+    result = await rate_limits.estimate_rate_limit_resets_export(
+        session=session,
+        user=_principal(9, name="admin", is_admin=True),
+        ctx=_ctx(None),
+        body=rate_limits.RateLimitResetsExportRequest(
+            format="csv", business_unit="Магазин 1"
+        ),
+    )
+    assert result.total == 1
+    assert result.sheets[0].total == 1
     assert [column.key for column in result.sheets[0].columns] == (
         rate_limits.rate_limit_resets_export_column_keys()
     )

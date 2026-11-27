@@ -81,7 +81,10 @@ from gpustack.schemas.usage import (
 from gpustack.schemas.resource_events import ResourceEvent
 from gpustack.server.db import async_session
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
-from gpustack.server.services import bulk_user_attribute_labels
+from gpustack.server.services import (
+    bulk_user_attribute_labels,
+    resolve_user_attribute_filter,
+)
 from gpustack.utils.export_delivery import (
     ExportSheetPlan,
     export_response,
@@ -2306,6 +2309,7 @@ def _resource_events_statement(
     creator_id_list: Optional[List[int]],
     organization_id_list: Optional[List[int]],
     group_member_ids: Optional[List[int]],
+    attribute_creator_ids: Optional[List[int]] = None,
 ):
     """The events list's query — the one predicate the page, its export and
     the export estimate all read from, so a file and the table it was
@@ -2318,6 +2322,13 @@ def _resource_events_statement(
         stmt = stmt.where(ResourceEvent.consumer_principal_id == org_id)
     if creator_id_list:
         stmt = stmt.where(ResourceEvent.creator_id.in_(creator_id_list))
+    if attribute_creator_ids is not None:
+        # The Business Unit / Department / Profession filters resolve to
+        # creator ids before this query. An empty list renders as a false
+        # predicate — a label nobody holds answers an empty table, not a
+        # dropped filter. A separate clause from ``creator_id_list``, so
+        # the picker and the attributes AND together.
+        stmt = stmt.where(ResourceEvent.creator_id.in_(attribute_creator_ids))
     if organization_id_list:
         stmt = stmt.where(ResourceEvent.consumer_principal_id.in_(organization_id_list))
     if group_member_ids is not None:
@@ -2358,6 +2369,9 @@ async def resource_events(  # noqa: C901
     creator_ids: Optional[str] = None,
     organization_ids: Optional[str] = None,
     user_group_ids: Optional[str] = None,
+    business_unit: Optional[str] = None,
+    department: Optional[str] = None,
+    profession: Optional[str] = None,
     page: int = 1,
     perPage: int = 50,
 ):
@@ -2383,6 +2397,13 @@ async def resource_events(  # noqa: C901
         if event_types
         else None
     )
+    attribute_creator_ids: Optional[List[int]] = None
+    if business_unit or department or profession:
+        attribute_creator_ids = list(
+            await resolve_user_attribute_filter(
+                session, business_unit, department, profession
+            )
+        )
 
     stmt = _resource_events_statement(
         user_id=user.id,
@@ -2396,6 +2417,7 @@ async def resource_events(  # noqa: C901
         creator_id_list=creator_id_list,
         organization_id_list=organization_id_list,
         group_member_ids=group_member_ids,
+        attribute_creator_ids=attribute_creator_ids,
     )
 
     count_stmt = select(func.count()).select_from(stmt.subquery())
@@ -2465,6 +2487,9 @@ class ResourceEventsExportRequest(TableExportRequest):
     creator_ids: Optional[List[int]] = None
     organization_ids: Optional[List[int]] = None
     user_group_ids: Optional[List[int]] = None
+    business_unit: Optional[str] = None
+    department: Optional[str] = None
+    profession: Optional[str] = None
 
 
 async def _events_export_statement(
@@ -2492,6 +2517,13 @@ async def _events_export_statement(
     group_member_ids = None
     if request.user_group_ids:
         group_member_ids = await _group_member_user_ids(session, request.user_group_ids)
+    attribute_creator_ids: Optional[List[int]] = None
+    if request.business_unit or request.department or request.profession:
+        attribute_creator_ids = list(
+            await resolve_user_attribute_filter(
+                session, request.business_unit, request.department, request.profession
+            )
+        )
     stmt = _resource_events_statement(
         user_id=user.id,
         org_id=org_id,
@@ -2504,6 +2536,7 @@ async def _events_export_statement(
         creator_id_list=request.creator_ids,
         organization_id_list=request.organization_ids,
         group_member_ids=group_member_ids,
+        attribute_creator_ids=attribute_creator_ids,
     )
     return stmt, effective_scope, org_id
 

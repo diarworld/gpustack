@@ -748,6 +748,109 @@ async def bulk_user_attribute_labels(
     return labels
 
 
+async def user_attribute_label_options(
+    session: AsyncSession,
+) -> Dict[str, List[str]]:
+    """Picker options for the overview tables' attribute filters.
+
+    One sorted label list per attribute kind, read from the same
+    membership scope and with the same label rule (``display_name``
+    falling back to the prefixed name) ``bulk_user_attribute_labels``
+    applies — an option the picker offers is a value the filter
+    resolves.
+    """
+    stmt = (
+        select(Principal.name, Principal.display_name)
+        .select_from(PrincipalMembership)
+        .join(
+            Principal,
+            Principal.id == PrincipalMembership.parent_principal_id,
+        )
+        .where(
+            PrincipalMembership.source == AuthProviderEnum.OIDC_ATTRIBUTES.value,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+        )
+    )
+    labels: Dict[str, Set[str]] = {kind: set() for kind in _ATTRIBUTE_LABEL_KINDS}
+    for name, display_name in (await session.exec(stmt)).all():
+        for kind, prefix in _ATTRIBUTE_LABEL_KINDS.items():
+            if name.startswith(prefix):
+                labels[kind].add(display_name or name)
+                break
+    return {kind: sorted(values) for kind, values in labels.items()}
+
+
+async def user_ids_with_attribute_label(
+    session: AsyncSession, kind: str, label: str
+) -> Set[int]:
+    """User ids whose ``kind`` attribute label equals ``label``.
+
+    The filter-side mirror of ``bulk_user_attribute_labels``: only the
+    oidc-attrs memberships count, and the label is the group's
+    ``display_name`` falling back to the prefixed name, compared in
+    Python — a SQL match on the raw columns would disagree with what
+    the table's tooltip renders.
+    """
+    prefix = _ATTRIBUTE_LABEL_KINDS.get(kind)
+    if prefix is None:
+        return set()
+    stmt = (
+        select(
+            PrincipalMembership.member_principal_id,
+            Principal.name,
+            Principal.display_name,
+        )
+        .join(
+            Principal,
+            Principal.id == PrincipalMembership.parent_principal_id,
+        )
+        .where(
+            PrincipalMembership.source == AuthProviderEnum.OIDC_ATTRIBUTES.value,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.kind == PrincipalType.GROUP,
+            Principal.deleted_at.is_(None),
+            Principal.name.startswith(prefix),
+        )
+    )
+    return {
+        member_id
+        for member_id, name, display_name in (await session.exec(stmt)).all()
+        if (display_name or name) == label
+    }
+
+
+async def resolve_user_attribute_filter(
+    session: AsyncSession,
+    business_unit: Optional[str] = None,
+    department: Optional[str] = None,
+    profession: Optional[str] = None,
+) -> Optional[Set[int]]:
+    """User ids matching every provided attribute label, or ``None``
+    when no attribute filter was passed.
+
+    The overview tables' shared resolution: each provided label narrows
+    the rows to the users holding it, and several provided labels
+    intersect — a row must match all of them. An empty return set means
+    no user matches, which callers render as an empty table.
+    """
+    requested = (
+        ("business_unit", business_unit),
+        ("department", department),
+        ("profession", profession),
+    )
+    matches: Optional[Set[int]] = None
+    for kind, label in requested:
+        if not label:
+            continue
+        ids = await user_ids_with_attribute_label(session, kind, label)
+        matches = ids if matches is None else matches & ids
+        if not matches:
+            break
+    return matches
+
+
 class APIKeyService:
     def __init__(self, session: AsyncSession):
         self.session = session

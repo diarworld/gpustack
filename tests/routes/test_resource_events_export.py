@@ -97,6 +97,14 @@ class _EventsSession:
         if kinds:
             wanted = set(re.findall(r"'([^']*)'", kinds.group(1)))
             matched = [r for r in matched if r.event_type in wanted]
+        # The attribute filters arrive as the creator-id IN the resolver
+        # produced; an empty IN renders as a false predicate.
+        if "1 != 1" in text:
+            return []
+        creators = re.search(r"creator_id IN \(([\d, ]+)\)", text)
+        if creators:
+            wanted = {int(v) for v in creators.group(1).split(",") if v.strip()}
+            matched = [r for r in matched if r.creator_id in wanted]
         name = re.search(r"LIKE '(%[^']*%)'", text)
         if name:
             needle = name.group(1).strip("%").lower()
@@ -245,6 +253,50 @@ async def test_events_export_honors_the_type_and_name_filters():
     assert len(data) == 1
     assert data[0][3] == "created"
     assert trailer.startswith("# rows=1 ")
+
+
+@pytest.mark.asyncio
+async def test_events_export_applies_attribute_filters(monkeypatch):
+    """The Business Unit / Department / Profession labels narrow the file
+    to the creators they resolve to, ANDed with the picker's creator
+    filter; a label nobody holds streams an empty file."""
+    rows = _rows()
+
+    async def _resolve(session, business_unit=None, department=None, profession=None):
+        assert business_unit == "BU 1"
+        return [2]
+
+    monkeypatch.setattr(
+        "gpustack.routes.resource_usage.resolve_user_attribute_filter", _resolve
+    )
+    response = await export_resource_events(
+        session=_EventsSession(rows),
+        user=User(id=1, name="admin", is_admin=True),
+        ctx=_ctx_for(User(id=1, name="admin", is_admin=True)),
+        request=ResourceEventsExportRequest(format="csv", business_unit="BU 1"),
+    )
+    _header, data, trailer = _csv_rows((await _collect(response)).decode("utf-8-sig"))
+    # Only creator 2's events survive the attribute narrow.
+    assert [row[7] for row in data] == ["2", "2"]
+    assert trailer.startswith("# rows=2 ")
+
+    async def _nobody(session, business_unit=None, department=None, profession=None):
+        return []
+
+    monkeypatch.setattr(
+        "gpustack.routes.resource_usage.resolve_user_attribute_filter", _nobody
+    )
+    empty = await export_resource_events(
+        session=_EventsSession(rows),
+        user=User(id=1, name="admin", is_admin=True),
+        ctx=_ctx_for(User(id=1, name="admin", is_admin=True)),
+        request=ResourceEventsExportRequest(format="csv", business_unit="Нет такого"),
+    )
+    _header, empty_rows, empty_trailer = _csv_rows(
+        (await _collect(empty)).decode("utf-8-sig")
+    )
+    assert empty_rows == []
+    assert empty_trailer.startswith("# rows=0 ")
 
 
 @pytest.mark.asyncio

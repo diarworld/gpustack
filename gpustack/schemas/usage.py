@@ -145,6 +145,15 @@ class UsageMetaResponse(BaseModel):
     filters: UsageFilters
 
 
+class UserAttributeOptionsResponse(BaseModel):
+    """``GET /usage/user-attribute-options`` — the overview tables'
+    attribute picker options, one sorted label list per kind."""
+
+    business_units: List[str] = Field(default_factory=list)
+    departments: List[str] = Field(default_factory=list)
+    professions: List[str] = Field(default_factory=list)
+
+
 class UsageFilterRequest(BaseModel):
     users: List[UsageFilterItem] = Field(default_factory=list)
     api_keys: List[UsageFilterItem] = Field(default_factory=list)

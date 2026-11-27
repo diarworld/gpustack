@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
@@ -76,7 +76,10 @@ from gpustack.schemas.usage import (
 )
 from gpustack.schemas.users import User
 from gpustack.server.deps import CurrentUserDep, SessionDep, TenantContextDep
-from gpustack.server.services import bulk_user_attribute_labels
+from gpustack.server.services import (
+    bulk_user_attribute_labels,
+    resolve_user_attribute_filter,
+)
 from gpustack.utils.export_delivery import (
     ExportSheetPlan,
     single_sheet_export_response,
@@ -688,7 +691,11 @@ def _user_table_value(
     return (0, 0)
 
 
-async def _active_user_principals(session, user_id: Optional[int]) -> List[Principal]:
+async def _active_user_principals(
+    session,
+    user_id: Optional[int],
+    attribute_user_ids: Optional[Set[int]] = None,
+) -> List[Principal]:
     """The active USER principals behind the table's rows.
 
     Module-level indirection like ``_reader_factory``: tests call the
@@ -701,6 +708,12 @@ async def _active_user_principals(session, user_id: Optional[int]) -> List[Princ
     )
     if user_id is not None:
         stmt = stmt.where(Principal.id == user_id)
+    if attribute_user_ids is not None:
+        if not attribute_user_ids:
+            # An attribute label no user holds: the filter matches
+            # nobody and the table is empty.
+            return []
+        stmt = stmt.where(Principal.id.in_(attribute_user_ids))
     return list((await session.exec(stmt)).all())
 
 
@@ -709,6 +722,7 @@ async def _user_limit_rows(
     request: Request,
     user_id: Optional[int],
     sort_by: Optional[str],
+    attribute_user_ids: Optional[Set[int]] = None,
 ) -> Tuple[
     List[Tuple[Principal, List[RateLimitWindowUsage]]],
     str,
@@ -730,6 +744,9 @@ async def _user_limit_rows(
         user_id: restrict the rows to one user (the picker filter).
         sort_by: one column token, ``-`` prefix for descending; empty =
             the default (busiest monthly budget first).
+        attribute_user_ids: the user ids the Business Unit / Department /
+            Profession labels resolve to; ``None`` = no attribute filter,
+            an empty set matches nobody.
 
     Returns:
         (rows, mode, now, usage_error): the sorted (principal, windows)
@@ -744,7 +761,7 @@ async def _user_limit_rows(
         return [], mode, now, None
 
     field, descending = _user_table_sort_token(sort_by)
-    principals = await _active_user_principals(session, user_id)
+    principals = await _active_user_principals(session, user_id, attribute_user_ids)
     rlc, _ = await effective_rate_limit(session, cfg)
     group_snapshots = await load_group_limit_snapshots(
         session, [p.id for p in principals]
@@ -817,6 +834,9 @@ async def list_user_rate_limits(
     perPage: int = 10,
     sort_by: Optional[str] = None,
     user_id: Optional[int] = None,
+    business_unit: Optional[str] = None,
+    department: Optional[str] = None,
+    profession: Optional[str] = None,
 ):
     """The admin's cross-user limits table, one row per active user.
 
@@ -843,6 +863,12 @@ async def list_user_rate_limits(
         sort_by: one column token, ``-`` prefix for descending; empty =
             the default (busiest monthly budget first).
         user_id: restrict the table to one user (the picker filter).
+        business_unit: restrict the table to users whose Business Unit
+            label matches (the attribute filters).
+        department: restrict the table to users whose Department label
+            matches.
+        profession: restrict the table to users whose Profession label
+            matches.
 
     Returns:
         UsersRateLimitsResponse: the page of rows with limits and live
@@ -858,7 +884,13 @@ async def list_user_rate_limits(
     page = max(1, page)
     perPage = max(1, min(perPage, 200))
     rows, mode, now, usage_error = await _user_limit_rows(
-        session, request, user_id, sort_by
+        session,
+        request,
+        user_id,
+        sort_by,
+        await resolve_user_attribute_filter(
+            session, business_unit, department, profession
+        ),
     )
     if mode == "disabled":
         return UsersRateLimitsResponse(
@@ -937,12 +969,18 @@ def _resets_statement(
     user_id: Optional[int],
     outcome: Optional[str],
     work_type: Optional[str],
+    attribute_user_ids: Optional[Set[int]] = None,
 ):
     """The resets table's query — the shared predicate of the list and its
     export, so a file and the page it was clicked on agree row for row."""
     stmt = select(GatewayRateLimitReset)
     if user_id is not None:
         stmt = stmt.where(GatewayRateLimitReset.user_id == user_id)
+    if attribute_user_ids is not None:
+        # The attribute filters resolve to user ids before this query;
+        # an empty set renders as a false predicate, so a label nobody
+        # holds answers an empty table rather than no filter at all.
+        stmt = stmt.where(GatewayRateLimitReset.user_id.in_(attribute_user_ids))
     if outcome is not None:
         stmt = stmt.where(GatewayRateLimitReset.outcome == outcome)
     if work_type is not None:
@@ -964,6 +1002,9 @@ async def list_rate_limit_resets(
     user_id: Optional[int] = None,
     outcome: Optional[str] = None,
     work_type: Optional[str] = None,
+    business_unit: Optional[str] = None,
+    department: Optional[str] = None,
+    profession: Optional[str] = None,
 ):
     """The admin's rate-limit resets table, one row per recorded press.
 
@@ -990,6 +1031,12 @@ async def list_rate_limit_resets(
         user_id: restrict the table to one budget owner (the picker).
         outcome: ``approved`` or ``rejected``; None = every press.
         work_type: one decision-model classification; None = every class.
+        business_unit: restrict the table to presses whose budget owner's
+            Business Unit label matches (the attribute filters).
+        department: restrict the table to owners whose Department label
+            matches.
+        profession: restrict the table to owners whose Profession label
+            matches.
 
     Returns:
         RateLimitResetsResponse: the page of recorded presses with the
@@ -1005,8 +1052,15 @@ async def list_rate_limit_resets(
     perPage = max(1, min(perPage, 200))
     _validate_resets_outcome(outcome)
 
+    attribute_user_ids = await resolve_user_attribute_filter(
+        session, business_unit, department, profession
+    )
     rows = list(
-        (await session.exec(_resets_statement(user_id, outcome, work_type))).all()
+        (
+            await session.exec(
+                _resets_statement(user_id, outcome, work_type, attribute_user_ids)
+            )
+        ).all()
     )
     # Newest press first; the id breaks ties so a same-second pair keeps
     # its insertion order under the reverse sort.
@@ -1055,14 +1109,17 @@ async def list_rate_limit_resets(
 class UserRateLimitsExportRequest(TableExportRequest):
     """``/rate-limits/users/export`` payload.
 
-    The users table's filters — the picker's ``user_id`` and the ``sort_by``
-    the column arrows set — plus the shared file-shape knobs. There is no
-    date range to narrow: the table is one row per active user, not a
-    period query.
+    The users table's filters — the picker's ``user_id``, the ``sort_by``
+    the column arrows set and the Business Unit / Department / Profession
+    labels — plus the shared file-shape knobs. There is no date range to
+    narrow: the table is one row per active user, not a period query.
     """
 
     user_id: Optional[int] = None
     sort_by: Optional[str] = None
+    business_unit: Optional[str] = None
+    department: Optional[str] = None
+    profession: Optional[str] = None
 
 
 class RateLimitResetsExportRequest(TableExportRequest):
@@ -1072,6 +1129,9 @@ class RateLimitResetsExportRequest(TableExportRequest):
     user_id: Optional[int] = None
     outcome: Optional[str] = None
     work_type: Optional[str] = None
+    business_unit: Optional[str] = None
+    department: Optional[str] = None
+    profession: Optional[str] = None
 
 
 def _limit_axis_cells(
@@ -1155,7 +1215,15 @@ async def export_user_rate_limits(
         raise ForbiddenException(
             message="Only platform-wide admins may export user rate limits"
         )
-    rows, _, _, _ = await _user_limit_rows(session, request, body.user_id, body.sort_by)
+    rows, _, _, _ = await _user_limit_rows(
+        session,
+        request,
+        body.user_id,
+        body.sort_by,
+        await resolve_user_attribute_filter(
+            session, body.business_unit, body.department, body.profession
+        ),
+    )
     keys = rate_limit_users_export_column_keys()
     # The file has no pages, so the tooltip's labels hydrate for every row.
     labels = await bulk_user_attribute_labels(session, [p.id for p, _ in rows])
@@ -1203,7 +1271,13 @@ async def estimate_user_rate_limits_export(
         raise ForbiddenException(
             message="Only platform-wide admins may export user rate limits"
         )
-    principals = await _active_user_principals(session, body.user_id)
+    principals = await _active_user_principals(
+        session,
+        body.user_id,
+        await resolve_user_attribute_filter(
+            session, body.business_unit, body.department, body.profession
+        ),
+    )
     total = len(principals)
     keys = rate_limit_users_export_column_keys()
     estimate = UsageExportSheetEstimate(
@@ -1238,7 +1312,17 @@ async def export_rate_limit_resets(
     rows = list(
         (
             await session.exec(
-                _resets_statement(body.user_id, body.outcome, body.work_type)
+                _resets_statement(
+                    body.user_id,
+                    body.outcome,
+                    body.work_type,
+                    await resolve_user_attribute_filter(
+                        session,
+                        body.business_unit,
+                        body.department,
+                        body.profession,
+                    ),
+                )
             )
         ).all()
     )
@@ -1287,7 +1371,14 @@ async def estimate_rate_limit_resets_export(
             message="Only platform-wide admins may export rate-limit resets"
         )
     _validate_resets_outcome(body.outcome)
-    stmt = _resets_statement(body.user_id, body.outcome, body.work_type)
+    stmt = _resets_statement(
+        body.user_id,
+        body.outcome,
+        body.work_type,
+        await resolve_user_attribute_filter(
+            session, body.business_unit, body.department, body.profession
+        ),
+    )
     total = int(
         (await session.exec(select(func.count()).select_from(stmt.subquery()))).first()
         or 0
